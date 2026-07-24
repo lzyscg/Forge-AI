@@ -1,0 +1,17 @@
+{
+  "name": "@forge-ai/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/main.ts",
+  "dependencies": {
+    "@forge-ai/contracts": "*",
+    "@forge-ai/domain": "*",
+    "@forge-ai/application": "*",
+    "@forge-ai/adapters": "*"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "check": "tsc --noEmit"
+  }
+}

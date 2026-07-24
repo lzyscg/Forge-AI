@@ -1,0 +1,58 @@
+scenario:
+  id: songwriting
+  name: 歌词生产
+  version: 1
+
+input_fields:
+  - key: reference_lyrics
+    label: 参考歌词
+  - key: fixed_phrase
+    label: 固定金句
+
+agents:
+  - key: supervisor
+    name: 总控
+    model: deepseek-v4-flash
+    session: { policy: persistent }
+    prompt: prompts/supervisor.md
+    skills: []
+    tools: [route_message, approve_delivery, request_human_input]
+
+  - key: generator
+    name: 生成
+    model: deepseek-v4-flash
+    session: { policy: persistent }
+    prompt: prompts/generator.md
+    skills: []
+    tools: [publish_artifact, request_human_input]
+
+  - key: reviewer
+    name: 审核
+    model: deepseek-v4-flash
+    session: { policy: cold_per_version }
+    prompt: prompts/reviewer.md
+    skills: []
+    tools: [submit_evaluation]
+
+start_agent: supervisor
+
+routes:
+  - from: supervisor
+    to: [generator]
+  - from: generator
+    to: [reviewer]
+  - from: reviewer
+    to: [supervisor]
+
+context_rules:
+  to_reviewer:
+    include: [current_artifact_version, input_constraints]
+  to_generator_repair:
+    include: [current_artifact_version, target_issues, revision_scope]
+
+artifact_types:
+  - type: lyrics
+    diff: line
+
+delivery:
+  deliverable_artifact_type: lyrics
