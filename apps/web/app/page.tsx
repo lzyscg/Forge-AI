@@ -47,20 +47,39 @@ export default function Home({ searchParams }: PageProps) {
 
       {selectedCase && (
         <>
-          {/* 消息流 */}
+          {/* 消息流（按 Agent 分列） */}
           <section>
-            <h2>消息流</h2>
-            {messages.map(m => (
-              <div key={m.message_id} className="card">
-                <div className="card-header">
-                  <span className="agent-tag">
-                    {m.source_agent ?? 'system'} → {m.target_agent ?? 'all'}
-                  </span>
-                  <small style={{ color: '#999' }}>{m.message_type}</small>
+            <h2>消息流（按 Agent 分列）</h2>
+            {(() => {
+              // 按 source_agent 分组
+              const agentGroups: Record<string, MessageRecord[]> = {};
+              for (const m of messages) {
+                const agent = m.source_agent ?? 'system';
+                if (!agentGroups[agent]) agentGroups[agent] = [];
+                agentGroups[agent].push(m);
+              }
+              const agentKeys = Object.keys(agentGroups);
+              return (
+                <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(agentKeys.length, 3)}, 1fr)`, gap: 12 }}>
+                  {agentKeys.map(agent => (
+                    <div key={agent} style={{ border: '1px solid #e0e0e0', borderRadius: 8, padding: 12 }}>
+                      <h3 style={{ margin: '0 0 8px', fontSize: '0.95rem', color: '#1976d2' }}>{agent}</h3>
+                      {agentGroups[agent].map(m => (
+                        <div key={m.message_id} className="card" style={{ marginBottom: 8 }}>
+                          <div className="card-header">
+                            <span className="agent-tag">
+                              → {m.target_agent ?? 'all'}
+                            </span>
+                            <small style={{ color: '#999' }}>{m.message_type}</small>
+                          </div>
+                          <div className="message-content">{m.content}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
                 </div>
-                <div className="message-content">{m.content}</div>
-              </div>
-            ))}
+              );
+            })()}
           </section>
 
           {/* 产物版本 */}
@@ -115,17 +134,17 @@ export default function Home({ searchParams }: PageProps) {
               <p style={{ color: '#666' }}>无门禁记录</p>
             ) : (
               gateResults.map(g => {
-                const checks = JSON.parse(g.checks) as { name: string; passed: boolean; detail?: string }[];
+                const checks = JSON.parse(g.checks) as { check: string; passed: boolean; detail?: string }[];
                 return (
-                  <div key={g.result_id} className="card">
+                  <div key={g.gate_result_id} className="card">
                     <div className="card-header">
-                      <strong>{g.gate_passed ? '✅ 通过' : '❌ 未通过'}</strong>
+                      <strong>{g.status === 'pass' ? '✅ 通过' : '❌ 未通过'}</strong>
                       <small style={{ color: '#999' }}>{g.created_at}</small>
                     </div>
                     {checks.map((c, idx) => (
                       <div key={idx} className={`gate-check ${c.passed ? 'gate-pass' : 'gate-fail'}`}>
                         <span>{c.passed ? '✓' : '✗'}</span>
-                        <span>{c.name}</span>
+                        <span>{c.check}</span>
                         {c.detail && <small style={{ color: '#666' }}>({c.detail})</small>}
                       </div>
                     ))}

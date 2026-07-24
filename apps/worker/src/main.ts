@@ -175,39 +175,79 @@ async function main() {
 
   // 崩溃恢复检查
   const casesNeedingRecovery = recoveryService.findCasesNeedingRecovery();
+  let resumeCaseId: string | null = null;
+  let resumeAgentKey: string | null = null;
+  let resumeMessage: string | null = null;
+
   if (casesNeedingRecovery.length > 0) {
     console.log(`\n[恢复] 发现 ${casesNeedingRecovery.length} 个需要恢复的 Case`);
     for (const caseId of casesNeedingRecovery) {
       const result = recoveryService.recoverCase(caseId);
       console.log(`  ${caseId}: ${result.detail}`);
+      // 记录第一个成功恢复的 Case，准备续跑
+      if (result.recovered && !resumeCaseId) {
+        resumeCaseId = caseId;
+        // 从最后完成的 Turn 的工具调用推断续跑起点
+        const lastTurn = repo.getLastCompletedTurn(caseId);
+        if (lastTurn) {
+          const actions = repo.getToolActionsByTurn(lastTurn.turn_id as string);
+          for (const action of actions) {
+            if (action.tool_name === 'route_message' && action.result) {
+              const routeOutput = JSON.parse(action.result as string);
+              if (routeOutput.success) {
+                const args = JSON.parse(action.arguments as string);
+                resumeAgentKey = args.target_agent;
+                resumeMessage = args.instruction;
+              }
+            }
+          }
+        }
+        // 如果无法从工具调用推断，使用 start_agent 重新开始
+        if (!resumeAgentKey) {
+          resumeAgentKey = scenarioConfig.start_agent;
+          resumeMessage = '系统崩溃恢复后续跑。请检查当前进度并决定下一步。';
+        }
+      }
     }
   }
 
-  // 创建新 Case
-  const inputPayload = {
-    reference_lyrics: '月光洒在老路上\n你的影子在前方\n我们走过的地方\n花开满了山岗\n风吹过耳旁\n像你说的晚安',
-    fixed_phrase: '你是我的山歌',
-  };
+  // 确定要执行的 Case：优先续跑恢复的 Case，否则创建新 Case
+  let caseId: string;
+  let currentAgentKey: string;
+  let currentMessage: string;
 
-  const caseId = caseService.createCase({
-    title: `歌词生产 - ${new Date().toISOString().slice(0, 10)}`,
-    scenarioConfig,
-    inputPayload,
-  });
-  console.log(`\n[Case] 创建: ${caseId}`);
+  if (resumeCaseId) {
+    // 续跑已恢复的 Case（12.2 崩溃恢复验收）
+    caseId = resumeCaseId;
+    currentAgentKey = resumeAgentKey!;
+    currentMessage = resumeMessage!;
+    console.log(`\n[Case] 续跑: ${caseId} (从 agent: ${currentAgentKey} 继续)`);
+  } else {
+    // 创建新 Case
+    const inputPayload = {
+      reference_lyrics: '月光洒在老路上\n你的影子在前方\n我们走过的地方\n花开满了山岗\n风吹过耳旁\n像你说的晚安',
+      fixed_phrase: '你是我的山歌',
+    };
 
-  // 启动 Case
-  caseService.startCase(caseId);
-  console.log(`[Case] 启动: ${caseId}`);
+    caseId = caseService.createCase({
+      title: `歌词生产 - ${new Date().toISOString().slice(0, 10)}`,
+      scenarioConfig,
+      inputPayload,
+    });
+    console.log(`\n[Case] 创建: ${caseId}`);
+
+    // 启动 Case
+    caseService.startCase(caseId);
+    console.log(`[Case] 启动: ${caseId}`);
+
+    currentAgentKey = scenarioConfig.start_agent;
+    currentMessage = `请开始执行任务。用户输入：\n参考歌词：${inputPayload.reference_lyrics}\n固定金句：${inputPayload.fixed_phrase}`;
+  }
 
   // 执行 Turn 循环
   const maxTurns = 20; // 安全上限
   let consecutiveErrors = 0;
   const maxConsecutiveErrors = 3;
-
-  // 确定当前活跃的 agent 和消息
-  let currentAgentKey = scenarioConfig.start_agent;
-  let currentMessage = `请开始执行任务。用户输入：\n参考歌词：${inputPayload.reference_lyrics}\n固定金句：${inputPayload.fixed_phrase}`;
 
   for (let turnNum = 0; turnNum < maxTurns; turnNum++) {
     const caseRecord = repo.getCase(caseId);
@@ -223,7 +263,7 @@ async function main() {
       break;
     }
 
-    // 获取或创建 session
+    // 获取或创建 session（cold_per_version 策略：每次调用都创建全新 Session）
     const agentConfig = scenarioConfig.agents.find((a) => a.key === currentAgentKey);
     if (!agentConfig) {
       console.error(`[错误] 未找到 agent 配置: ${currentAgentKey}`);
@@ -232,6 +272,15 @@ async function main() {
 
     let session = repo.getActiveSession(caseId, currentAgentKey);
     let sessionId: string;
+
+    // cold_per_version：关闭旧 Session，确保每次调用都是独立冷启动
+    if (session && agentConfig.session.policy === 'cold_per_version') {
+      repo.updateSession(session.session_id as string, { status: 'closed', closed_at: clock.now() });
+      if (pi instanceof RealPiAdapter) {
+        await pi.closeSession(session.pi_session_ref as string);
+      }
+      session = null;
+    }
 
     if (!session) {
       sessionId = idGen.generate('sess');
@@ -252,6 +301,7 @@ async function main() {
         pi.registerSession(sessionId, currentAgentKey, agentConfig.session.policy);
       }
     } else {
+      // persistent 策略：复用已有 Session（继承历史上下文）
       sessionId = session.session_id as string;
       // 对于真实 Pi adapter，确保 session 已注册（用于崩溃恢复场景）
       if (pi instanceof RealPiAdapter) {

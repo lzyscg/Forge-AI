@@ -62,10 +62,12 @@ export interface IssueRecord {
 }
 
 export interface DeliveryGateResultRecord {
-  result_id: string;
+  gate_result_id: string;
   case_id: string;
-  gate_passed: number;
+  artifact_version_id: string | null;
+  status: string; // 'pass' | 'fail'
   checks: string;
+  blocking_issue_ids: string | null;
   created_at: string;
 }
 
