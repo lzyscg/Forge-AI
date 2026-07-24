@@ -31,6 +31,8 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.82.0"
+    "@earendil-works/pi-ai": "^0.82.0",
+    "@earendil-works/pi-coding-agent": "^0.82.0",
+    "typebox": "^1.1.38"
   }
 }

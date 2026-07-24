@@ -34,6 +34,8 @@ export class FakePiAdapter implements PiPort {
   private turnCounters: Map<string, number> = new Map();
   private sessionCounter = 0;
   private contextResolver: (() => Record<string, string>) | null = null;
+  /** P1-2 修复：当前活跃的 scenarioId，用于路由到对应 script */
+  private activeScenarioId: string | null = null;
 
   /**
    * 注册一个场景的脚本
@@ -41,6 +43,15 @@ export class FakePiAdapter implements PiPort {
   registerScript(scenarioId: string, script: FakePiScript): void {
     this.scripts.set(scenarioId, script);
     this.turnCounters.set(scenarioId, 0);
+    // 自动设置为活跃场景（最后一个注册的）
+    this.activeScenarioId = scenarioId;
+  }
+
+  /**
+   * P1-2 修复：显式设置活跃场景 ID
+   */
+  setActiveScenario(scenarioId: string): void {
+    this.activeScenarioId = scenarioId;
   }
 
   /**
@@ -77,9 +88,9 @@ export class FakePiAdapter implements PiPort {
     messages: PiMessage[],
     tools: PiToolDefinition[],
   ): Promise<PiTurnResult> {
-    // 找到当前活跃的脚本（简化：使用第一个注册的脚本）
-    const scriptKey = this.scripts.keys().next().value;
-    if (!scriptKey) {
+    // P1-2 修复：按 activeScenarioId 路由到对应 script（而非永远取第一个）
+    const scriptKey = this.activeScenarioId ?? this.scripts.keys().next().value;
+    if (!scriptKey || !this.scripts.has(scriptKey)) {
       return { content: 'No script registered', tool_calls: [], finish_reason: 'stop' };
     }
 
@@ -102,8 +113,10 @@ export class FakePiAdapter implements PiPort {
           argsStr = argsStr.replace(new RegExp(key, 'g'), value);
         }
       }
+      // P1-1 修复：稳定的 tool_call_id
+      // 使用 scenarioId + turnIndex + toolIndex 组合，确保同一 Turn 重试时 ID 不变
       return {
-        id: `fake_tc_${turnIndex}_${i}`,
+        id: `${scriptKey}_t${turnIndex}_tc${i}`,
         name: tc.name,
         arguments: argsStr,
       };

@@ -1,7 +1,11 @@
 /**
  * Turn 编排
  * Turn 生命周期：queued → running → 调用 Pi → 解析工具调用 → 执行 → completed/failed
- * 事务保证：Turn 状态翻转与全部副作用在同一个数据库事务内提交
+ *
+ * P0-3 修复：整个 Turn 的状态翻转与全部副作用在同一个数据库事务内提交。
+ * 使用显式 beginTransaction/commit/rollback（而非 runInTransaction），
+ * 因为 pi.executeTurn 是 async 的，事务需要跨越 await 点。
+ * better-sqlite3 是同步的，事务在 await 期间保持打开状态。
  */
 
 import type {
@@ -57,30 +61,34 @@ export class TurnExecutor {
     const turnId = this.idGen.generate('turn');
     const sequence = this.getNextSequence(input.caseId);
 
-    // 创建 Turn 记录（queued）
-    this.repo.insertTurn({
-      turn_id: turnId,
-      case_id: input.caseId,
-      session_id: input.sessionId,
-      sequence,
-      status: 'queued' satisfies TurnStatus,
-      input_message_id: null,
-      output_message_id: null,
-      context_snapshot_id: null,
-      produced_artifact_version_ids: '[]',
-      started_at: null,
-      finished_at: null,
-      retry_of_turn_id: null,
-      provider_error: null,
-    });
-
-    // Turn → running
-    this.repo.updateTurn(turnId, {
-      status: transitionTurn('queued', 'running'),
-      started_at: this.clock.now(),
-    });
+    // P0-3：显式事务，跨越 async Pi 调用
+    // better-sqlite3 同步操作在 await 之间保持事务打开
+    this.repo.beginTransaction();
 
     try {
+      // 创建 Turn 记录（queued）
+      this.repo.insertTurn({
+        turn_id: turnId,
+        case_id: input.caseId,
+        session_id: input.sessionId,
+        sequence,
+        status: 'queued' satisfies TurnStatus,
+        input_message_id: null,
+        output_message_id: null,
+        context_snapshot_id: null,
+        produced_artifact_version_ids: '[]',
+        started_at: null,
+        finished_at: null,
+        retry_of_turn_id: null,
+        provider_error: null,
+      });
+
+      // Turn → running
+      this.repo.updateTurn(turnId, {
+        status: transitionTurn('queued', 'running'),
+        started_at: this.clock.now(),
+      });
+
       // 构建上下文
       const { messages, snapshotId } = this.contextBuilder.buildContext({
         caseId: input.caseId,
@@ -113,12 +121,12 @@ export class TurnExecutor {
 
       // 调用 Pi
       const session = { session_ref: input.sessionId };
-
-      // 创建工具执行回调（用于真实 Pi adapter 的内部循环）
       const toolCallResults: Record<string, unknown>[] = [];
       const producedVersionIds: string[] = [];
       const outputMessageId = this.idGen.generate('msg');
 
+      // 工具执行回调（真实 Pi adapter 的 Agent 循环中调用）
+      // 所有 DB 操作都在当前打开的事务内
       const toolExecutor: PiToolExecutorFn = (toolCallId, toolName, args) => {
         // 幂等检查
         const existingAction = this.repo.getToolActionByProviderId(turnId, toolCallId);
@@ -168,6 +176,7 @@ export class TurnExecutor {
         return toolResult;
       };
 
+      // Pi 执行（async，事务保持打开）
       const piResult: PiTurnResult = await this.pi.executeTurn(session, messages, input.tools, toolExecutor);
 
       if (piResult.finish_reason === 'error') {
@@ -175,63 +184,60 @@ export class TurnExecutor {
       }
 
       // 如果 adapter 没有使用 toolExecutor 回调（如 Fake Pi），则在这里执行工具
-      // 检查是否已经有工具结果（通过回调执行）
       const hasCallbackResults = toolCallResults.length > 0;
 
       if (!hasCallbackResults && piResult.tool_calls.length > 0) {
-        // 传统模式：adapter 返回工具调用，turn-executor 执行
-        this.repo.runInTransaction(() => {
-          for (let i = 0; i < piResult.tool_calls.length; i++) {
-            const toolCall = piResult.tool_calls[i];
-            const toolName = toolCall.name as ToolName;
-            const args = JSON.parse(toolCall.arguments);
+        // 传统模式：adapter 返回工具调用，turn-executor 执行（仍在同一事务内）
+        for (let i = 0; i < piResult.tool_calls.length; i++) {
+          const toolCall = piResult.tool_calls[i];
+          const toolName = toolCall.name as ToolName;
+          const args = JSON.parse(toolCall.arguments);
 
-            // 幂等检查
-            const providerToolCallId = toolCall.id || `${turnId}_seq_${i}`;
-            const existingAction = this.repo.getToolActionByProviderId(turnId, providerToolCallId);
-            if (existingAction) {
-              toolCallResults.push(JSON.parse(existingAction.result as string));
-              continue;
-            }
-
-            // 记录工具调用
-            const actionId = this.idGen.generate('act');
-            this.repo.insertToolAction({
-              action_id: actionId,
-              turn_id: turnId,
-              tool_name: toolName,
-              arguments: toolCall.arguments,
-              result: null,
-              status: 'pending',
-              provider_tool_call_id: providerToolCallId,
-              created_at: this.clock.now(),
-            });
-
-            // 执行工具
-            const ctx: ToolExecutionContext = {
-              caseId: input.caseId,
-              turnId,
-              sessionId: input.sessionId,
-              agentKey: input.agentKey,
-              messageId: outputMessageId,
-              scenarioConfig: input.scenarioConfig,
-            };
-
-            const toolResult = this.toolExecutor.execute(toolName, args, ctx);
-            toolCallResults.push(toolResult);
-
-            // 更新工具调用记录
-            this.repo.updateToolAction(actionId, {
-              result: JSON.stringify(toolResult),
-              status: 'completed',
-            });
-
-            // 收集产物版本 ID
-            if (toolResult.artifact_version_id) {
-              producedVersionIds.push(toolResult.artifact_version_id as string);
-            }
+          // 幂等检查
+          const providerToolCallId = toolCall.id || `${turnId}_seq_${i}`;
+          const existingAction = this.repo.getToolActionByProviderId(turnId, providerToolCallId);
+          if (existingAction) {
+            toolCallResults.push(JSON.parse(existingAction.result as string));
+            continue;
           }
-        });
+
+          // 记录工具调用
+          const actionId = this.idGen.generate('act');
+          this.repo.insertToolAction({
+            action_id: actionId,
+            turn_id: turnId,
+            tool_name: toolName,
+            arguments: toolCall.arguments,
+            result: null,
+            status: 'pending',
+            provider_tool_call_id: providerToolCallId,
+            created_at: this.clock.now(),
+          });
+
+          // 执行工具
+          const ctx: ToolExecutionContext = {
+            caseId: input.caseId,
+            turnId,
+            sessionId: input.sessionId,
+            agentKey: input.agentKey,
+            messageId: outputMessageId,
+            scenarioConfig: input.scenarioConfig,
+          };
+
+          const toolResult = this.toolExecutor.execute(toolName, args, ctx);
+          toolCallResults.push(toolResult);
+
+          // 更新工具调用记录
+          this.repo.updateToolAction(actionId, {
+            result: JSON.stringify(toolResult),
+            status: 'completed',
+          });
+
+          // 收集产物版本 ID
+          if (toolResult.artifact_version_id) {
+            producedVersionIds.push(toolResult.artifact_version_id as string);
+          }
+        }
       }
 
       // 记录输出消息
@@ -257,6 +263,9 @@ export class TurnExecutor {
         finished_at: this.clock.now(),
       });
 
+      // 提交事务：Turn 状态 + 所有副作用原子性写入
+      this.repo.commitTransaction();
+
       return {
         turnId,
         status: 'completed',
@@ -264,11 +273,25 @@ export class TurnExecutor {
         toolCallResults,
       };
     } catch (error) {
-      // Turn → failed
+      // 回滚事务：所有 DB 变更撤销（Turn、工具调用、产物等）
+      this.repo.rollbackTransaction();
+
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.repo.updateTurn(turnId, {
-        status: 'failed',
+
+      // 在事务外记录 failed Turn（新事务）
+      this.repo.insertTurn({
+        turn_id: turnId,
+        case_id: input.caseId,
+        session_id: input.sessionId,
+        sequence,
+        status: 'failed' satisfies TurnStatus,
+        input_message_id: null,
+        output_message_id: null,
+        context_snapshot_id: null,
+        produced_artifact_version_ids: '[]',
+        started_at: this.clock.now(),
         finished_at: this.clock.now(),
+        retry_of_turn_id: null,
         provider_error: errorMsg,
       });
 
