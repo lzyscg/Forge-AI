@@ -10,6 +10,7 @@ import type {
   ClockPort,
   IdGeneratorPort,
   PiPort,
+  PiSessionOptions,
   PiToolDefinition,
   ScenarioConfig,
   ConfigLoaderPort,
@@ -281,7 +282,12 @@ export class CaseRunner {
 
       if (!session) {
         sessionId = this.idGen.generate('sess');
-        const piSession = await this.pi.createSession(currentAgentKey, agentConfig.session.policy);
+        const sessionOptions: PiSessionOptions = {
+          scenarioId: this.scenarioConfig.scenario.id,
+          scenarioSkillsPath: resolve(dirname(this.scenarioPath), 'skills'),
+          agentSkills: agentConfig.skills ?? [],
+        };
+        const piSession = await this.pi.createSession(currentAgentKey, agentConfig.session.policy, undefined, sessionOptions);
         this.repo.insertSession({
           session_id: sessionId,
           case_id: caseId,
@@ -299,7 +305,12 @@ export class CaseRunner {
         // persistent 策略：复用已有 Session（继承历史上下文）
         sessionId = session.session_id as string;
         // 跨进程恢复：resumeSession 把 persistent session 从磁盘文件加载回内存
-        await this.pi.resumeSession(session.pi_session_ref as string);
+        const sessionOptions: PiSessionOptions = {
+          scenarioId: this.scenarioConfig.scenario.id,
+          scenarioSkillsPath: resolve(dirname(this.scenarioPath), 'skills'),
+          agentSkills: agentConfig.skills ?? [],
+        };
+        await this.pi.resumeSession(session.pi_session_ref as string, sessionOptions);
         this.pi.registerSession?.(sessionId, session.pi_session_ref as string);
       }
 

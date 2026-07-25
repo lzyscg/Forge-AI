@@ -6,6 +6,12 @@ import type { ScenarioConfig } from './scenario.js';
 import type { ToolName } from './tools.js';
 
 // === Pi 端口 ===
+export interface PiSessionOptions {
+  scenarioId?: string;
+  scenarioSkillsPath?: string;  // scenarios/<id>/skills/
+  agentSkills?: string[];       // AgentConfig.skills
+}
+
 export interface PiSession {
   session_ref: string;
 }
@@ -47,8 +53,8 @@ export type PiToolExecutorFn = (
 ) => Record<string, unknown>;
 
 export interface PiPort {
-  createSession(agentKey: string, policy: string, scopeKey?: string): Promise<PiSession>;
-  resumeSession(sessionRef: string): Promise<PiSession>;
+  createSession(agentKey: string, policy: string, scopeKey?: string, options?: PiSessionOptions): Promise<PiSession>;
+  resumeSession(sessionRef: string, options?: PiSessionOptions): Promise<PiSession>;
   closeSession(sessionRef: string): Promise<void>;
   executeTurn(
     session: PiSession,
@@ -62,6 +68,8 @@ export interface PiPort {
   alignTurnCounter?(scenarioId: string, sequence: number): void;
   /** 注册 DB session_id -> Pi 内部 session 的映射（RealPi 用于别名桥接） */
   registerSession?(sessionId: string, piSessionRef: string): void;
+  /** 获取 session 已加载的 skills 列表 */
+  getSkills?(sessionRef: string): Array<{ name: string; description: string }>;
 }
 
 // === Repository 端口 ===

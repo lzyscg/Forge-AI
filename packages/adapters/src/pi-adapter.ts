@@ -14,7 +14,10 @@
 
 import {
   createAgentSession,
+  createReadToolDefinition,
   defineTool,
+  DefaultResourceLoader,
+  getAgentDir,
   ModelRuntime,
   SessionManager,
   type AgentSession,
@@ -25,14 +28,31 @@ import { Type } from 'typebox';
 import type {
   PiPort,
   PiSession,
+  PiSessionOptions,
   PiMessage,
   PiToolDefinition,
   PiTurnResult,
   PiToolCall,
   PiToolExecutorFn,
 } from '@forge-ai/contracts';
-import { join } from 'node:path';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
+import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
+
+/** 创建白名单 access 函数（铁律 6：只允许读 skills 目录） */
+export function createWhitelistAccess(scenarioSkillsPath: string): (absolutePath: string) => Promise<void> {
+  if (!existsSync(scenarioSkillsPath)) {
+    throw new Error(`Skills directory not found: ${scenarioSkillsPath}. Check scenario.yaml skills config.`);
+  }
+  const allowedRoot = realpathSync(scenarioSkillsPath);
+  return async (absolutePath: string) => {
+    const realPath = realpathSync(absolutePath);  // 解析 symlink
+    const rel = relative(allowedRoot, realPath);
+    // 必须在 skills 目录内（不能 ../ 逃逸）
+    if (rel.startsWith('..') || resolve(allowedRoot, rel) !== realPath) {
+      throw new Error(`Access denied: ${absolutePath} is outside skills whitelist`);
+    }
+  };
+}
 
 /** 内部 Session 状态 */
 interface SessionState {
@@ -42,6 +62,8 @@ interface SessionState {
   policy: string;
   /** 当前 Turn 的工具执行回调（每次 executeTurn 时设置） */
   currentToolExecutor: PiToolExecutorFn | null;
+  /** Skill 资源加载器（可选） */
+  resourceLoader?: DefaultResourceLoader;
 }
 
 export class RealPiAdapter implements PiPort {
@@ -68,7 +90,7 @@ export class RealPiAdapter implements PiPort {
     return this.modelRuntime;
   }
 
-  async createSession(agentKey: string, policy: string, scopeKey?: string): Promise<PiSession> {
+  async createSession(agentKey: string, policy: string, scopeKey?: string, options?: PiSessionOptions): Promise<PiSession> {
     const sessionRef = `pi_${agentKey}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
     const runtime = await this.getModelRuntime();
@@ -80,13 +102,33 @@ export class RealPiAdapter implements PiPort {
       ? SessionManager.create(process.cwd(), join(this.dataDir, sessionRef))
       : SessionManager.inMemory(process.cwd());
 
+    // 如果有 skills 配置，创建 resourceLoader
+    let resourceLoader: DefaultResourceLoader | undefined;
+    if (options?.scenarioSkillsPath && options.agentSkills?.length) {
+      resourceLoader = new DefaultResourceLoader({
+        cwd: process.cwd(),
+        agentDir: getAgentDir(),
+        additionalSkillPaths: [options.scenarioSkillsPath],
+        noExtensions: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        skillsOverride: (base) => ({
+          skills: base.skills.filter(s => options.agentSkills!.includes(s.name)),
+          diagnostics: base.diagnostics,
+        }),
+      });
+      await resourceLoader.reload();
+    }
+
     const { session } = await createAgentSession({
       cwd: process.cwd(),
       modelRuntime: runtime,
       model: model ?? undefined,
       sessionManager,
       noTools: 'builtin',      // 禁用 Pi 内置工具（read/bash/edit/write），保留自定义工具
-      customTools: this.buildCustomTools(sessionRef),
+      customTools: this.buildCustomTools(sessionRef, options),
+      resourceLoader,
     });
 
     this.sessions.set(sessionRef, {
@@ -95,6 +137,7 @@ export class RealPiAdapter implements PiPort {
       agentKey,
       policy,
       currentToolExecutor: null,
+      resourceLoader,
     });
 
     return { session_ref: sessionRef };
@@ -124,7 +167,7 @@ export class RealPiAdapter implements PiPort {
    * 历史丢失却不报错--这会让 persistent session 续跑后"上下文不含之前 Turn 历史"，
    * 直接违反 2.3 硬指标。这里改为显式定位 .jsonl 文件，找不到就抛错（fail loud）。
    */
-  async resumeSession(sessionRef: string): Promise<PiSession> {
+  async resumeSession(sessionRef: string, options?: PiSessionOptions): Promise<PiSession> {
     // 已在内存中（同一进程内复用，幂等）
     if (this.sessions.has(sessionRef)) {
       return { session_ref: sessionRef };
@@ -160,13 +203,33 @@ export class RealPiAdapter implements PiPort {
     const runtime = await this.getModelRuntime();
     const model = runtime.getModel('deepseek', this.modelId);
 
+    // 重建 resourceLoader（persistent 崩溃恢复 skill 仍在）
+    let resourceLoader: DefaultResourceLoader | undefined;
+    if (options?.scenarioSkillsPath && options.agentSkills?.length) {
+      resourceLoader = new DefaultResourceLoader({
+        cwd: process.cwd(),
+        agentDir: getAgentDir(),
+        additionalSkillPaths: [options.scenarioSkillsPath],
+        noExtensions: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        skillsOverride: (base) => ({
+          skills: base.skills.filter(s => options.agentSkills!.includes(s.name)),
+          diagnostics: base.diagnostics,
+        }),
+      });
+      await resourceLoader.reload();
+    }
+
     const { session } = await createAgentSession({
       cwd: process.cwd(),
       modelRuntime: runtime,
       model: model ?? undefined,
       sessionManager,
       noTools: 'builtin',
-      customTools: this.buildCustomTools(sessionRef),
+      customTools: this.buildCustomTools(sessionRef, options),
+      resourceLoader,
     });
 
     this.sessions.set(sessionRef, {
@@ -175,6 +238,7 @@ export class RealPiAdapter implements PiPort {
       agentKey: 'restored',
       policy: 'persistent',
       currentToolExecutor: null,
+      resourceLoader,
     });
 
     return { session_ref: sessionRef };
@@ -190,6 +254,14 @@ export class RealPiAdapter implements PiPort {
         if (s === state) this.sessions.delete(key);
       }
     }
+  }
+
+  /** 获取 session 已加载的 skills 列表 */
+  getSkills(sessionRef: string): Array<{ name: string; description: string }> {
+    const state = this.sessions.get(sessionRef);
+    if (!state?.resourceLoader) return [];
+    const { skills } = state.resourceLoader.getSkills();
+    return skills.map(s => ({ name: s.name, description: s.description }));
   }
 
   /**
@@ -282,7 +354,7 @@ export class RealPiAdapter implements PiPort {
    * 构建 Forge 自定义工具（通过 defineTool 注册到 Pi Agent Runtime）
    * Pi 的内置 Agent 循环会自动调用这些工具的 execute()
    */
-  private buildCustomTools(sessionRef: string): ToolDefinition[] {
+  private buildCustomTools(sessionRef: string, options?: PiSessionOptions): ToolDefinition[] {
     const getState = () => this.sessions.get(sessionRef);
 
     /** 通用工具执行：调用 turn-executor 提供的 toolExecutor 回调 */
@@ -311,7 +383,7 @@ export class RealPiAdapter implements PiPort {
       }
     };
 
-    return [
+    const tools: ToolDefinition[] = [
       defineTool({
         name: 'publish_artifact',
         label: 'Publish Artifact',
@@ -381,6 +453,23 @@ export class RealPiAdapter implements PiPort {
         execute: async (toolCallId, params) => executeViaCallback(toolCallId, 'request_human_input', params as Record<string, unknown>),
       }),
     ];
+
+    // 5+1：加受限 read 工具（铁律 6：只允许读 skills 目录）
+    if (options?.scenarioSkillsPath && options.agentSkills?.length) {
+      const skillsPath = options.scenarioSkillsPath;
+      const readTool = createReadToolDefinition(process.cwd(), {
+        operations: {
+          access: createWhitelistAccess(skillsPath),
+          readFile: async (absolutePath: string) => {
+            const { readFile } = await import('node:fs/promises');
+            return readFile(absolutePath);
+          },
+        },
+      });
+      tools.push(readTool as unknown as ToolDefinition);
+    }
+
+    return tools;
   }
 
   /**

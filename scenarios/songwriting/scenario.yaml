@@ -23,7 +23,7 @@ agents:
     model: deepseek-v4-flash
     session: { policy: persistent }
     prompt: prompts/generator.md
-    skills: []
+    skills: [rhyme]
     tools: [publish_artifact, request_human_input]
 
   - key: reviewer

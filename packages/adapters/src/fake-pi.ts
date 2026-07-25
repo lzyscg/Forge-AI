@@ -7,6 +7,7 @@
 import type {
   PiPort,
   PiSession,
+  PiSessionOptions,
   PiMessage,
   PiToolDefinition,
   PiTurnResult,
@@ -92,17 +93,22 @@ export class FakePiAdapter implements PiPort {
     this.setTurnCounter(scenarioId, sequence);
   }
 
-  async createSession(agentKey: string, policy: string, scopeKey?: string): Promise<PiSession> {
+  async createSession(agentKey: string, policy: string, scopeKey?: string, _options?: PiSessionOptions): Promise<PiSession> {
     this.sessionCounter++;
     return { session_ref: `fake_session_${this.sessionCounter}_${agentKey}` };
   }
 
-  async resumeSession(sessionRef: string): Promise<PiSession> {
+  async resumeSession(sessionRef: string, _options?: PiSessionOptions): Promise<PiSession> {
     return { session_ref: sessionRef };
   }
 
   async closeSession(sessionRef: string): Promise<void> {
     // no-op for fake
+  }
+
+  /** FakePi 不实现 skill 注入，返回空数组 */
+  getSkills(_sessionRef: string): Array<{ name: string; description: string }> {
+    return [];
   }
 
   async executeTurn(
