@@ -8,6 +8,7 @@ import type { CaseRecord, MessageRecord, ArtifactVersionRecord, IssueRecord, Del
 import { AutoRefresh } from './auto-refresh';
 import { LaneBoard } from './lane-board';
 import { VersionDiff } from './version-diff';
+import { CaseActions } from './case-actions';
 import type { AgentInfo, TurnData, RouteEdgeData, ToolActionData, MessageData } from './lane-board';
 
 export const dynamic = 'force-dynamic';
@@ -193,7 +194,7 @@ export default function Home({ searchParams }: PageProps) {
               <h2>生产任务</h2>
               <span className="count">{cases.length}</span>
             </div>
-            <p className="rail-note">只读回放 · 5 秒轮询 · 不调用 Pi</p>
+            <p className="rail-note">5 秒轮询 · 可创建 / 运行 / 恢复 Case</p>
             <div className="task-list">
               {cases.map((c) => (
                 <a key={c.case_id} href={`/?case=${c.case_id}`} className="task-item-link">
@@ -214,6 +215,7 @@ export default function Home({ searchParams }: PageProps) {
                 </a>
               ))}
             </div>
+            <CaseActions caseId={selectedCaseId} caseStatus={selectedCase?.status} />
           </aside>
 
           {/* 主区 */}

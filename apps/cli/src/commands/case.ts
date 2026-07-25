@@ -111,7 +111,8 @@ export function registerCaseCommand(program: Command): void {
           maxTurns,
         });
 
-        writeFirstLine(id);
+        runner.assertNoConcurrentCase(id); // 先检查并发
+        writeFirstLine(id);                // 通过后才写第一行
 
         const result = await runner.runCase(id, { maxTurns });
         writeResultLine(result);
@@ -282,7 +283,8 @@ export function registerCaseCommand(program: Command): void {
           logger,
         });
 
-        writeFirstLine(id);
+        runner.assertNoConcurrentCase(id); // 先检查并发
+        writeFirstLine(id);                // 通过后才写第一行
         const result = await runner.resumeCaseWithHumanInput(id, opts.answer);
         writeResultLine(result);
         repo.close();

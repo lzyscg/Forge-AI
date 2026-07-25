@@ -582,6 +582,83 @@ main { max-width: 1720px; margin: 0 auto; padding: 18px 22px 60px; }
 .gate-fail { color: var(--red); }
 .gate-check small { color: var(--muted); margin-left: auto; }
 
+/* ---------- case actions ---------- */
+.case-actions {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.action-panel {
+  padding: 10px 12px;
+  background: var(--blue-soft);
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+.action-panel h4 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+.action-row { margin-bottom: 8px; }
+.action-select {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 13px;
+  background: #fff;
+}
+.action-fields { margin-bottom: 8px; }
+.action-field { margin-bottom: 6px; }
+.action-field label {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.action-field input {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 13px;
+}
+.action-btn {
+  padding: 7px 14px;
+  border: none;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--line);
+  color: var(--ink);
+  transition: background .15s;
+}
+.action-btn:hover:not(:disabled) { background: var(--line-strong); }
+.action-btn:disabled { opacity: .5; cursor: not-allowed; }
+.action-btn.primary { background: var(--blue); color: #fff; }
+.action-btn.primary:hover:not(:disabled) { background: #4a6ae0; }
+.resume-panel { background: var(--amber-soft); }
+.resume-row { display: flex; gap: 8px; }
+.resume-input {
+  flex: 1;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 13px;
+}
+.action-msg {
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  margin-top: 8px;
+}
+.action-msg.error { background: var(--red-soft); color: var(--red); }
+.action-msg.success { background: var(--green-soft); color: var(--green); }
+
 /* ---------- responsive ---------- */
 @media (max-width: 1080px) {
   .workspace { grid-template-columns: 1fr; }

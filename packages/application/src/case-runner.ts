@@ -629,10 +629,10 @@ export class CaseRunner {
   }
 
   /**
-   * 并发守卫
+   * 并发守卫：检查是否有其他 running case（供 CLI preflight 调用）
    */
-  private assertNoConcurrentCase(caseId: string): void {
-    const runningCases = this.repo.getCasesByStatus('running').filter(c => c.case_id !== caseId);
+  assertNoConcurrentCase(excludeCaseId?: string): void {
+    const runningCases = this.repo.getCasesByStatus('running').filter(c => c.case_id !== excludeCaseId);
     if (runningCases.length > 0) {
       throw new ConcurrentCaseError(runningCases[0].case_id as string);
     }
