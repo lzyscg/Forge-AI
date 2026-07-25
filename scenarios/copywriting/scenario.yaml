@@ -64,6 +64,7 @@ context_rules:
     include:
       - current_artifact_version
       - input_constraints
+      - target_issues
 
 # 交付配置
 delivery:

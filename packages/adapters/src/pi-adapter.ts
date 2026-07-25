@@ -32,7 +32,7 @@ import type {
   PiToolExecutorFn,
 } from '@forge-ai/contracts';
 import { join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 
 /** 内部 Session 状态 */
 interface SessionState {
@@ -101,69 +101,94 @@ export class RealPiAdapter implements PiPort {
   }
 
   /**
-   * 注册一个已存在的 session（由 worker 调用，关联 DB session_id 和 Pi session）
-   * 如果该 sessionRef 已有内部 session，则创建别名映射。
+   * 注册 DB session_id -> Pi 内部 session 的映射（别名）。
+   * turn-executor 用 DB session_id 调 executeTurn，但 createSession/resumeSession 用 pi_session_ref 做 map key，
+   * 所以需要别名桥接。
+   *
+   * 必须显式传入刚 createSession/resumeSession 返回的 piSessionRef，直接别名到它对应的 state。
+   * 不能用「按 agentKey 循环找现有 state」的旧逻辑——cold_per_version 下旧 session 已被 closeSession
+   * dispose，但其别名 key 可能仍残留在 map 中，循环会命中已 dispose 的旧 state，导致新 Turn 在死 session 上 prompt 返回空。
    */
-  registerSession(sessionRef: string, agentKey: string, policy: string): void {
-    if (this.sessions.has(sessionRef)) return;
-    // 查找是否有该 agent 的现有 session（通过 agentKey 匹配最新的）
-    for (const [key, state] of this.sessions) {
-      if (state.agentKey === agentKey && key !== sessionRef) {
-        // 创建别名
-        this.sessions.set(sessionRef, state);
-        return;
-      }
+  registerSession(sessionId: string, piSessionRef: string): void {
+    const state = this.sessions.get(piSessionRef);
+    if (state) {
+      this.sessions.set(sessionId, state);
     }
-    // 没有现有 session，不做任何事（等 createSession 或 resumeSession 处理）
   }
 
   /**
-   * 恢复 Session（P0-2 修复：从文件恢复完整历史，绝不创建空 Context）
+   * 恢复 Session（P0-2 修复 + 2.3 跨进程恢复：从文件恢复完整历史，绝不创建空 Context）
+   *
+   * 关键：用 SessionManager.open 显式打开 session 文件，而不是 continueRecent。
+   * continueRecent 在找不到文件 / cwd 不匹配 / 读盘竞态时会**静默新建空 session**，
+   * 历史丢失却不报错--这会让 persistent session 续跑后"上下文不含之前 Turn 历史"，
+   * 直接违反 2.3 硬指标。这里改为显式定位 .jsonl 文件，找不到就抛错（fail loud）。
    */
   async resumeSession(sessionRef: string): Promise<PiSession> {
-    // 已在内存中
+    // 已在内存中（同一进程内复用，幂等）
     if (this.sessions.has(sessionRef)) {
       return { session_ref: sessionRef };
     }
 
-    // 尝试从文件恢复（persistent session 持久化在 dataDir 下）
+    // persistent session 持久化在 dataDir/<sessionRef>/ 下，每个 sessionRef 目录含一个 .jsonl
     const sessionDir = join(this.dataDir, sessionRef);
-    if (existsSync(sessionDir)) {
-      const sessionManager = SessionManager.continueRecent(process.cwd(), sessionDir);
-      const runtime = await this.getModelRuntime();
-      const model = runtime.getModel('deepseek', this.modelId);
-
-      const { session } = await createAgentSession({
-        cwd: process.cwd(),
-        modelRuntime: runtime,
-        model: model ?? undefined,
-        sessionManager,
-        noTools: 'builtin',
-        customTools: this.buildCustomTools(sessionRef),
-      });
-
-      this.sessions.set(sessionRef, {
-        agentSession: session,
-        sessionManager,
-        agentKey: 'restored',
-        policy: 'persistent',
-        currentToolExecutor: null,
-      });
-
-      return { session_ref: sessionRef };
+    if (!existsSync(sessionDir)) {
+      throw new Error(
+        `Cannot resume session ${sessionRef}: no persisted session dir at ${sessionDir}`,
+      );
     }
 
-    throw new Error(
-      `Cannot resume session ${sessionRef}: no persisted session found. ` +
-      `Persistent sessions must be recoverable from ${sessionDir}`,
-    );
+    // 显式定位 session 文件（取 mtime 最新的一条）。每个 sessionRef 目录正常只有 1 个 .jsonl。
+    let jsonlFiles: string[] = [];
+    try {
+      jsonlFiles = readdirSync(sessionDir)
+        .filter((f) => f.endsWith('.jsonl'))
+        .map((f) => join(sessionDir, f));
+    } catch {
+      // 读盘失败，下面按空处理 -> 抛错
+    }
+    if (jsonlFiles.length === 0) {
+      throw new Error(
+        `Cannot resume session ${sessionRef}: no .jsonl session file in ${sessionDir}`,
+      );
+    }
+    const sessionFile = jsonlFiles
+      .map((p) => ({ p, m: statSync(p).mtimeMs }))
+      .sort((a, b) => b.m - a.m)[0].p;
+
+    const sessionManager = SessionManager.open(sessionFile, sessionDir, process.cwd());
+    const runtime = await this.getModelRuntime();
+    const model = runtime.getModel('deepseek', this.modelId);
+
+    const { session } = await createAgentSession({
+      cwd: process.cwd(),
+      modelRuntime: runtime,
+      model: model ?? undefined,
+      sessionManager,
+      noTools: 'builtin',
+      customTools: this.buildCustomTools(sessionRef),
+    });
+
+    this.sessions.set(sessionRef, {
+      agentSession: session,
+      sessionManager,
+      agentKey: 'restored',
+      policy: 'persistent',
+      currentToolExecutor: null,
+    });
+
+    return { session_ref: sessionRef };
   }
 
   async closeSession(sessionRef: string): Promise<void> {
     const state = this.sessions.get(sessionRef);
     if (state) {
       state.agentSession.dispose();
-      this.sessions.delete(sessionRef);
+      // 清除该 state 的所有 key（pi_session_ref 主键 + 任何 DB session_id 别名），
+      // 否则残留别名会被 registerSession 之后的 executeTurn 命中已 dispose 的死 session。
+      for (const [key, s] of this.sessions) {
+        if (s === state) this.sessions.delete(key);
+      }
     }
   }
 
@@ -220,8 +245,20 @@ export class RealPiAdapter implements PiPort {
       // 构建 prompt：将 system prompt 和 user message 合并
       const promptText = this.buildPromptText(messages);
 
-      // Pi 原生 Agent 循环：model → tool call → execute → model sees result → continue
-      await state.agentSession.prompt(promptText);
+      // Pi 原生 Agent 循环：model -> tool call -> execute -> model sees result -> continue
+      // 真实模型（尤其 cold_per_version 下的 flash）偶发返回完全空响应（无文本、无工具调用）。
+      // 空响应没有副作用（未调工具），在事务内重试是安全的。最多重试 2 次，追加明确指令迫使模型调工具。
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        toolCalls.length = 0;
+        finalContent = null;
+        const p = attempt === 1
+          ? promptText
+          : `${promptText}\n\n<nudge>你刚才没有返回任何内容，也没有调用工具。你必须调用工具完成任务，禁止只回复空内容。请现在调用工具。</nudge>`;
+        await state.agentSession.prompt(p);
+        if (toolCalls.length > 0 || finalContent) break;
+        console.warn(`[PiAdapter] 空响应（attempt ${attempt}/${MAX_ATTEMPTS}, agent=${state.agentKey}），重试...`);
+      }
 
       return {
         content: finalContent,

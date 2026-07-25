@@ -117,8 +117,11 @@ export class ToolExecutor {
     }
 
     // 计算与上一版的 diff
-    const parentVersion = existingVersions.length > 0
-      ? existingVersions[existingVersions.length - 1]
+    // 父本取最后一个非 rejected 版本：越界 rejected 版本是死分支，若以它为基准，
+    // 返修重试版本会与被拒版本比较 diff，导致 scope 校验把"回滚越界改动"误判为新越界。
+    const nonRejected = existingVersions.filter((v) => v.status !== 'rejected');
+    const parentVersion = nonRejected.length > 0
+      ? nonRejected[nonRejected.length - 1]
       : null;
     let diff: string | null = null;
     if (parentVersion) {
@@ -159,7 +162,26 @@ export class ToolExecutor {
         this.repo.updateRevisionInstruction(ri.revision_instruction_id as string, {
           status: 'scope_violation',
         });
-        return { success: false, error: `越界修改被拒绝: ${scopeResult.detail}` };
+        // 支柱一/三：越界后系统自动重发一份同 scope/issue_ids 的返修指令（status=issued，仍 active），
+        // 让生成 Agent 可在同一 Turn 内重试。否则指令进 scope_violation 终态后，生成 Agent 的后续
+        // 合规版本会因无 active instruction 被当成 draft，Issue 永远卡在 repairing，门禁永远拦。
+        const retriedIssueIds = JSON.parse(ri.issue_ids as string) as string[];
+        this.repo.insertRevisionInstruction({
+          revision_instruction_id: this.idGen.generate('ri'),
+          case_id: caseId,
+          target_agent: ri.target_agent as string,
+          target_artifact_version_id: (ri.target_artifact_version_id as string | null) ?? null,
+          issue_ids: JSON.stringify(retriedIssueIds),
+          editable_anchors: JSON.stringify(editableAnchors),
+          frozen_anchors: JSON.stringify(frozenAnchors),
+          status: 'issued' satisfies RevisionInstructionStatus,
+          source_message_id: messageId,
+          created_at: this.clock.now(),
+        });
+        return {
+          success: false,
+          error: `越界修改被拒绝: ${scopeResult.detail}。已自动重发返修指令，请严格只修改 editable_anchors 范围内的行（不增删行、不动 frozen 行）后重新发布。`,
+        };
       }
 
       // 通过校验：更新 Issue 和 Revision Instruction 状态
@@ -367,6 +389,21 @@ export class ToolExecutor {
     }
 
     let revisionInstructionId: string | undefined;
+
+    // 支柱一：模型不应被要求完美管理 issue_ids。supervisor 发返修（带 editable/frozen scope）
+    // 却漏填 issue_ids 时，系统自动补齐为当前 Case 的 open blocking issues——否则 Issue 生命周期
+    // 断裂（不进 repairing/claimed_fixed/verified），交付门禁会永远拦截，真实模型下频繁触发。
+    const scope = input.scope;
+    const hasRepairScope = !!scope
+      && ((scope.editable_anchors?.length ?? 0) > 0 || (scope.frozen_anchors?.length ?? 0) > 0);
+    if (hasRepairScope && (!scope!.issue_ids || scope!.issue_ids.length === 0)) {
+      const openBlocking = this.repo.getIssuesByCase(caseId).filter(
+        (i) => i.status === 'open' && i.severity === 'blocking',
+      );
+      if (openBlocking.length > 0) {
+        scope!.issue_ids = openBlocking.map((i) => i.issue_id as string);
+      }
+    }
 
     // 如果携带 issue_ids，创建 Revision Instruction
     if (input.scope?.issue_ids && input.scope.issue_ids.length > 0) {

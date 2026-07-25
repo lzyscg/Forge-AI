@@ -6,7 +6,7 @@
 
 import { resolve, dirname } from 'node:path';
 import { mkdirSync } from 'node:fs';
-import type { PiPort, PiToolDefinition, ScenarioConfig } from '@forge-ai/contracts';
+import type { PiPort, PiToolDefinition, ScenarioConfig, RepositoryPort } from '@forge-ai/contracts';
 import { CaseService, TurnExecutor, RecoveryService } from '@forge-ai/application';
 import { SqliteRepository, FakePiAdapter, RealPiAdapter, SystemClock, UuidGenerator, FileConfigLoader } from '@forge-ai/adapters';
 import type { FakePiScript } from '@forge-ai/adapters';
@@ -97,6 +97,56 @@ const TOOL_DEFINITIONS: PiToolDefinition[] = [
     },
   },
 ];
+
+/**
+ * 构造崩溃恢复续跑消息：附 Case 当前状态摘要，让 start_agent 能据实决定下一步
+ * （路由审核 / 下发返修 / 申请交付），而不是收到一句模糊的"续跑"后停滞。
+ * 全部从配置 + DB 状态派生，不含业务角色名硬编码（铁律 1）。
+ */
+function buildResumeContextMessage(
+  caseId: string,
+  repo: RepositoryPort,
+  config: ScenarioConfig,
+): string {
+  const lines: string[] = ['系统崩溃恢复后续跑。请根据以下当前进度决定下一步：'];
+  const caseRecord = repo.getCase(caseId);
+  if (caseRecord) {
+    lines.push(`- Case 状态: ${caseRecord.status}`);
+  }
+  // 各产物类型的最新版本（配置驱动，不写死产物类型名）
+  for (const at of config.artifact_types) {
+    const artifact = repo.getArtifactByTypeAndCase(caseId, at.type);
+    if (artifact) {
+      const latest = repo.getLatestVersion(artifact.artifact_id as string);
+      if (latest) {
+        lines.push(`- 最新产物 [${at.type}]: v${latest.version} (${latest.status})`);
+      }
+    }
+  }
+  // 待处理 Issue
+  const issues = repo.getIssuesByCase(caseId);
+  const active = issues.filter((i) =>
+    ['open', 'repairing', 'claimed_fixed', 'reopened'].includes(i.status as string),
+  );
+  if (active.length > 0) {
+    lines.push(
+      `- 待处理 Issue: ${active.length} 个（${active.map((i) => `${i.severity}:${i.status}`).join(', ')}）`,
+    );
+  } else {
+    lines.push('- 待处理 Issue: 无');
+  }
+  // 活跃返修指令
+  const revisions = repo.getActiveRevisionInstructions(caseId);
+  if (revisions.length > 0) {
+    lines.push(`- 活跃返修指令: ${revisions.length} 条`);
+  } else {
+    lines.push('- 活跃返修指令: 无');
+  }
+  lines.push(
+    '请依据上述进度决定下一步：若产物待审核则路由给审核方，若需返修则下发返修指令，若已满足交付条件则申请交付。',
+  );
+  return lines.join('\n');
+}
 
 async function main() {
   // 读取环境变量
@@ -206,10 +256,12 @@ async function main() {
             }
           }
         }
-        // 如果无法从工具调用推断，使用 start_agent 重新开始
+        // 如果无法从工具调用推断（例如最后完成的是 generator 的 publish 或 reviewer 的
+        // submit_evaluation，这些不走 route_message），用 start_agent 续跑，并附 Case 状态
+        // 摘要--否则一句模糊的"续跑"会让模型停滞（真实 Pi 崩溃恢复实测卡在 waiting_review）。
         if (!resumeAgentKey) {
           resumeAgentKey = scenarioConfig.start_agent;
-          resumeMessage = '系统崩溃恢复后续跑。请检查当前进度并决定下一步。';
+          resumeMessage = buildResumeContextMessage(caseId, repo, scenarioConfig);
         }
       }
     }
@@ -301,16 +353,22 @@ async function main() {
         opened_at: clock.now(),
         closed_at: null,
       });
-      // 对于真实 Pi adapter，注册 DB session_id 以便 turn-executor 可以使用
+      // 对于真实 Pi adapter，注册 DB session_id -> 刚创建的 pi_session_ref 的别名
       if (pi instanceof RealPiAdapter) {
-        pi.registerSession(sessionId, currentAgentKey, agentConfig.session.policy);
+        pi.registerSession(sessionId, piSession.session_ref);
       }
     } else {
       // persistent 策略：复用已有 Session（继承历史上下文）
       sessionId = session.session_id as string;
-      // 对于真实 Pi adapter，确保 session 已注册（用于崩溃恢复场景）
       if (pi instanceof RealPiAdapter) {
-        pi.registerSession(sessionId, currentAgentKey, agentConfig.session.policy);
+        // 跨进程恢复（2.3 硬指标）：进程重启后 adapter 内存 sessions map 为空，
+        // registerSession 会因 this.sessions.get(pi_session_ref)===undefined 而成为 no-op，
+        // 随后 executeTurn({session_ref: sessionId}) 会报 "Session not found"。
+        // 必须先 resumeSession 把 persistent session 从磁盘文件加载回内存（恢复完整对话历史），
+        // 再 registerSession 建 DB session_id -> pi_session_ref 别名。
+        // resumeSession 幂等：同一进程内已加载则直接返回，不重复读盘。
+        await pi.resumeSession(session.pi_session_ref as string);
+        pi.registerSession(sessionId, session.pi_session_ref as string);
       }
     }
 
@@ -406,13 +464,26 @@ async function main() {
           currentMessage = `审核已通过。产物已通过复审验证。请决定是否申请交付。`;
           routed = true;
           const cr = repo.getCase(caseId);
-          if (cr && cr.status === 'repairing') {
+          if (cr && (cr.status === 'repairing' || cr.status === 'waiting_review')) {
             caseService.transitionCaseStatus(caseId, 'running');
           }
         } else {
           // 审核不通过，回到总控
           currentAgentKey = scenarioConfig.start_agent;
-          currentMessage = `审核未通过。发现问题：${evalOutput.issue_ids?.join(', ')}。请决定返修方案。`;
+          // 把 issue 详情（problem/anchor/evidence）带进消息，否则总控无法构造 editable/frozen 返修范围
+          const issueDetails = ((evalOutput.issue_ids as string[]) ?? [])
+            .map((id) => {
+              const iss = repo.getIssue(id);
+              if (!iss) return `issue ${id}: (详情不可用)`;
+              let anchor: any = iss.anchor;
+              try { anchor = JSON.parse(iss.anchor as string); } catch { /* keep raw */ }
+              const anchorStr = anchor && typeof anchor === 'object'
+                ? `${anchor.type}:${anchor.value}`
+                : String(anchor);
+              return `issue ${id} [${iss.severity}] 锚点 ${anchorStr}\n  问题: ${iss.problem}\n  证据: ${iss.evidence}`;
+            })
+            .join('\n');
+          currentMessage = `审核未通过，需要返修。以下是审核发现的具体问题：\n${issueDetails}\n\n请据此制定返修方案：使用 route_message 派给负责生成产物的 Agent，在 scope 中明确 editable_anchors（可改的行）、frozen_anchors（必须冻结的行），并在 issue_ids 中关联上述问题。`;
           routed = true;
           const cr = repo.getCase(caseId);
           if (cr && cr.status === 'waiting_review') {
@@ -444,7 +515,10 @@ async function main() {
                 currentMessage = `请审核最新版本的产物。`;
                 routed = true;
                 const cr = repo.getCase(caseId);
-                if (cr && cr.status === 'running') {
+                // 初版发布：running -> waiting_review；
+                // 返修版发布：repairing -> waiting_review（否则 case 卡在 repairing，
+                // 后续 reviewer 再判 repair、supervisor 再发返修会触发 repairing->repairing 非法转换）
+                if (cr && (cr.status === 'running' || cr.status === 'repairing')) {
                   caseService.transitionCaseStatus(caseId, 'waiting_review');
                 }
               }

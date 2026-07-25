@@ -47,6 +47,8 @@ routes:
 context_rules:
   to_reviewer:
     include: [current_artifact_version, input_constraints]
+  to_supervisor:
+    include: [current_artifact_version, target_issues]
   to_generator_repair:
     include: [current_artifact_version, target_issues, revision_scope]
 

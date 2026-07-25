@@ -5,6 +5,8 @@ dist/
 *.db-wal
 *.db-shm
 .env
+.env.local
+.env.*.local
 .DS_Store
 ._*
 data/
@@ -12,3 +14,4 @@ deepseek_config.txt
 *.tsbuildinfo
 .qoder/
 *.canvas.status.json
+.claude/
