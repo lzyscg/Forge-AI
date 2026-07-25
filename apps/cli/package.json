@@ -1,0 +1,14 @@
+{
+  "name": "@forge-ai/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "forge": "./bin.js" },
+  "dependencies": {
+    "@forge-ai/application": "*",
+    "@forge-ai/adapters": "*",
+    "@forge-ai/contracts": "*",
+    "commander": "^12.0.0",
+    "dotenv": "^16.4.0"
+  }
+}

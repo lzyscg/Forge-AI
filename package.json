@@ -9,7 +9,8 @@
     "packages/application",
     "packages/adapters",
     "apps/worker",
-    "apps/web"
+    "apps/web",
+    "apps/cli"
   ],
   "scripts": {
     "dev": "tsx apps/worker/src/main.ts",
