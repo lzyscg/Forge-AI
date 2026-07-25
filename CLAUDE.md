@@ -112,6 +112,7 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 15. **worker recovery 路径未接 RealPi resumeSession**（已修，2.3 硬指标）：进程重启后 `RealPiAdapter` 内存 `sessions` map 为空，`main.ts` 复用 persistent session 时只调 `registerSession(sessionId, pi_session_ref)`，而 `registerSession` 内部 `this.sessions.get(pi_session_ref)` 返回 undefined → 别名建不上（no-op）→ 随后 `executeTurn({session_ref: sessionId})` 报 `Session not found`、连续 3 次 → Case 被标 `failed`。修复：`main.ts` persistent 复用分支先 `await pi.resumeSession(pi_session_ref)` 从磁盘加载回内存，再 `registerSession`。`resumeSession` 幂等（同进程已加载则直接返回）。
 16. **resumeSession 不能用 continueRecent**（已修）：旧 `resumeSession` 用 `SessionManager.continueRecent(cwd, sessionDir)`，它在找不到 .jsonl / cwd 不匹配 / 读盘竞态时会**静默新建空 session**，历史丢失却不报错 → 违反 2.3"persistent session 续跑后上下文含历史"。改为显式 `readdirSync` 定位 sessionRef 目录下 mtime 最新的 `.jsonl`，用 `SessionManager.open(file, dir, cwd)` 打开；找不到文件就抛错（fail loud，不静默丢历史）。每个 sessionRef 目录正常只有 1 个 `.jsonl`（create 时生成）。
 17. **恢复消息不能太模糊**（已修）：旧 fallback 恢复消息是"系统崩溃恢复后续跑。请检查当前进度并决定下一步。"，真实模型收到后停滞（实测卡在 `waiting_review`，supervisor 不路由）。改为 `buildResumeContextMessage`：附 Case 状态 + 各产物类型最新版本 + 待处理 Issue + 活跃返修指令摘要（全配置驱动，铁律 1），让 start_agent 据实决定路由审核/返修/交付。修复后 Real Pi kill-9 测试 supervisor 续跑 Turn 3-5 一路到 approved。
+18. **Case 输入硬编码是铁律 1 残留**（已修）：旧 `main.ts` 把新 Case 输入写死为歌词（`reference_lyrics`/`fixed_phrase`="你是我的山歌"）+ 歌词语义首条消息（"参考歌词：…固定金句：…"）+ 写死 title "歌词生产"。导致 copywriting 场景收到歌词形状的输入（它声明的是 `product_name`/`promotion_info`），2.4 验收过的只是"结构不同"但输入内容无意义。改为 `resolveInputPayload`（优先级 `FORGE_INPUT` JSON > `FORGE_INPUT_FILE` 路径 > `<scenario 目录>/input.example.json` > fail loud）+ 按 `scenario.input_fields` 校验字段齐全 + `renderInputMessage` 按 field label 通用渲染 + title 用 `scenario.name`。两场景各补一份 `input.example.json` 示例输入。
 
 ## 待办（新 Agent 接手后优先）
 
@@ -158,3 +159,12 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 6. 新增 `README.md`（交付标准 4.2）：安装/启动 worker/启动 web/Fake Pi/真实 Pi/环境变量说明。
 
 **验证证据**：`data/crash-realpi.db` case `case_258d56979d924d13`（5 Turn approved）。Phase 1 跑 2 Turn 后 `taskkill /F`，Phase 2 同 DB+同 session dir 重启续跑：Turn 1-2 哈希不变（铁律 4）、v1 `draft->delivered`（同 content_hash `b13f4594`）、persistent supervisor session `.jsonl` 7->23 条目（跨进程历史续跑）、recovery 控制事件 `recovery_started`+`recovery_completed`、门禁 `fail,pass`（首次未过、调整后过）、最终 `approved`。
+
+### Case 输入配置驱动（铁律 1 收尾，2026-07-25 续）
+修 `main.ts` 把新 Case 输入从硬编码歌词改为配置驱动（坑 18）：
+- 新增 `resolveInputPayload`：`FORGE_INPUT`(JSON) > `FORGE_INPUT_FILE`(路径) > `<scenario 目录>/input.example.json` > fail loud；按 `scenario.input_fields` 校验字段齐全，缺字段 fail loud。
+- 新增 `renderInputMessage`：按 field label 通用渲染首条消息（去掉"参考歌词/固定金句"歌词语义）。
+- title 用 `scenario.name`（歌词生产/文案生产），不再写死"歌词生产"。
+- 新增 `scenarios/songwriting/input.example.json`、`scenarios/copywriting/input.example.json` 示例输入。
+
+**验证证据**：`npm run check` 0 错误 / `npm run test` 78 passed / Fake Pi songwriting e2e 8 项无回归。copywriting Fake Pi 实测：title "文案生产"、input_payload `{"product_name":...,"promotion_info":...}`、首条消息"产品名称:…促销信息:…"、最终 approved。`FORGE_INPUT` 环境变量覆盖实测生效；缺字段实测 fail loud（`输入缺少必填字段：fixed_phrase`）。

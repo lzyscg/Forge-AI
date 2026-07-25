@@ -57,7 +57,11 @@ npm rebuild better-sqlite3 esbuild
 | `DEEPSEEK_API_KEY` | `PI_MODE=real` 时必需 | — | DeepSeek API Key（铁律 6：只走环境变量，不进日志/DB/前端） |
 | `PI_MODEL_ID` | 否 | `deepseek-v4-flash` | 模型 ID（`deepseek-v4-flash` 或 `deepseek-v4-pro`） |
 | `PI_SESSION_DIR` | 否 | `./data/pi-sessions` | persistent Pi Session 文件持久化目录 |
+| `FORGE_INPUT` | 否 | - | 新 Case 的输入 payload（JSON 字符串），形状对应当前场景的 `input_fields` |
+| `FORGE_INPUT_FILE` | 否 | - | 新 Case 输入 payload 的 JSON 文件路径（多行内容推荐用这个） |
 | `MAX_TURNS` | 否 | `20` | 测试钩子：限制本轮执行的 Turn 数（模拟"跑到一半退出"，用于崩溃恢复测试） |
+
+> 若 `FORGE_INPUT` / `FORGE_INPUT_FILE` 都未设置，worker 会读 `<scenario 目录>/input.example.json` 作为示例输入；都没有则 fail loud。每个场景自带一份 `input.example.json`（songwriting 歌词、copywriting 产品信息）。
 
 ---
 

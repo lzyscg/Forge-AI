@@ -5,7 +5,7 @@
  */
 
 import { resolve, dirname } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync } from 'node:fs';
 import type { PiPort, PiToolDefinition, ScenarioConfig, RepositoryPort } from '@forge-ai/contracts';
 import { CaseService, TurnExecutor, RecoveryService } from '@forge-ai/application';
 import { SqliteRepository, FakePiAdapter, RealPiAdapter, SystemClock, UuidGenerator, FileConfigLoader } from '@forge-ai/adapters';
@@ -148,6 +148,63 @@ function buildResumeContextMessage(
   return lines.join('\n');
 }
 
+/**
+ * 解析 Case 输入 payload（铁律 1：输入不写死在源码，按 scenario.input_fields 驱动）。
+ * 优先级：FORGE_INPUT 环境变量(JSON) > FORGE_INPUT_FILE 环境变量(路径) >
+ *        <scenario 目录>/input.example.json > fail loud。
+ * 校验：scenario.input_fields 声明的字段必须齐全。
+ */
+function resolveInputPayload(
+  scenarioPath: string,
+  config: ScenarioConfig,
+): Record<string, unknown> {
+  let raw: string;
+  let source: string;
+  if (process.env.FORGE_INPUT) {
+    raw = process.env.FORGE_INPUT;
+    source = 'FORGE_INPUT';
+  } else if (process.env.FORGE_INPUT_FILE) {
+    const file = resolve(process.env.FORGE_INPUT_FILE);
+    raw = readFileSync(file, 'utf-8');
+    source = `FORGE_INPUT_FILE(${file})`;
+  } else {
+    const samplePath = resolve(dirname(scenarioPath), 'input.example.json');
+    if (existsSync(samplePath)) {
+      raw = readFileSync(samplePath, 'utf-8');
+      source = `sample(${samplePath})`;
+    } else {
+      throw new Error(
+        `未提供 Case 输入：请设置 FORGE_INPUT(JSON) 或 FORGE_INPUT_FILE(路径)，` +
+          `或在 ${samplePath} 放置示例输入。期望字段：${config.input_fields.map((f) => f.key).join(', ')}`,
+      );
+    }
+  }
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`输入 JSON 解析失败(来源 ${source})：${e instanceof Error ? e.message : e}`);
+  }
+  const missing = config.input_fields.filter((f) => !(f.key in payload)).map((f) => f.key);
+  if (missing.length > 0) {
+    throw new Error(
+      `输入缺少必填字段(来源 ${source})：${missing.join(', ')}。` +
+        `scenario.input_fields 要求：${config.input_fields.map((f) => f.key).join(', ')}`,
+    );
+  }
+  console.log(`  输入来源: ${source}`);
+  return payload;
+}
+
+/**
+ * 把输入 payload 渲染成首条任务消息（通用，不写死歌词/文案语义）。
+ * 按 scenario.input_fields 的 label 逐字段渲染。
+ */
+function renderInputMessage(payload: Record<string, unknown>, config: ScenarioConfig): string {
+  const lines = config.input_fields.map((f) => `${f.label}: ${payload[f.key]}`);
+  return `请开始执行任务。用户输入：\n${lines.join('\n')}`;
+}
+
 async function main() {
   // 读取环境变量
   const piMode = process.env.PI_MODE ?? 'fake';
@@ -279,14 +336,11 @@ async function main() {
     currentMessage = resumeMessage!;
     console.log(`\n[Case] 续跑: ${caseId} (从 agent: ${currentAgentKey} 继续)`);
   } else {
-    // 创建新 Case
-    const inputPayload = {
-      reference_lyrics: '月光洒在老路上\n你的影子在前方\n我们走过的地方\n花开满了山岗\n风吹过耳旁\n像你说的晚安',
-      fixed_phrase: '你是我的山歌',
-    };
+    // 创建新 Case（铁律 1：输入从外部/示例文件读，不写死在源码）
+    const inputPayload = resolveInputPayload(scenarioPath, scenarioConfig);
 
     caseId = caseService.createCase({
-      title: `歌词生产 - ${new Date().toISOString().slice(0, 10)}`,
+      title: `${scenarioConfig.scenario.name} - ${new Date().toISOString().slice(0, 10)}`,
       scenarioConfig,
       inputPayload,
     });
@@ -297,7 +351,7 @@ async function main() {
     console.log(`[Case] 启动: ${caseId}`);
 
     currentAgentKey = scenarioConfig.start_agent;
-    currentMessage = `请开始执行任务。用户输入：\n参考歌词：${inputPayload.reference_lyrics}\n固定金句：${inputPayload.fixed_phrase}`;
+    currentMessage = renderInputMessage(inputPayload, scenarioConfig);
   }
 
   // 执行 Turn 循环
