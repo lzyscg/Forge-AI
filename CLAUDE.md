@@ -71,6 +71,18 @@ npm run test:integration # 真实 PG（本项目用 SQLite，此命令可能为�
 npm run dev              # tsx apps/worker/src/main.ts（默认 Fake Pi + songwriting）
 ```
 
+## 工作流（提交规则·用户明确要求）
+
+**每完成一处改动（代码或文档），自动 `git commit` + `git push origin main`，无需每次问用户。** 这是用户 2026-07-25 明确授予的 standing authorization，覆盖之前"推送前确认"的谨慎做法。
+
+细则：
+- 直接提交到 `main`（沿用本项目 direct-to-main 模式，无 PR 流程）。
+- 一处改动 = 一个有意义的单元（一个 fix / 一个 feature / 一组相关 doc），不要把半成品/未编译通过的中间状态提交上去。改动后先 `npm run check` 确认 0 错误再提交。
+- 提交信息用 conventional commit（`feat:` / `fix:` / `docs:`），中文描述，结尾带 `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`。
+- push 走本仓库已配的 `http.proxy=127.0.0.1:10808`（坑 3）。代理失效时（`Connection reset` / 超时）先排查代理是否在跑，别误认为是代码问题。
+- 仅以下情况仍需先问用户：force-push、改写已推送的历史、删除分支、涉及密钥/敏感数据的提交。
+- `data/`（*.db / pi-sessions）、`node_modules/`、`.env*`、`.claude/` 已 gitignore，不会被提交。
+
 ## 如何运行 / 测试
 
 **跑 Fake Pi 场景**（默认 songwriting）：
@@ -97,7 +109,7 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 
 1. **不要读旧仓库代码**：父目录的旧 TS monorepo 和 `pi-pipline-main` Python 项目是失败品，只保留"分层约定"思路，不复用一行实现。唯一允许借用的旧事实是 Pi 包名/仓库地址。
 2. **`docs/HANDOFF.md` 是过时的**：它描述旧 PostgreSQL/Kysely/Next16/SSE/Playwright 项目，与当前 SQLite/pi-coding-agent 代码**完全不符**，已被错误带进本仓库。**不要依据它判断当前状态**。
-3. **Git 版本控制状态**：`Forge-AI-main/` **已是独立 git 仓库**（与父目录 `C:\Users\13863\Desktop\zhihu\Forge AI` 的旧项目仓库隔离，无 remote，纯本地）。当前在 `main` 分支，提交历史：`ecc9990`（Real Pi 崩溃恢复 + Web 回放页 + README）<- `836e072`（Fake Pi 全链路 + 崩溃恢复验证）。`.gitignore` 已排除 `node_modules/`、`data/`、`*.db`、`.env*`、`deepseek_config.txt`、`.claude/`。改动后直接提交到 `main` 即可（沿用现有 direct-to-main 模式）。
+3. **Git 版本控制状态**：`Forge-AI-main/` **已是独立 git 仓库**（与父目录 `C:\Users\13863\Desktop\zhihu\Forge AI` 的旧项目仓库隔离）。当前在 `main` 分支（direct-to-main，无 PR 流程）。`.gitignore` 已排除 `node_modules/`、`data/`、`*.db`、`.env*`、`deepseek_config.txt`、`.claude/`。**remote `origin = https://github.com/lzyscg/Forge-AI.git`**（用户自有仓库），本仓库配了 `http.proxy=127.0.0.1:10808` 走本地 V2Ray 代理访问 GitHub（国内网络必需）。**每处改动自动 commit + push（见上"工作流"），无需逐次问用户。** 最新提交历史见 `git log --oneline`。
 4. **不要读旧仓库代码**：父目录的旧 TS monorepo 和 `pi-pipline-main` Python 项目是失败品，只保留"分层约定"思路，不复用一行实现。唯一允许借用的旧事实是 Pi 包名/仓库地址。
 5. **依赖安装**：`node_modules` 必须本机 `npm install`，不能从别处拷贝（之前拷贝损坏：native 二进制缺失、包空壳）。已加 `.npmrc` 设 `allow-scripts=true`（npm 11 默认拦 native 脚本）；重装后需 `npm rebuild better-sqlite3 esbuild` 生成 native 二进制。
 6. **环境**：Node v24 / npm 11 / TS ^5.5 / better-sqlite3 11.x（通过 N-API prebuild 支持 Node 24）。`engines` 写 `>=20`。
