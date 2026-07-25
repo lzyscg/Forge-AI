@@ -35,6 +35,11 @@ describe('Case 状态机', () => {
     expect(canTransitionCase('waiting_human', 'running')).toBe(true);
   });
 
+  it('allows waiting_human → running (resume)', () => {
+    expect(canTransitionCase('waiting_human', 'running')).toBe(true);
+    expect(transitionCase('waiting_human', 'running')).toBe('running');
+  });
+
   it('approved 是终态，不能转换', () => {
     expect(canTransitionCase('approved', 'running')).toBe(false);
     expect(() => transitionCase('approved', 'running')).toThrow();

@@ -7,3 +7,4 @@ export * from './sqlite-repository.js';
 export * from './fake-pi.js';
 export * from './pi-adapter.js';
 export * from './base-adapters.js';
+export * from './paths.js';

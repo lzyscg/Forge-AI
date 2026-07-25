@@ -38,7 +38,7 @@ contracts  ->  domain  ->  application  ->  adapters  ->  apps
 | `apps/worker` | 唯一启动 Pi Session 的入口，跑 Agent 循环 | `src/main.ts` |
 | `apps/web` | 只读回放页（Next.js，轮询，不调 Pi） | `app/page.tsx`, `lib/db.ts` |
 
-**4+1 工具**（支柱一落地，参数只留最小字段）：`publish_artifact` / `submit_evaluation` / `route_message` / `approve_delivery` + `request_human_input`（降级，Case 停 `waiting_human`）。`approve_delivery` 不许模型传版本号（铁律 2），系统自动定位。
+**5+1 工具**（支柱一落地，参数只留最小字段）：`publish_artifact` / `submit_evaluation` / `route_message` / `approve_delivery` + `request_human_input`（降级，Case 停 `waiting_human`）+ `read`（受限，仅 skills 目录白名单）。`approve_delivery` 不许模型传版本号（铁律 2），系统自动定位。
 
 **交付门禁 5 项**（铁律 3 灵魂，`domain/delivery-gate.ts`）：版本有效 / 该版审核通过（不继承旧版）/ 所有 blocking Issue `verified` / 无运行中返修 / 无未完成 Turn。
 
@@ -60,7 +60,10 @@ contracts  ->  domain  ->  application  ->  adapters  ->  apps
 | 2.6 Web 回放页 | ✅ | `next dev` HTTP 200，显示 Case/版本diff/Issue/门禁 |
 | 3.1 事务原子性 / 3.2 幂等键 / 3.3 上下文快照 / 3.4 WAL | ✅ | WAL+busy_timeout=5000 |
 | 铁律 4 issue_events 完整 | ✅ 已修 | created→repairing→claimed_fixed→verified |
-| **2.2 真实 Pi 全链路** | ✅ 已验证 | 16 个真实 Pi Case（9 approved / 7 stopped）。**含完整返修闭环**：v1->reviewer 挑出 blocking->supervisor 发 editable/frozen 返修->generator v2->reviewer approve->issue `created->repairing->claimed_fixed->verified`->门禁 5 项 pass->v2 delivered/v1 superseded。凭证 `deepseek_config.txt`，模型 `deepseek-v4-flash`/`pro`（推理模型，见下"坑 8"）。DB `data/real-pi-multi.db`。详见下"最近的改动"。|
+| **2.2 真实 Pi 全链路** | ✅ 已验证 | 16 个真实 Pi Case（9 approved / 7 stopped）。**含完整返修闭环**：v1->reviewer 挑出 blocking->supervisor 发 editable/frozen 返修->generator v2->reviewer approve->issue `created->repairing->claimed_fixed->verified`->门禁 5 项 pass->v2 delivered/v1 superseded。凭证 `deepseek_config.txt`，模型 `deepseek-v4-flash`/`pro`（推理模型，见下“坑 8”）。DB `data/real-pi-multi.db`。详见下“最近的改动”。|
+| **Round 2 CLI 操作系统** | ✅ | `npx forge --help` 可用；Fake Pi CLI 全链路 approved；stdout 双阶段协议；e2e 8/8 |
+| **Round 2 Skill 注入** | ✅ | SDK 探针通过；PiPort 扩展；read 白名单安全单测 9 项；rhyme skill 配置 |
+| **Round 2 UI 操作系统** | ✅ | API routes detached spawn；前端选模板/填输入/跑 case/恢复 waiting_human；next build 成功 |
 
 ## 标准命令
 
@@ -125,6 +128,9 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 16. **resumeSession 不能用 continueRecent**（已修）：旧 `resumeSession` 用 `SessionManager.continueRecent(cwd, sessionDir)`，它在找不到 .jsonl / cwd 不匹配 / 读盘竞态时会**静默新建空 session**，历史丢失却不报错 → 违反 2.3"persistent session 续跑后上下文含历史"。改为显式 `readdirSync` 定位 sessionRef 目录下 mtime 最新的 `.jsonl`，用 `SessionManager.open(file, dir, cwd)` 打开；找不到文件就抛错（fail loud，不静默丢历史）。每个 sessionRef 目录正常只有 1 个 `.jsonl`（create 时生成）。
 17. **恢复消息不能太模糊**（已修）：旧 fallback 恢复消息是"系统崩溃恢复后续跑。请检查当前进度并决定下一步。"，真实模型收到后停滞（实测卡在 `waiting_review`，supervisor 不路由）。改为 `buildResumeContextMessage`：附 Case 状态 + 各产物类型最新版本 + 待处理 Issue + 活跃返修指令摘要（全配置驱动，铁律 1），让 start_agent 据实决定路由审核/返修/交付。修复后 Real Pi kill-9 测试 supervisor 续跑 Turn 3-5 一路到 approved。
 18. **Case 输入硬编码是铁律 1 残留**（已修）：旧 `main.ts` 把新 Case 输入写死为歌词（`reference_lyrics`/`fixed_phrase`="你是我的山歌"）+ 歌词语义首条消息（"参考歌词：…固定金句：…"）+ 写死 title "歌词生产"。导致 copywriting 场景收到歌词形状的输入（它声明的是 `product_name`/`promotion_info`），2.4 验收过的只是"结构不同"但输入内容无意义。改为 `resolveInputPayload`（优先级 `FORGE_INPUT` JSON > `FORGE_INPUT_FILE` 路径 > `<scenario 目录>/input.example.json` > fail loud）+ 按 `scenario.input_fields` 校验字段齐全 + `renderInputMessage` 按 field label 通用渲染 + title 用 `scenario.name`。两场景各补一份 `input.example.json` 示例输入。
+19. **CLI stdout 协议**（Round 2）：`case run` 第 1 行必须是 `{"case_id":"..."}`（`fs.writeSync` 同步 flush），末行是结果 JSON。fatal 错误也写 stdout errorJson + exit 非 0（不只 console.error）。API route 读 stdout 第 1 行后立即 `child.unref()`。
+20. **read 工具白名单**（Round 2，铁律 6）：`createReadTool` 的 `access` 用 `realpathSync` + `path.relative` 检查路径在 `scenarios/<id>/skills/` 内。symlink 逃逸被拦截。单测覆盖 `.env*`/`data/*.db`/源码/`../`/绝对路径。
+21. **next dev caveat**（Round 2）：热重载可能杀 detached 子进程，被杀的 case 留 running 状态。验收用 `next start`，被杀的 case 可用 CLI `forge case run <id>` 续跑。
 
 ## 待办（新 Agent 接手后优先）
 

@@ -94,6 +94,24 @@ PI_MODE=real DEEPSEEK_API_KEY=sk-xxxx PI_MODEL_ID=deepseek-v4-flash \
 
 ---
 
+## CLI 操作系统（Round 2 新增）
+
+```bash
+# 查看帮助
+npx forge --help
+
+# Fake Pi 全链路
+npx forge case create --template songwriting --input '{"reference_lyrics":"...","fixed_phrase":"..."}' --db ./data/cli.db
+npx forge case run <case_id> --wait --db ./data/cli.db
+
+# 真实 Pi
+DEEPSEEK_API_KEY=sk-xxxx npx forge case run <case_id> --wait --mode real --db ./data/cli.db
+```
+
+完整命令见 `使用说明.md` 第 11 章。
+
+---
+
 ## 启动 Web 回放页
 
 ```bash

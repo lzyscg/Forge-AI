@@ -7,6 +7,7 @@
 import type {
   PiPort,
   PiSession,
+  PiSessionOptions,
   PiMessage,
   PiToolDefinition,
   PiTurnResult,
@@ -72,7 +73,7 @@ export class FakePiAdapter implements PiPort {
 
   /**
    * 设置某个场景的 turn 计数器（崩溃恢复续跑时由 worker 调用）。
-   * 让 Fake Pi 从"最后完成 Turn 的下一个"脚本位置继续消费，避免续跑时脚本错位。
+   * 让 Fake Pi 从“最后完成 Turn 的下一个”脚本位置继续消费，避免续跑时脚本错位。
    * index 传 lastCompletedTurn.sequence（1-based）正好对应 0-based 的下一个脚本索引。
    */
   setTurnCounter(scenarioId: string, index: number): void {
@@ -81,18 +82,33 @@ export class FakePiAdapter implements PiPort {
       this.activeScenarioId = scenarioId;
     }
   }
+  
+  /** PiPort 接口方法：委托给 setContextResolver */
+  registerContextResolver(fn: () => Record<string, string>): void {
+    this.setContextResolver(fn);
+  }
+  
+  /** PiPort 接口方法：委托给 setTurnCounter */
+  alignTurnCounter(scenarioId: string, sequence: number): void {
+    this.setTurnCounter(scenarioId, sequence);
+  }
 
-  async createSession(agentKey: string, policy: string, scopeKey?: string): Promise<PiSession> {
+  async createSession(agentKey: string, policy: string, scopeKey?: string, _options?: PiSessionOptions): Promise<PiSession> {
     this.sessionCounter++;
     return { session_ref: `fake_session_${this.sessionCounter}_${agentKey}` };
   }
 
-  async resumeSession(sessionRef: string): Promise<PiSession> {
+  async resumeSession(sessionRef: string, _options?: PiSessionOptions): Promise<PiSession> {
     return { session_ref: sessionRef };
   }
 
   async closeSession(sessionRef: string): Promise<void> {
     // no-op for fake
+  }
+
+  /** FakePi 不实现 skill 注入，返回空数组 */
+  getSkills(_sessionRef: string): Array<{ name: string; description: string }> {
+    return [];
   }
 
   async executeTurn(
