@@ -77,15 +77,20 @@ export function registerTemplateCommand(program: Command): void {
       }
     });
 
-  // forge template validate <yaml>
+  // forge template validate <name|path>
   template
-    .command('validate <yaml>')
-    .description('校验场景 YAML 配置')
+    .command('validate <name>')
+    .description('校验场景 YAML 配置（接受模板名或 YAML 路径）')
     .option('--human', '人类可读格式输出')
-    .action((yamlPath: string, opts) => {
-      const resolvedPath = resolve(yamlPath);
+    .action((nameOrPath: string, opts) => {
+      // 支持模板名（如 songwriting）或完整路径
+      let resolvedPath = resolve(nameOrPath);
       if (!existsSync(resolvedPath)) {
-        process.stderr.write(`[ERROR] 文件不存在: ${resolvedPath}\n`);
+        // 尝试作为模板名解析
+        resolvedPath = resolveFromRoot('scenarios', nameOrPath, 'scenario.yaml');
+      }
+      if (!existsSync(resolvedPath)) {
+        process.stderr.write(`[ERROR] 文件不存在: ${nameOrPath}\n`);
         process.exit(1);
       }
 

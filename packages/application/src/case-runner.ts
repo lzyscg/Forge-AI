@@ -136,7 +136,7 @@ export class CaseRunner {
     // 2. waiting_human → 返回 JSON + action_required hint
     if (status === 'waiting_human') {
       const result = this.buildResultJson(caseId);
-      result.action_required = 'Case is waiting for human input. Use resumeCaseWithHumanInput to continue.';
+      result.action_required = "use 'forge case resume <id> --answer'";
       return result;
     }
 
@@ -611,7 +611,7 @@ export class CaseRunner {
     // action_required
     let actionRequired: string | null = null;
     if (status === 'waiting_human') {
-      actionRequired = 'Case is waiting for human input.';
+      actionRequired = "use 'forge case resume <id> --answer'";
     }
 
     return {
