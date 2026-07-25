@@ -56,6 +56,12 @@ export interface PiPort {
     tools: PiToolDefinition[],
     toolExecutor?: PiToolExecutorFn,
   ): Promise<PiTurnResult>;
+  /** 注册上下文解析器（FakePi 用于动态替换脚本占位符） */
+  registerContextResolver?(fn: () => Record<string, string>): void;
+  /** 对齐 Turn 计数器（FakePi 崩溃恢复续跑时避免脚本错位） */
+  alignTurnCounter?(scenarioId: string, sequence: number): void;
+  /** 注册 DB session_id -> Pi 内部 session 的映射（RealPi 用于别名桥接） */
+  registerSession?(sessionId: string, piSessionRef: string): void;
 }
 
 // === Repository 端口 ===

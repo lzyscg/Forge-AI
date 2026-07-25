@@ -58,6 +58,15 @@ export class TurnExecutor {
   }
 
   async executeTurn(input: TurnExecutionInput): Promise<TurnExecutionResult> {
+    // 守卫：事务外查 case status，终态直接抛错（不 beginTransaction、不 insertTurn）
+    const caseRecord = this.repo.getCase(input.caseId);
+    if (caseRecord) {
+      const status = caseRecord.status as string;
+      if (status === 'stopped' || status === 'failed' || status === 'approved') {
+        throw new Error(`Case ${input.caseId} is in terminal state '${status}', cannot execute turn`);
+      }
+    }
+
     const turnId = this.idGen.generate('turn');
     const sequence = this.getNextSequence(input.caseId);
 

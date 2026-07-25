@@ -8,3 +8,4 @@ export * from './context-builder.js';
 export * from './tool-executor.js';
 export * from './turn-executor.js';
 export * from './recovery.js';
+export * from './case-runner.js';
