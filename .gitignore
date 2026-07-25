@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.next/
+*.db
+*.db-wal
+*.db-shm
+.env
+.DS_Store
+._*
+data/
+deepseek_config.txt
+*.tsbuildinfo
+.qoder/
+*.canvas.status.json

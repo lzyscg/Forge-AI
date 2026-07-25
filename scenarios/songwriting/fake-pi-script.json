@@ -1,0 +1,119 @@
+{
+  "turns": [
+    {
+      "agentKey": "supervisor",
+      "content": "收到任务，我来协调歌词生产。先把创作任务派给生成 Agent。",
+      "toolCalls": [
+        {
+          "name": "route_message",
+          "arguments": {
+            "target_agent": "generator",
+            "instruction": "请根据参考歌词的风格，创作一首新歌词。必须包含固定金句「你是我的山歌」。参考歌词描绘了月光、老路、花开的意境，请保持类似的田园抒情风格。",
+            "reason": "开始歌词创作任务"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    },
+    {
+      "agentKey": "generator",
+      "content": "好的，我来创作歌词。",
+      "toolCalls": [
+        {
+          "name": "publish_artifact",
+          "arguments": {
+            "artifact_type": "lyrics",
+            "content": "月光铺在青石巷\n你的身影在远方\n我们走过的地方\n花开满了山岗\n你是我的山歌\n唱不完的情长\n风吹过耳旁\n像你说的晚安",
+            "summary": "初版歌词，8行，田园抒情风格，包含固定金句「你是我的山歌」"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    },
+    {
+      "agentKey": "reviewer",
+      "content": "审核歌词 v1。发现第2行存在问题。",
+      "toolCalls": [
+        {
+          "name": "submit_evaluation",
+          "arguments": {
+            "verdict": "repair",
+            "issues": [
+              {
+                "severity": "blocking",
+                "anchor": { "type": "line", "value": "2" },
+                "problem": "第2行「你的身影在远方」与第1行「月光铺在青石巷」的意境不连贯，从近景突然跳到远方，缺乏过渡",
+                "evidence": "第1行是近景（青石巷），第2行突然变成远方，读者视角跳跃过大"
+              }
+            ],
+            "summary": "整体风格合格，固定金句已包含。但第2行意境跳跃过大，需要返修。"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    },
+    {
+      "agentKey": "supervisor",
+      "content": "收到审核意见。第2行确实需要修改。发出返修指令，只允许改第2行。",
+      "toolCalls": [
+        {
+          "name": "route_message",
+          "arguments": {
+            "target_agent": "generator",
+            "instruction": "请只修改第2行，解决意境跳跃问题。保持与第1行「月光铺在青石巷」的近景连贯性。其他行不要动。",
+            "scope": {
+              "editable_anchors": ["line:2"],
+              "frozen_anchors": ["line:1", "line:3-8"],
+              "issue_ids": ["PLACEHOLDER_ISSUE_ID"]
+            },
+            "reason": "审核发现第2行意境跳跃过大"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    },
+    {
+      "agentKey": "generator",
+      "content": "收到返修指令，只修改第2行。",
+      "toolCalls": [
+        {
+          "name": "publish_artifact",
+          "arguments": {
+            "artifact_type": "lyrics",
+            "content": "月光铺在青石巷\n你的影子在身旁\n我们走过的地方\n花开满了山岗\n你是我的山歌\n唱不完的情长\n风吹过耳旁\n像你说的晚安",
+            "summary": "返修v2：只修改了第2行，将「你的身影在远方」改为「你的影子在身旁」，保持近景连贯"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    },
+    {
+      "agentKey": "reviewer",
+      "content": "重新审核歌词 v2。第2行已修正，整体质量合格。",
+      "toolCalls": [
+        {
+          "name": "submit_evaluation",
+          "arguments": {
+            "verdict": "approve",
+            "issues": [],
+            "summary": "歌词v2审核通过。第2行意境连贯，固定金句完整，整体风格统一。"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    },
+    {
+      "agentKey": "supervisor",
+      "content": "审核已通过，申请交付。",
+      "toolCalls": [
+        {
+          "name": "approve_delivery",
+          "arguments": {
+            "summary": "审核通过，歌词质量合格，申请交付"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+# 第二验证场景：文案生成 + 质检
+# 证明平台未硬编码任何角色：只写新 YAML + 提示词 + Fake Pi 脚本，零代码改动
+
+scenario:
+  id: copywriting
+  name: 文案生产
+  version: 1
+
+input_fields:
+  - key: product_name
+    label: 产品名称
+  - key: promotion_info
+    label: 促销信息
+
+# 两个 Agent：writer（写手）和 qc（质检）
+agents:
+  - key: writer
+    name: 写手
+    model: deepseek-v4-flash
+    prompt: prompts/writer.md
+    skills: []
+    session:
+      policy: persistent
+    tools:
+      - publish_artifact
+      - request_human_input
+
+  - key: qc
+    name: 质检
+    model: deepseek-v4-flash
+    prompt: prompts/qc.md
+    skills: []
+    session:
+      policy: cold_per_version
+    tools:
+      - submit_evaluation
+      - route_message
+      - approve_delivery
+
+# 起始 Agent
+start_agent: writer
+
+# 产物类型
+artifact_types:
+  - type: copy
+    diff: line
+
+# 路由规则
+routes:
+  - from: writer
+    to: [qc]
+  - from: qc
+    to: [writer]
+
+# 上下文规则
+context_rules:
+  writer_context:
+    include:
+      - current_artifact_version
+      - input_constraints
+      - target_issues
+      - revision_scope
+  qc_context:
+    include:
+      - current_artifact_version
+      - input_constraints
+
+# 交付配置
+delivery:
+  deliverable_artifact_type: copy

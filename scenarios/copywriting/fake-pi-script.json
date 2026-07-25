@@ -1,0 +1,90 @@
+{
+  "turns": [
+    {
+      "agentKey": "writer",
+      "content": "我来创作文案。",
+      "toolCalls": [
+        {
+          "name": "publish_artifact",
+          "arguments": {
+            "artifact_type": "copy",
+            "content": "【春日特惠】\n春天来了，万物复苏。\n在这个美好的季节，我们推出限时特惠活动。\n全场商品低至五折，欢迎选购！",
+            "summary": "创建春日特惠文案初稿"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    },
+    {
+      "agentKey": "qc",
+      "content": "审核文案。",
+      "toolCalls": [
+        {
+          "name": "submit_evaluation",
+          "arguments": {
+            "verdict": "repair",
+            "issues": [
+              {
+                "severity": "major",
+                "anchor": { "type": "section", "value": "第二行" },
+                "problem": "缺少具体的活动时间",
+                "evidence": "原文：'在这个美好的季节'，未说明具体日期"
+              }
+            ],
+            "summary": "文案需要补充活动时间"
+          }
+        },
+        {
+          "name": "route_message",
+          "arguments": {
+            "target_agent": "writer",
+            "instruction": "请在第二行补充具体的活动时间（如：3月1日-3月15日）",
+            "scope": {
+              "editable_anchors": ["第二行"],
+              "frozen_anchors": ["第一行", "第三行"],
+              "issue_ids": ["PLACEHOLDER_ISSUE_ID"]
+            },
+            "reason": "审核发现缺少活动时间"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    },
+    {
+      "agentKey": "writer",
+      "content": "根据返修指令修改文案。",
+      "toolCalls": [
+        {
+          "name": "publish_artifact",
+          "arguments": {
+            "artifact_type": "copy",
+            "content": "【春日特惠】\n3月1日-3月15日，万物复苏。\n在这个美好的季节，我们推出限时特惠活动。\n全场商品低至五折，欢迎选购！",
+            "summary": "补充了活动时间（3月1日-3月15日）"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    },
+    {
+      "agentKey": "qc",
+      "content": "复审文案。",
+      "toolCalls": [
+        {
+          "name": "submit_evaluation",
+          "arguments": {
+            "verdict": "approve",
+            "issues": [],
+            "summary": "文案已补充活动时间，质量合格"
+          }
+        },
+        {
+          "name": "approve_delivery",
+          "arguments": {
+            "summary": "文案审核通过，申请交付"
+          }
+        }
+      ],
+      "finishReason": "tool_calls"
+    }
+  ]
+}
