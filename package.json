@@ -18,7 +18,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
-    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:e2e": "node scripts/crash-recovery-e2e.cjs",
+    "test:e2e:real": "node scripts/crash-recovery-realpi-e2e.cjs",
     "lint": "eslint . --ext .ts"
   },
   "devDependencies": {
