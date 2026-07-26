@@ -1,0 +1,54 @@
+scenario:
+  id: zhihu-chapter-packet
+  name: 知乎故事章节执行包
+  version: 1
+
+input_fields:
+  - key: chapter_id
+    label: 章节 ID
+  - key: chapter_label
+    label: 章节标签
+  - key: blueprint_bundle
+    label: 已交付的大纲与稳定契约
+  - key: previous_ledger
+    label: 上一章已验收状态账本
+  - key: previous_chapter_ending
+    label: 上一章最短结尾承接
+
+agents:
+  - key: packet_compiler
+    name: 章节包编译
+    model: deepseek-v4-pro
+    session: { policy: persistent }
+    prompt: prompts/packet-compiler.md
+    skills: [zhihu-salt-chapter-packet]
+    tools: [route_message, publish_artifact, request_human_input]
+
+  - key: packet_auditor
+    name: 章节包门禁审核
+    model: deepseek-v4-pro
+    session: { policy: cold_per_version }
+    prompt: prompts/packet-auditor.md
+    skills: [zhihu-salt-chapter-packet]
+    tools: [submit_evaluation, route_message, approve_delivery]
+
+start_agent: packet_compiler
+
+routes:
+  - from: packet_compiler
+    to: [packet_compiler, packet_auditor]
+  - from: packet_auditor
+    to: [packet_compiler]
+
+context_rules:
+  packet_compiler_context:
+    include: [input_constraints, current_artifact_version, target_issues, revision_scope]
+  packet_auditor_context:
+    include: [input_constraints, current_artifact_version, target_issues]
+
+artifact_types:
+  - type: chapter_packet
+    diff: line
+
+delivery:
+  deliverable_artifact_type: chapter_packet

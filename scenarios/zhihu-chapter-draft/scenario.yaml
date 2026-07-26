@@ -1,0 +1,52 @@
+scenario:
+  id: zhihu-chapter-draft
+  name: 知乎故事单章正文
+  version: 1
+
+input_fields:
+  - key: chapter_id
+    label: 章节 ID
+  - key: chapter_label
+    label: 章节标签
+  - key: chapter_packet
+    label: 已交付的无剧透章节执行包
+  - key: repair_context
+    label: 当前返修上下文
+
+agents:
+  - key: chapter_writer
+    name: 单章正文写作
+    model: deepseek-v4-pro
+    session: { policy: persistent }
+    prompt: prompts/chapter-writer.md
+    skills: [zhihu-salt-chapter-drafter]
+    tools: [route_message, publish_artifact, request_human_input]
+
+  - key: chapter_auditor
+    name: 单章语义审核
+    model: deepseek-v4-pro
+    session: { policy: cold_per_version }
+    prompt: prompts/chapter-auditor.md
+    skills: [zhihu-salt-chapter-packet]
+    tools: [submit_evaluation, route_message, approve_delivery]
+
+start_agent: chapter_writer
+
+routes:
+  - from: chapter_writer
+    to: [chapter_writer, chapter_auditor]
+  - from: chapter_auditor
+    to: [chapter_writer]
+
+context_rules:
+  chapter_writer_context:
+    include: [input_constraints, current_artifact_version, target_issues, revision_scope]
+  chapter_auditor_context:
+    include: [input_constraints, current_artifact_version, target_issues]
+
+artifact_types:
+  - type: chapter_draft
+    diff: line
+
+delivery:
+  deliverable_artifact_type: chapter_draft

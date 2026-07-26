@@ -1,0 +1,116 @@
+{
+  "turns": [
+    {
+      "agentKey": "outline_architect",
+      "content": "完成第1轮：来源与边界。",
+      "toolCalls": [
+        {
+          "name": "route_message",
+          "arguments": {
+            "target_agent": "outline_architect",
+            "instruction": "进入第2轮，只整理事实、知识时点与冲突。"
+          }
+        }
+      ]
+    },
+    {
+      "agentKey": "outline_architect",
+      "content": "完成第2轮：事实与冲突。",
+      "toolCalls": [
+        {
+          "name": "route_message",
+          "arguments": {
+            "target_agent": "outline_architect",
+            "instruction": "进入第3轮，只整理主线、因果、变化与退出状态。"
+          }
+        }
+      ]
+    },
+    {
+      "agentKey": "outline_architect",
+      "content": "完成第3轮：故事变化。",
+      "toolCalls": [
+        {
+          "name": "route_message",
+          "arguments": {
+            "target_agent": "outline_architect",
+            "instruction": "进入第4轮，只整理人物目标、情绪链与读者压力。"
+          }
+        }
+      ]
+    },
+    {
+      "agentKey": "outline_architect",
+      "content": "完成第4轮：人物与压力。",
+      "toolCalls": [
+        {
+          "name": "route_message",
+          "arguments": {
+            "target_agent": "outline_architect",
+            "instruction": "进入第5轮，只整理叙述声音、对白策略与语言呼吸。"
+          }
+        }
+      ]
+    },
+    {
+      "agentKey": "outline_architect",
+      "content": "完成第5轮：声音与节拍。",
+      "toolCalls": [
+        {
+          "name": "route_message",
+          "arguments": {
+            "target_agent": "outline_architect",
+            "instruction": "进入第6轮，只组装执行大纲与公开稳定契约。"
+          }
+        }
+      ]
+    },
+    {
+      "agentKey": "outline_architect",
+      "content": "完成第6轮：执行大纲组装。",
+      "toolCalls": [
+        {
+          "name": "route_message",
+          "arguments": {
+            "target_agent": "outline_architect",
+            "instruction": "进入第7轮，独立自检；通过后发布 blueprint_bundle。"
+          }
+        }
+      ]
+    },
+    {
+      "agentKey": "outline_architect",
+      "content": "第7轮自检通过，发布大纲包。",
+      "toolCalls": [
+        {
+          "name": "publish_artifact",
+          "arguments": {
+            "artifact_type": "blueprint_bundle",
+            "content": "# 私有总控蓝图\n\n## 主线\n我在父亲遗物中发现一段被截断的录音，姐姐带着第二份证据回来；我必须在拒绝她与听完真相之间做出选择。\n\n## B001 第一章\n- 唯一功能：把“父亲独自承担秘密”改写为“姐姐也掌握证据”，迫使我开门。\n- P0：我听见录音中的责任否定；姐姐携带第二盘录音出现；我从拒绝接触转为允许她进入。\n- 章首状态：父亲去世，我相信父亲隐瞒了十年前事故真相。\n- 章尾状态：第二盘录音被放在桌上，我尚未播放，但已经决定面对姐姐。\n- 知识停点：只确认姐姐掌握补充证据，不确认十年前真正承担责任的人。\n- 情绪与读者压力：丧父麻木 → 旧案刺痛 → 防御升高 → 有条件打开真相入口。\n\n# 公开稳定契约\n- 第一人称限知，只写“我”当下可见、可听、可推断的信息。\n- 过去时叙述；短段为主，关键动作单独落段。\n- 现实层级：当代家庭悬疑，无超自然机制。\n- 公开身份：我；姐姐；已故父亲。姓名暂不需要公开。\n- 标题承诺：旧录音改变我对家庭旧案的理解。",
+            "summary": "完成七轮提取、组装和自检，形成私有蓝图与公开稳定契约"
+          }
+        }
+      ]
+    },
+    {
+      "agentKey": "outline_auditor",
+      "content": "大纲边界、因果、知识停点和公开契约均通过。",
+      "toolCalls": [
+        {
+          "name": "submit_evaluation",
+          "arguments": {
+            "verdict": "approve",
+            "issues": [],
+            "summary": "大纲包通过独立审核"
+          }
+        },
+        {
+          "name": "approve_delivery",
+          "arguments": {
+            "summary": "大纲包满足交付门禁，申请交付"
+          }
+        }
+      ]
+    }
+  ]
+}

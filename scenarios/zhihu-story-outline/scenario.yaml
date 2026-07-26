@@ -1,0 +1,50 @@
+scenario:
+  id: zhihu-story-outline
+  name: 知乎故事大纲生产
+  version: 1
+
+input_fields:
+  - key: source_text
+    label: 完整原始素材
+  - key: production_mode
+    label: 生产模式
+  - key: production_requirements
+    label: 生产要求
+
+agents:
+  - key: outline_architect
+    name: 大纲架构师
+    model: deepseek-v4-pro
+    session: { policy: persistent }
+    prompt: prompts/outline-architect.md
+    skills: [zhihu-salt-outline-designer]
+    tools: [route_message, publish_artifact, request_human_input]
+
+  - key: outline_auditor
+    name: 大纲独立审核
+    model: deepseek-v4-pro
+    session: { policy: cold_per_version }
+    prompt: prompts/outline-auditor.md
+    skills: [zhihu-salt-outline-designer]
+    tools: [submit_evaluation, route_message, approve_delivery]
+
+start_agent: outline_architect
+
+routes:
+  - from: outline_architect
+    to: [outline_architect, outline_auditor]
+  - from: outline_auditor
+    to: [outline_architect]
+
+context_rules:
+  outline_architect_context:
+    include: [input_constraints, current_artifact_version, target_issues, revision_scope]
+  outline_auditor_context:
+    include: [input_constraints, current_artifact_version, target_issues]
+
+artifact_types:
+  - type: blueprint_bundle
+    diff: line
+
+delivery:
+  deliverable_artifact_type: blueprint_bundle

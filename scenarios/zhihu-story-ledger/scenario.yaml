@@ -1,0 +1,52 @@
+scenario:
+  id: zhihu-story-ledger
+  name: 知乎故事状态账本
+  version: 1
+
+input_fields:
+  - key: chapter_id
+    label: 章节 ID
+  - key: approved_chapter_draft
+    label: 已交付章节正文
+  - key: previous_ledger
+    label: 上一章已验收状态账本
+  - key: forge_audit_evidence
+    label: 上游审核与门禁证据
+
+agents:
+  - key: ledger_updater
+    name: 状态账本更新
+    model: deepseek-v4-pro
+    session: { policy: persistent }
+    prompt: prompts/ledger-updater.md
+    skills: [zhihu-salt-chapter-packet]
+    tools: [publish_artifact, request_human_input]
+
+  - key: ledger_auditor
+    name: 状态迁移审核
+    model: deepseek-v4-pro
+    session: { policy: cold_per_version }
+    prompt: prompts/ledger-auditor.md
+    skills: [zhihu-salt-chapter-packet]
+    tools: [submit_evaluation, route_message, approve_delivery]
+
+start_agent: ledger_updater
+
+routes:
+  - from: ledger_updater
+    to: [ledger_auditor]
+  - from: ledger_auditor
+    to: [ledger_updater]
+
+context_rules:
+  ledger_updater_context:
+    include: [input_constraints, current_artifact_version, target_issues, revision_scope]
+  ledger_auditor_context:
+    include: [input_constraints, current_artifact_version, target_issues]
+
+artifact_types:
+  - type: state_ledger
+    diff: line
+
+delivery:
+  deliverable_artifact_type: state_ledger

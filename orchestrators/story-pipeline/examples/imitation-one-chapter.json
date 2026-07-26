@@ -1,0 +1,14 @@
+{
+  "run_id": "imitation-demo-001",
+  "story_id": "story-demo-001",
+  "title": "旧录音",
+  "mode": "imitation",
+  "source_file": "source-story.md",
+  "requirements": "忠实提取原文人物、事件、因果、信息释放顺序与第一人称限知视角；正文不得复用原句或可识别表达。",
+  "chapters": [
+    {
+      "id": "B001",
+      "label": "第一章"
+    }
+  ]
+}

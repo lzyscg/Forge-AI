@@ -1,0 +1,52 @@
+scenario:
+  id: zhihu-story-final
+  name: 知乎故事全文终审
+  version: 1
+
+input_fields:
+  - key: blueprint_bundle
+    label: 已交付的大纲与稳定契约
+  - key: approved_chapters
+    label: 全部已交付章节正文
+  - key: final_ledger
+    label: 最终状态账本
+  - key: production_requirements
+    label: 生产要求
+
+agents:
+  - key: manuscript_assembler
+    name: 全文组装
+    model: deepseek-v4-pro
+    session: { policy: persistent }
+    prompt: prompts/manuscript-assembler.md
+    skills: []
+    tools: [publish_artifact, request_human_input]
+
+  - key: final_director
+    name: 全文终审与签发
+    model: deepseek-v4-pro
+    session: { policy: cold_per_version }
+    prompt: prompts/final-director.md
+    skills: [zhihu-salt-production-director]
+    tools: [submit_evaluation, route_message, approve_delivery, request_human_input]
+
+start_agent: manuscript_assembler
+
+routes:
+  - from: manuscript_assembler
+    to: [final_director]
+  - from: final_director
+    to: [manuscript_assembler]
+
+context_rules:
+  manuscript_assembler_context:
+    include: [input_constraints, current_artifact_version, target_issues, revision_scope]
+  final_director_context:
+    include: [input_constraints, current_artifact_version, target_issues]
+
+artifact_types:
+  - type: final_manuscript
+    diff: line
+
+delivery:
+  deliverable_artifact_type: final_manuscript

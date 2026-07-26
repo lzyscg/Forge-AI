@@ -1,0 +1,6 @@
+{
+  "blueprint_bundle": "已交付的大纲包。",
+  "approved_chapters": "[{\"chapter_id\":\"B001\",\"content\":\"# 第一章\\n正文\"}]",
+  "final_ledger": "已交付的最终状态账本。",
+  "production_requirements": "按配置顺序组装并完成全文终审。"
+}
