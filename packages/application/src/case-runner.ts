@@ -615,7 +615,33 @@ export class CaseRunner {
     // 终态 / 等待人工：runCase 顶部已处理，这里不决定
     if (['approved', 'failed', 'stopped', 'waiting_human'].includes(status)) return null;
 
-    // 1. 最新版本 under_review -> 路由审核 Agent
+    // 1. 存在 issued/in_progress 指令 -> 路由其 target_agent（返修进行中）
+    const active = this.repo.getActiveRevisionInstructions(caseId);
+    const inProgress = active.find(
+      (ri) => ri.status === 'issued' || ri.status === 'in_progress',
+    );
+    if (inProgress) {
+      return {
+        agent: inProgress.target_agent as string,
+        message: `系统恢复续跑：存在进行中的返修指令(${inProgress.revision_instruction_id})，请按指令的 editable_anchors 范围发布修复版本。\n${this.buildResumeContextMessage(caseId)}`,
+      };
+    }
+
+    // 2. 存在 open/reopened Issue（审核方已 repair、尚未下发返修）-> 回 start agent 发返修。
+    //    不能因 version 仍 under_review 就再派 reviewer--reviewer 已评估过（issue 已建），
+    //    再派会空转无动作（Fake/真实 Pi 崩溃恢复续跑实测卡在这里直到 maxTurns->failed）。
+    const issues = this.repo.getIssuesByCase(caseId);
+    const pendingRepair = issues.filter(
+      (i) => (i.status as string) === 'open' || (i.status as string) === 'reopened',
+    );
+    if (pendingRepair.length > 0) {
+      return {
+        agent: this.scenarioConfig.start_agent,
+        message: `系统恢复续跑：存在 ${pendingRepair.length} 个未返修的 Issue（审核方已挑出，尚未下发返修）。请用 route_message 向生成方下发定点返修（editable/frozen scope + issue_ids）。\n${this.buildResumeContextMessage(caseId)}`,
+      };
+    }
+
+    // 3. 最新版本 under_review 且无待返修 Issue -> 路由审核 Agent（待审核）
     for (const at of this.scenarioConfig.artifact_types) {
       const artifact = this.repo.getArtifactByTypeAndCase(caseId, at.type);
       if (artifact) {
@@ -631,28 +657,15 @@ export class CaseRunner {
         }
       }
     }
-    // 2. 存在 issued/in_progress 指令 -> 路由其 target_agent
-    const active = this.repo.getActiveRevisionInstructions(caseId);
-    const inProgress = active.find(
-      (ri) => ri.status === 'issued' || ri.status === 'in_progress',
-    );
-    if (inProgress) {
-      return {
-        agent: inProgress.target_agent as string,
-        message: `系统恢复续跑：存在进行中的返修指令(${inProgress.revision_instruction_id})，请按指令的 editable_anchors 范围发布修复版本。\n${this.buildResumeContextMessage(caseId)}`,
-      };
-    }
-    // 3. 全部 Issue 已 verified、无活跃指令但未交付 -> 回到 start agent 申请交付
-    const openIssues = this.repo
-      .getIssuesByCase(caseId)
-      .filter((i) => (i.status as string) !== 'verified');
+    // 4. 全部 Issue 已 verified、无活跃指令但未交付 -> 回到 start agent 申请交付
+    const openIssues = issues.filter((i) => (i.status as string) !== 'verified');
     if (openIssues.length === 0 && active.length === 0) {
       return {
         agent: this.scenarioConfig.start_agent,
         message: `系统恢复续跑：所有 Issue 已 verified、无活跃返修指令。若最新产物版本已审核通过，请申请交付（approve_delivery）。`,
       };
     }
-    // 4. 状态无法归类（如存在 submitted 指令但版本非 under_review）-> 返回 null，调用方回退
+    // 5. 状态无法归类（如存在 submitted 指令但版本非 under_review）-> 返回 null，调用方回退
     return null;
   }
 
