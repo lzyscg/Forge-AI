@@ -29,7 +29,11 @@ import {
   applyRouteMessageWithIssues,
   applyPublishArtifactRepair,
   applyEvaluationVerify,
+  findUnresolvableSubmittedInstructions,
+  findStaleSubmittedInstructions,
+  isRevisionInstructionActive,
   type DeliveryGateInput,
+  type InstructionRef,
 } from '@forge-ai/domain';
 import type { IssueStatus, RevisionInstructionStatus } from '@forge-ai/contracts';
 
@@ -134,8 +138,35 @@ export class ToolExecutor {
 
     // 行级越界校验（如果有活跃的返修指令）
     const activeInstructions = this.repo.getActiveRevisionInstructions(caseId);
+    // 5.2：发布返修版本时按 (target_agent=当前发布方, target_artifact_version_id=父版本)
+    // 定位唯一活跃指令。不再无条件取数组最后一条（旧实现会悬挂其他指令）。
+    let boundInstruction: Record<string, unknown> | null = null;
     if (activeInstructions.length > 0 && parentVersion) {
-      const ri = activeInstructions[activeInstructions.length - 1];
+      const parentId = parentVersion.artifact_version_id as string;
+      const candidates = activeInstructions.filter((ri) => {
+        if (ri.target_agent !== ctx.agentKey) return false;
+        const targetVersion = ri.target_artifact_version_id as string | null;
+        // 优先匹配 target_artifact_version_id === parent；允许 null 兜底（指令创建时无版本）
+        return targetVersion === parentId || targetVersion === null;
+      });
+      if (candidates.length === 0) {
+        // 没有绑定到当前 Agent/父版本的活跃指令：不能发布模糊归属的返修版本。
+        // 这通常意味着活跃指令指向其他 Agent 或其他父版本（跨轮悬挂），需要先由系统确定性处理。
+        return {
+          success: false,
+          error: `无法发布返修版本：当前没有匹配 Agent(${ctx.agentKey})与父版本(${parentId})的活跃返修指令。活跃指令: ${activeInstructions.map((ri) => `${ri.revision_instruction_id}(${ri.target_agent}->${ri.target_artifact_version_id ?? 'null'})`).join(', ')}`,
+          error_code: 'NO_ACTIVE_INSTRUCTION',
+        };
+      }
+      if (candidates.length > 1) {
+        return {
+          success: false,
+          error: `无法发布返修版本：匹配到 ${candidates.length} 条活跃返修指令，归属模糊，拒绝发布: ${candidates.map((c) => c.revision_instruction_id).join(', ')}`,
+          error_code: 'AMBIGUOUS_ACTIVE_INSTRUCTION',
+        };
+      }
+      boundInstruction = candidates[0];
+      const ri = boundInstruction;
       const editableAnchors = JSON.parse(ri.editable_anchors as string) as string[];
       const frozenAnchors = JSON.parse(ri.frozen_anchors as string) as string[];
       const changedLines = computeChangedLines(parentVersion.content as string, input.content);
@@ -165,7 +196,7 @@ export class ToolExecutor {
         // 支柱一/三：越界后系统自动重发一份同 scope/issue_ids 的返修指令（status=issued，仍 active），
         // 让生成 Agent 可在同一 Turn 内重试。否则指令进 scope_violation 终态后，生成 Agent 的后续
         // 合规版本会因无 active instruction 被当成 draft，Issue 永远卡在 repairing，门禁永远拦。
-        const retriedIssueIds = JSON.parse(ri.issue_ids as string) as string[];
+        const retriedIssueIds = this.parseIssueIds(ri.issue_ids as string);
         this.repo.insertRevisionInstruction({
           revision_instruction_id: this.idGen.generate('ri'),
           case_id: caseId,
@@ -185,7 +216,7 @@ export class ToolExecutor {
       }
 
       // 通过校验：更新 Issue 和 Revision Instruction 状态
-      const issueIds = JSON.parse(ri.issue_ids as string) as string[];
+      const issueIds = this.parseIssueIds(ri.issue_ids as string);
       const currentIssueStatuses = new Map<string, IssueStatus>();
       for (const issueId of issueIds) {
         const issue = this.repo.getIssue(issueId);
@@ -252,10 +283,9 @@ export class ToolExecutor {
       });
     }
 
-    // 更新 Issue 的 resolution_artifact_version_id
-    if (activeInstructions.length > 0) {
-      const ri = activeInstructions[activeInstructions.length - 1];
-      const issueIds = JSON.parse(ri.issue_ids as string) as string[];
+    // 更新 Issue 的 resolution_artifact_version_id（5.2：用绑定的指令，不再取数组最后一条）
+    if (boundInstruction) {
+      const issueIds = this.parseIssueIds(boundInstruction.issue_ids as string);
       for (const issueId of issueIds) {
         this.repo.updateIssue(issueId, { resolution_artifact_version_id: versionId });
       }
@@ -286,31 +316,46 @@ export class ToolExecutor {
     const issueIds: string[] = [];
 
     if (input.verdict === 'approve') {
-      // 审核通过：产物版本 → approved
-      this.repo.updateArtifactVersion(latestVersion.artifact_version_id as string, {
-        status: 'approved',
-        approved_at: this.clock.now(),
-      });
-
-      // 如果有 claimed_fixed 的 issue，标记为 verified
-      const issues = this.repo.getIssuesByCase(caseId);
-      const claimedFixedIssues = issues.filter((i) => i.status === 'claimed_fixed');
-      const currentIssueStatuses = new Map<string, IssueStatus>();
-      for (const issue of claimedFixedIssues) {
-        currentIssueStatuses.set(issue.issue_id as string, issue.status as IssueStatus);
+      // 幂等：版本已 approved，直接返回成功（不重复迁移）
+      if (latestVersion.status === 'approved') {
+        return { success: true, issue_ids: [] };
       }
 
-      // 查找相关的 revision instruction
-      const instructions = this.repo.getRevisionInstructionsByCase(caseId);
-      const submittedInstruction = instructions.find((ri) => ri.status === 'submitted');
+      // 收集 Case 下全部 Issue 的当前状态（不只 claimed_fixed，
+      // 还需要 verified 状态用于判定陈旧 submitted 指令是否可一致关闭）
+      const issues = this.repo.getIssuesByCase(caseId);
+      const allIssueStatuses = new Map<string, IssueStatus>();
+      for (const issue of issues) {
+        allIssueStatuses.set(issue.issue_id as string, issue.status as IssueStatus);
+      }
+      const claimedFixedIssueIds = issues
+        .filter((i) => i.status === 'claimed_fixed')
+        .map((i) => i.issue_id as string);
 
+      // 解析全部 submitted 指令为 InstructionRef（5.1：不再只取第一条）
+      const submittedRefs = this.collectInstructionRefs(caseId, 'submitted');
+
+      // 5.1 / 7.2：若存在无法在本次 approve 中关闭的 submitted 指令
+      // （其关联 Issue 仍有 repairing/open/reopened），不能产生半批准状态。
+      // 先返回结构化错误，不改任何状态。
+      const unresolvable = findUnresolvableSubmittedInstructions(submittedRefs, allIssueStatuses);
+      if (unresolvable.length > 0) {
+        return {
+          success: false,
+          error: `审核通过无法批准产物：存在 ${unresolvable.length} 条 submitted 返修指令的关联 Issue 尚未 claimed_fixed（最新版本未完整解决这些指令的问题）: ${unresolvable.join(', ')}`,
+          error_code: 'PARTIAL_REVISION_INCOMPLETE',
+          incomplete_instruction_ids: unresolvable,
+        };
+      }
+
+      // 审核通过：先算跨状态机结果，再统一落库（避免中途异常产生半状态）
       const crossResult = applyEvaluationVerify(
-        claimedFixedIssues.map((i) => i.issue_id as string),
-        currentIssueStatuses,
-        submittedInstruction ? (submittedInstruction.revision_instruction_id as string) : null,
-        submittedInstruction ? (submittedInstruction.status as RevisionInstructionStatus) : null,
+        claimedFixedIssueIds,
+        allIssueStatuses,
+        submittedRefs,
       );
 
+      // Issue：claimed_fixed -> verified
       for (const t of crossResult.issueTransitions) {
         this.repo.updateIssue(t.issueId, {
           status: t.to,
@@ -328,9 +373,15 @@ export class ToolExecutor {
           created_at: this.clock.now(),
         });
       }
+      // Instruction：submitted -> verified（5.1：全部可关闭的指令一并关闭）
       for (const t of crossResult.instructionTransitions) {
         this.repo.updateRevisionInstruction(t.instructionId, { status: t.to });
       }
+      // ArtifactVersion：under_review -> approved
+      this.repo.updateArtifactVersion(latestVersion.artifact_version_id as string, {
+        status: 'approved',
+        approved_at: this.clock.now(),
+      });
     } else if (input.verdict === 'repair' || input.verdict === 'regenerate') {
       // 审核不通过：登记 issues
       for (const issueInput of input.issues) {
@@ -384,14 +435,12 @@ export class ToolExecutor {
     if (!route) {
       return {
         success: false,
-        error: `路由不合法: ${ctx.agentKey} → ${input.target_agent}`,
+        error: `路由不合法: ${ctx.agentKey} -> ${input.target_agent}`,
       };
     }
 
-    let revisionInstructionId: string | undefined;
-
     // 支柱一：模型不应被要求完美管理 issue_ids。supervisor 发返修（带 editable/frozen scope）
-    // 却漏填 issue_ids 时，系统自动补齐为当前 Case 的 open blocking issues——否则 Issue 生命周期
+    // 却漏填 issue_ids 时，系统自动补齐为当前 Case 的 open blocking issues--否则 Issue 生命周期
     // 断裂（不进 repairing/claimed_fixed/verified），交付门禁会永远拦截，真实模型下频繁触发。
     const scope = input.scope;
     const hasRepairScope = !!scope
@@ -405,9 +454,110 @@ export class ToolExecutor {
       }
     }
 
-    // 如果携带 issue_ids，创建 Revision Instruction
+    // 5.3：校验 issue_ids 引用完整性。任一不合法则整条 route_message 失败，
+    // 不写入 Revision Instruction、不改任何 Issue 状态。
+    // 不变量 4.1：issue_id 必须存在 + 属于当前 Case + 状态在 open|reopened。
     if (input.scope?.issue_ids && input.scope.issue_ids.length > 0) {
-      revisionInstructionId = this.idGen.generate('ri');
+      const invalidIds: string[] = [];
+      const seen = new Set<string>();
+      for (const issueId of input.scope.issue_ids) {
+        if (seen.has(issueId)) continue; // 去重，不重复报错
+        seen.add(issueId);
+        const issue = this.repo.getIssue(issueId);
+        if (!issue) {
+          invalidIds.push(issueId);
+          continue;
+        }
+        if (issue.case_id !== caseId) {
+          invalidIds.push(issueId);
+          continue;
+        }
+        const st = issue.status as IssueStatus;
+        if (st !== 'open' && st !== 'reopened') {
+          invalidIds.push(issueId);
+          continue;
+        }
+      }
+      if (invalidIds.length > 0) {
+        return {
+          success: false,
+          error: `route_message 拒绝：issue_ids 中存在不合法引用（不存在 / 不属于当前 Case / 状态不在 open|reopened）: ${invalidIds.join(', ')}`,
+          error_code: 'INVALID_ISSUE_REFERENCE',
+          invalid_issue_ids: invalidIds,
+        };
+      }
+
+      // 5.2 单活跃指令约束：同一个 Case、目标 Agent 同时最多一条 issued|in_progress 指令。
+      // 新问题需要追加时，合并到现有活跃指令（扩展 issue_ids + anchors），而不是新建第二条。
+      // （submitted 指令代表该轮已发布版本、正在等待复审，属于不同轮次，可与新 issued 共存。）
+      const existingActive = this.repo.getActiveRevisionInstructions(caseId).find((ri) => {
+        if (ri.target_agent !== input.target_agent) return false;
+        const st = ri.status as RevisionInstructionStatus;
+        return st === 'issued' || st === 'in_progress';
+      });
+
+      if (existingActive) {
+        // 合并：把新（合法）issue_ids 并入现有指令，并扩展 editable/frozen 锚点
+        const mergedIssueIds = this.mergeUnique(
+          this.parseIssueIds(existingActive.issue_ids as string),
+          input.scope.issue_ids,
+        );
+        const mergedEditable = this.mergeUnique(
+          JSON.parse(existingActive.editable_anchors as string) as string[],
+          input.scope.editable_anchors ?? [],
+        );
+        const mergedFrozen = this.mergeUnique(
+          JSON.parse(existingActive.frozen_anchors as string) as string[],
+          input.scope.frozen_anchors ?? [],
+        );
+        this.repo.updateRevisionInstruction(existingActive.revision_instruction_id as string, {
+          issue_ids: JSON.stringify(mergedIssueIds),
+          editable_anchors: JSON.stringify(mergedEditable),
+          frozen_anchors: JSON.stringify(mergedFrozen),
+        });
+
+        // 只对新加入的（之前非 repairing 的）Issue 触发 open|reopened -> repairing
+        const currentIssueStatuses = new Map<string, IssueStatus>();
+        for (const issueId of input.scope.issue_ids) {
+          const issue = this.repo.getIssue(issueId);
+          if (issue) currentIssueStatuses.set(issueId, issue.status as IssueStatus);
+        }
+        const crossResult = applyRouteMessageWithIssues(
+          input.scope.issue_ids,
+          currentIssueStatuses,
+          existingActive.revision_instruction_id as string,
+        );
+        for (const t of crossResult.issueTransitions) {
+          this.repo.updateIssue(t.issueId, { status: t.to, updated_at: this.clock.now() });
+          this.repo.insertIssueEvent({
+            issue_event_id: this.idGen.generate('ie'),
+            issue_id: t.issueId,
+            event_type: 'repairing',
+            actor: ctx.agentKey,
+            message_id: messageId,
+            detail: input.reason ?? input.instruction,
+            created_at: this.clock.now(),
+          });
+        }
+
+        // 记录路由边
+        this.repo.insertRouteEdge({
+          route_id: this.idGen.generate('route'),
+          case_id: caseId,
+          source_message_id: messageId,
+          target_message_id: null,
+          source_agent: ctx.agentKey,
+          target_agent: input.target_agent,
+          reason: input.reason ?? null,
+          context_snapshot_id: null,
+          created_at: this.clock.now(),
+        });
+
+        return { success: true, revision_instruction_id: existingActive.revision_instruction_id as string };
+      }
+
+      // 新建 Revision Instruction
+      const revisionInstructionId = this.idGen.generate('ri');
 
       // 找到当前产物版本
       const artifactType = scenarioConfig.artifact_types[0]?.type;
@@ -431,7 +581,7 @@ export class ToolExecutor {
         created_at: this.clock.now(),
       });
 
-      // 跨状态机联动：Issue → repairing
+      // 跨状态机联动：Issue -> repairing
       const currentIssueStatuses = new Map<string, IssueStatus>();
       for (const issueId of input.scope.issue_ids) {
         const issue = this.repo.getIssue(issueId);
@@ -456,6 +606,21 @@ export class ToolExecutor {
           created_at: this.clock.now(),
         });
       }
+
+      // 记录路由边
+      this.repo.insertRouteEdge({
+        route_id: this.idGen.generate('route'),
+        case_id: caseId,
+        source_message_id: messageId,
+        target_message_id: null,
+        source_agent: ctx.agentKey,
+        target_agent: input.target_agent,
+        reason: input.reason ?? null,
+        context_snapshot_id: null,
+        created_at: this.clock.now(),
+      });
+
+      return { success: true, revision_instruction_id: revisionInstructionId };
     }
 
     // 记录路由边
@@ -471,7 +636,7 @@ export class ToolExecutor {
       created_at: this.clock.now(),
     });
 
-    return { success: true, revision_instruction_id: revisionInstructionId };
+    return { success: true, revision_instruction_id: undefined };
   }
 
   private approveDelivery(input: ApproveDeliveryInput, ctx: ToolExecutionContext): ApproveDeliveryOutput {
@@ -489,42 +654,12 @@ export class ToolExecutor {
       return { success: false, error: '未找到产物版本' };
     }
 
-    // 收集门禁检查所需数据
-    const allIssues = this.repo.getIssuesByCase(caseId);
-    const blockingIssues = allIssues
-      .filter((i) => i.severity === 'blocking')
-      .map((i) => ({
-        issueId: i.issue_id as string,
-        status: i.status as IssueStatus,
-        severity: i.severity as string,
-      }));
+    let gateResult = this.evaluateGateForCase(caseId, latestVersion.artifact_version_id as string, ctx.turnId);
 
-    const revisionInstructions = this.repo.getRevisionInstructionsByCase(caseId).map((ri) => ({
-      id: ri.revision_instruction_id as string,
-      status: ri.status as RevisionInstructionStatus,
-    }));
-
-    const incompleteTurns = this.repo.getIncompleteTurns(caseId)
-      .filter((t) => t.turn_id !== ctx.turnId) // 排除当前正在执行的 Turn
-      .map((t) => ({
-        turnId: t.turn_id as string,
-        status: t.status as string,
-      })) as { turnId: string; status: 'queued' | 'running' | 'completed' | 'failed' }[];
-
-    const gateInput: DeliveryGateInput = {
-      artifactVersion: { status: latestVersion.status as any },
-      artifactVersionApproved: latestVersion.status === 'approved',
-      blockingIssues,
-      revisionInstructions,
-      incompleteTurns,
-    };
-
-    const gateResult = evaluateDeliveryGate(gateInput);
-
-    // 记录门禁结果
-    const gateResultId = this.idGen.generate('gate');
+    // 记录门禁结果（若发生一致性修复，下面会追加第二条并通过 finalGateResultId 返回最终结果）
+    let finalGateResultId = this.idGen.generate('gate');
     this.repo.insertDeliveryGateResult({
-      gate_result_id: gateResultId,
+      gate_result_id: finalGateResultId,
       case_id: caseId,
       artifact_version_id: latestVersion.artifact_version_id,
       status: gateResult.passed ? 'pass' : 'fail',
@@ -533,8 +668,107 @@ export class ToolExecutor {
       created_at: this.clock.now(),
     });
 
+    // 5.6：门禁失败且唯一失败项是 no_active_revision 时的确定性恢复。
+    // 不让 start agent 根据门禁文本再次创建新的返修指令（会加剧不一致）。
+    let consistencyRepaired = false;
+    if (!gateResult.passed) {
+      const failedChecks = gateResult.checks.filter((c) => !c.passed);
+      const onlyNoActiveRevision =
+        failedChecks.length === 1 && failedChecks[0].check === 'no_active_revision';
+      if (onlyNoActiveRevision) {
+        const allIssues = this.repo.getIssuesByCase(caseId);
+        const issueStatusMap = new Map<string, IssueStatus>();
+        for (const i of allIssues) issueStatusMap.set(i.issue_id as string, i.status as IssueStatus);
+
+        const activeRefs = this.collectInstructionRefs(caseId, 'active');
+        // 陈旧 submitted 指令：关联 Issue 已全部 verified（生命周期不一致）
+        const stale = findStaleSubmittedInstructions(activeRefs, issueStatusMap);
+        if (stale.length > 0) {
+          // 系统一致性修复：把陈旧 submitted 指令关闭为 verified（不再让 Agent 重新建返修）
+          for (const id of stale) {
+            this.repo.updateRevisionInstruction(id, { status: 'verified' });
+          }
+          this.repo.insertControlEvent({
+            event_id: this.idGen.generate('evt'),
+            case_id: caseId,
+            event_type: 'consistency_repair',
+            actor: 'system',
+            detail: JSON.stringify({ closed_instruction_ids: stale, reason: 'issues_all_verified' }),
+            created_at: this.clock.now(),
+          });
+          consistencyRepaired = true;
+          // 重新评估门禁
+          gateResult = this.evaluateGateForCase(caseId, latestVersion.artifact_version_id as string, ctx.turnId);
+          // 记录修复后的门禁结果（作为最终返回的 gate_result_id）
+          finalGateResultId = this.idGen.generate('gate');
+          this.repo.insertDeliveryGateResult({
+            gate_result_id: finalGateResultId,
+            case_id: caseId,
+            artifact_version_id: latestVersion.artifact_version_id,
+            status: gateResult.passed ? 'pass' : 'fail',
+            checks: JSON.stringify(gateResult.checks),
+            blocking_issue_ids: JSON.stringify(gateResult.blockingIssueIds),
+            created_at: this.clock.now(),
+          });
+        }
+
+        if (!gateResult.passed) {
+          // 仍未通过：按剩余活跃指令状态确定性路由
+          const remaining = this.collectInstructionRefs(caseId, 'active');
+          const stillActive = remaining.filter((r) => isRevisionInstructionActive(r.status));
+          if (stillActive.length > 0) {
+            const hasSubmitted = stillActive.some((r) => r.status === 'submitted');
+            if (hasSubmitted) {
+              // submitted -> 审核 Agent
+              const reviewer = this.findReviewerAgentKey(scenarioConfig);
+              if (reviewer) {
+                return {
+                  success: true,
+                  gate_result_id: finalGateResultId,
+                  gate_passed: false,
+                  checks: gateResult.checks,
+                  consistency_repaired: consistencyRepaired,
+                  route_to: reviewer,
+                  route_reason: `交付门禁因存在 submitted 返修指令未关闭而失败，但其关联 Issue 尚未全部 verified。请审核最新返修版本。`,
+                };
+              }
+            }
+            // issued|in_progress -> 该指令的 target_agent
+            const inProgress = stillActive.find((r) => r.status === 'issued' || r.status === 'in_progress');
+            if (inProgress) {
+              // 需要取 target_agent：collectInstructionRefs 没带，重新查
+              const rec = this.repo.getRevisionInstruction(inProgress.id);
+              const targetAgent = rec?.target_agent as string | undefined;
+              if (targetAgent) {
+                return {
+                  success: true,
+                  gate_result_id: finalGateResultId,
+                  gate_passed: false,
+                  checks: gateResult.checks,
+                  consistency_repaired: consistencyRepaired,
+                  route_to: targetAgent,
+                  route_reason: `交付门禁因存在未完成的返修指令(${inProgress.id})而失败。请按返修指令发布修复版本。`,
+                };
+              }
+            }
+          }
+          // 无法确定性路由 -> 报内部错误，不让 Agent 猜
+          return {
+            success: false,
+            gate_result_id: finalGateResultId,
+            gate_passed: false,
+            checks: gateResult.checks,
+            consistency_repaired: consistencyRepaired,
+            error_code: 'INTERNAL_STATE_INCONSISTENT',
+            error: `交付门禁唯一失败项为 no_active_revision，但一致性修复后仍无法通过，且无法确定性路由。需要人工介入核查 Case 状态。`,
+          };
+        }
+        // 修复后通过 -> 继续走交付
+      }
+    }
+
     if (gateResult.passed) {
-      // 交付成功：产物版本 → delivered
+      // 交付成功：产物版本 -> delivered
       this.repo.updateArtifactVersion(latestVersion.artifact_version_id as string, {
         status: 'delivered',
       });
@@ -542,9 +776,10 @@ export class ToolExecutor {
 
     return {
       success: true,
-      gate_result_id: gateResultId,
+      gate_result_id: finalGateResultId,
       gate_passed: gateResult.passed,
       checks: gateResult.checks,
+      consistency_repaired: consistencyRepaired || undefined,
     };
   }
 
@@ -560,5 +795,89 @@ export class ToolExecutor {
     });
 
     return { success: true, message: 'Case 已进入 waiting_human 状态，等待人工输入' };
+  }
+
+  // === 私有辅助 ===
+
+  /** 安全解析 revision_instruction.issue_ids（JSON 字符串） */
+  private parseIssueIds(raw: string | null | undefined): string[] {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((x) => typeof x === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** 收集 Case 下指令的 InstructionRef（statusFilter: 'submitted' | 'active' | 'all'） */
+  private collectInstructionRefs(caseId: string, statusFilter: 'submitted' | 'active' | 'all'): InstructionRef[] {
+    const all = this.repo.getRevisionInstructionsByCase(caseId);
+    return all
+      .filter((ri) => {
+        const st = ri.status as RevisionInstructionStatus;
+        if (statusFilter === 'all') return true;
+        if (statusFilter === 'submitted') return st === 'submitted';
+        return isRevisionInstructionActive(st);
+      })
+      .map((ri) => ({
+        id: ri.revision_instruction_id as string,
+        status: ri.status as RevisionInstructionStatus,
+        issueIds: this.parseIssueIds(ri.issue_ids as string),
+      }));
+  }
+
+  /** 查找持有 submit_evaluation 工具的 Agent（审核方），配置驱动，不写死角色名 */
+  private findReviewerAgentKey(scenarioConfig: ScenarioConfig): string | null {
+    const reviewer = scenarioConfig.agents.find((a) => a.tools.includes('submit_evaluation'));
+    return reviewer?.key ?? null;
+  }
+
+  /** 计算当前 Case 的交付门禁结果（用于 approveDelivery 与一致性修复后重评估） */
+  private evaluateGateForCase(caseId: string, versionId: string, currentTurnId: string) {
+    const latestVersion = this.repo.getArtifactVersion(versionId);
+    const allIssues = this.repo.getIssuesByCase(caseId);
+    const blockingIssues = allIssues
+      .filter((i) => i.severity === 'blocking')
+      .map((i) => ({
+        issueId: i.issue_id as string,
+        status: i.status as IssueStatus,
+        severity: i.severity as string,
+      }));
+    const revisionInstructions = this.repo.getRevisionInstructionsByCase(caseId).map((ri) => ({
+      id: ri.revision_instruction_id as string,
+      status: ri.status as RevisionInstructionStatus,
+    }));
+    const incompleteTurns = this.repo
+      .getIncompleteTurns(caseId)
+      .filter((t) => t.turn_id !== currentTurnId)
+      .map((t) => ({
+        turnId: t.turn_id as string,
+        status: t.status as string,
+      })) as { turnId: string; status: 'queued' | 'running' | 'completed' | 'failed' }[];
+
+    const gateInput: DeliveryGateInput = {
+      artifactVersion: latestVersion ? { status: latestVersion.status as any } : null,
+      artifactVersionApproved: latestVersion?.status === 'approved',
+      blockingIssues,
+      revisionInstructions,
+      incompleteTurns,
+    };
+    return evaluateDeliveryGate(gateInput);
+  }
+
+  /** 数组去重合并（保持顺序） */
+  private mergeUnique(...arrs: string[][]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const arr of arrs) {
+      for (const x of arr) {
+        if (!seen.has(x)) {
+          seen.add(x);
+          out.push(x);
+        }
+      }
+    }
+    return out;
   }
 }

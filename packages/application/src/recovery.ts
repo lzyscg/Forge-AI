@@ -20,6 +20,9 @@ export interface RecoveryResult {
 }
 
 export class RecoveryService {
+  /** 进程级恢复事件计数器，保证 control_events.event_id 唯一（4.5 幂等） */
+  private static eventSeq = 0;
+
   constructor(
     private repo: RepositoryPort,
     private clock: ClockPort,
@@ -86,9 +89,10 @@ export class RecoveryService {
       });
     }
 
-    // 记录恢复事件
+    // 记录恢复事件（4.5 幂等：用进程级计数器保证 event_id 唯一，
+    // 避免同一 Case 短时间内重复恢复时 Date.now() 同毫秒导致 UNIQUE 冲突）
     this.repo.insertControlEvent({
-      event_id: `evt_recovery_${caseId}_${Date.now()}`,
+      event_id: `evt_recovery_${caseId}_${Date.now()}_${RecoveryService.eventSeq++}`,
       case_id: caseId,
       event_type: 'recovery_started',
       actor: 'system',
@@ -124,7 +128,7 @@ export class RecoveryService {
 
     // 记录恢复完成事件
     this.repo.insertControlEvent({
-      event_id: `evt_recovery_done_${caseId}_${Date.now()}`,
+      event_id: `evt_recovery_done_${caseId}_${Date.now()}_${RecoveryService.eventSeq++}`,
       case_id: caseId,
       event_type: 'recovery_completed',
       actor: 'system',

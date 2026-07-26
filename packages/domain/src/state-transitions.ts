@@ -79,13 +79,37 @@ export function applyPublishArtifactRepair(
 }
 
 /**
+ * 一条 Revision Instruction 的纯数据引用（用于跨状态机判定）。
+ * issueIds 为已解析的 Issue ID 列表（不再依赖 JSON 字符串）。
+ */
+export interface InstructionRef {
+  id: string;
+  status: RevisionInstructionStatus;
+  issueIds: string[];
+}
+
+/**
  * submit_evaluation 决定 Issue 进入 verified（复审通过）
+ *
+ * 5.1 修复：审核通过时，必须在同一事务内关闭“所有”与当前 claimed_fixed Issue
+ * 绑定的 submitted 指令——不再只关闭第一条。
+ *
+ * 判定规则：
+ * - 所有 claimed_fixed Issue -> verified；
+ * - 每条 submitted 指令，若其关联 Issue 全部“可视为已解决”
+ *   （= 正在被验证的 claimed_fixed，或此前已 verified），则 -> verified；
+ * - 若某条 submitted 指令存在 Issue 仍处于 repairing/open/reopened，
+ *   它不会被这里关闭——调用方应先用 findUnresolvableSubmittedInstructions
+ *   检测并返回结构化错误，避免出现半批准状态。
+ *
+ * 这样设计同时支持：
+ * - 多轮返修产生多条 submitted 指令，approve 时一并关闭；
+ * - 旧 bug 残留的“Issue 已 verified、指令仍 submitted”一致性问题在审核时自愈。
  */
 export function applyEvaluationVerify(
   issueIds: string[],
   currentIssueStatuses: Map<string, IssueStatus>,
-  instructionId: string | null,
-  currentInstructionStatus: RevisionInstructionStatus | null,
+  instructions: InstructionRef[],
 ): CrossStateResult {
   const issueTransitions: CrossStateResult['issueTransitions'] = [];
 
@@ -97,13 +121,67 @@ export function applyEvaluationVerify(
     }
   }
 
+  // 正在被验证的 Issue（claimed_fixed -> verified）+ 此前已 verified 的 Issue
+  const resolvingIssueIds = new Set<string>();
+  for (const t of issueTransitions) resolvingIssueIds.add(t.issueId);
+  for (const [id, st] of currentIssueStatuses) {
+    if (st === 'verified') resolvingIssueIds.add(id);
+  }
+
   const instructionTransitions: CrossStateResult['instructionTransitions'] = [];
-  if (instructionId && currentInstructionStatus === 'submitted') {
-    const to = transitionRevisionInstruction(currentInstructionStatus, 'verified');
-    instructionTransitions.push({ instructionId, from: currentInstructionStatus, to });
+  for (const instr of instructions) {
+    if (instr.status !== 'submitted') continue;
+    if (instr.issueIds.length === 0) continue;
+    const allResolved = instr.issueIds.every((id) => resolvingIssueIds.has(id));
+    if (allResolved) {
+      const to = transitionRevisionInstruction('submitted', 'verified');
+      instructionTransitions.push({ instructionId: instr.id, from: 'submitted', to });
+    }
   }
 
   return { issueTransitions, instructionTransitions };
+}
+
+/**
+ * 检测无法在本次 approve 中关闭的 submitted 指令：
+ * 即存在关联 Issue 既不是 claimed_fixed、也不是 verified（仍处于
+ * repairing/open/reopened）。出现这种指令说明最新版本只解决了部分问题，
+ * approve 不应产生半批准状态，调用方应返回结构化错误。
+ */
+export function findUnresolvableSubmittedInstructions(
+  instructions: InstructionRef[],
+  currentIssueStatuses: Map<string, IssueStatus>,
+): string[] {
+  const unresolvable: string[] = [];
+  for (const instr of instructions) {
+    if (instr.status !== 'submitted') continue;
+    if (instr.issueIds.length === 0) continue;
+    const allResolved = instr.issueIds.every((id) => {
+      const st = currentIssueStatuses.get(id);
+      return st === 'claimed_fixed' || st === 'verified';
+    });
+    if (!allResolved) unresolvable.push(instr.id);
+  }
+  return unresolvable;
+}
+
+/**
+ * 检测“生命周期不一致”的 submitted 指令：
+ * 即其全部关联 Issue 已 verified，但指令本身仍 submitted。
+ * 这类指令可由系统一致性修复直接关闭（5.6），不应让 Agent 重新建返修。
+ */
+export function findStaleSubmittedInstructions(
+  instructions: InstructionRef[],
+  currentIssueStatuses: Map<string, IssueStatus>,
+): string[] {
+  const stale: string[] = [];
+  for (const instr of instructions) {
+    if (instr.status !== 'submitted') continue;
+    if (instr.issueIds.length === 0) continue;
+    const allVerified = instr.issueIds.every((id) => currentIssueStatuses.get(id) === 'verified');
+    if (allVerified) stale.push(instr.id);
+  }
+  return stale;
 }
 
 /**

@@ -15,6 +15,9 @@ export interface PublishArtifactOutput {
   artifact_version_id?: string;
   version?: number;
   error?: string;
+  /** 5.2：机器可读错误码。NO_ACTIVE_INSTRUCTION / AMBIGUOUS_ACTIVE_INSTRUCTION
+   * 表示无法确定唯一活跃返修指令，拒绝发布模糊归属的返修版本。 */
+  error_code?: string;
 }
 
 // === submit_evaluation ===
@@ -37,6 +40,12 @@ export interface SubmitEvaluationOutput {
   success: boolean;
   issue_ids?: string[];
   error?: string;
+  /** 5.1：机器可读错误码。PARTIAL_REVISION_INCOMPLETE 表示存在无法在本次
+   * approve 中关闭的 submitted 指令（其关联 Issue 仍未 claimed_fixed/verified），
+   * approve 不应产生半批准状态。 */
+  error_code?: string;
+  /** 5.1：无法关闭的 submitted 指令 ID 列表，便于定位。 */
+  incomplete_instruction_ids?: string[];
 }
 
 // === route_message ===
@@ -57,6 +66,14 @@ export interface RouteMessageOutput {
   success: boolean;
   revision_instruction_id?: string;
   error?: string;
+  /** 5.3：机器可读错误码。INVALID_ISSUE_REFERENCE 表示 scope.issue_ids 中存在
+   * 不合法的引用（不存在 / 不属于当前 Case / 状态不在 open|reopened）。
+   * 此时不会写入 Revision Instruction，也不会改变任何 Issue 状态。 */
+  error_code?: string;
+  /** 5.3：不合法的 issue_id 列表。 */
+  invalid_issue_ids?: string[];
+  /** 5.2：当发布返修版本时无法确定唯一活跃指令（0 条或多于 1 条）时使用。 */
+  ambiguous_instruction_ids?: string[];
 }
 
 // === approve_delivery ===
@@ -72,6 +89,15 @@ export interface ApproveDeliveryOutput {
   gate_passed?: boolean;
   checks?: GateCheckResult[];
   error?: string;
+  /** 5.6：true 表示系统对“Issue 已全 verified、指令仍 submitted”的生命周期不一致
+   * 执行了一致性修复（把陈旧 submitted 指令关闭为 verified）。 */
+  consistency_repaired?: boolean;
+  /** 5.6：门禁失败时确定性路由提示。若设置，case-runner 应据此路由，而不是把
+   * 门禁文本原样丢给 start agent。 */
+  route_to?: string;
+  route_reason?: string;
+  /** 5.6：内部错误码。INTERNAL_STATE_INCONSISTENT 表示一致性修复后仍无法通过门禁。 */
+  error_code?: string;
 }
 
 export interface GateCheckResult {

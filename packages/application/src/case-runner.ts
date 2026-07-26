@@ -174,19 +174,28 @@ export class CaseRunner {
       }
     }
 
-    if (inferredAgent) {
-      // 从最后 Turn 的 route_message 推断了续跑起点
-      agentKey = inferredAgent;
-      message = inferredMessage!;
-    } else if (!lastTurn) {
+    // 5.5：恢复决策优先由程序根据当前状态判断（不把全部判断交给模型）。
+    if (!lastTurn) {
       // 新建 Case（无任何 Turn）：使用用户输入作为首条消息
       agentKey = this.scenarioConfig.start_agent;
       const payload = this.caseService.getInputPayload(caseId);
       message = this.renderInputMessage(payload);
     } else {
-      // 崩溃续跑（有 Turn 但无法从 route_message 推断）：使用上下文摘要
-      agentKey = this.scenarioConfig.start_agent;
-      message = this.buildResumeContextMessage(caseId);
+      const decision = this.decideResumeAgent(caseId);
+      if (decision) {
+        // 程序判定：under_review -> 审核 Agent；issued/in_progress -> 返修 Agent；
+        // 全部关闭未交付 -> start_agent 申请交付
+        agentKey = decision.agent;
+        message = decision.message;
+      } else if (inferredAgent) {
+        // 回退 1：从最后 Turn 的 route_message 推断续跑起点
+        agentKey = inferredAgent;
+        message = inferredMessage!;
+      } else {
+        // 回退 2：回到 start_agent，附带完整状态上下文
+        agentKey = this.scenarioConfig.start_agent;
+        message = this.buildResumeContextMessage(caseId);
+      }
     }
 
     // 7. runTurnLoop
@@ -247,6 +256,8 @@ export class CaseRunner {
     let currentAgentKey = agentKey;
     let currentMessage = message;
     let consecutiveErrors = 0;
+    // 5.4：非终态 Case 连续无工具调用计数。第一次追加纠错消息，第二次转 failed。
+    let consecutiveNoAction = 0;
     const maxConsecutiveErrors = 3;
 
     for (let turnNum = 0; turnNum < maxTurns; turnNum++) {
@@ -385,6 +396,17 @@ export class CaseRunner {
             this.caseService.transitionCaseStatus(caseId, 'approved');
             this.repo.closeSessionsByCase(caseId);
             this.logger.info(`\n[交付] 门禁通过，Case 已交付！`);
+          } else if (deliveryOutput.error_code === 'INTERNAL_STATE_INCONSISTENT') {
+            // 5.6：一致性修复后仍无法通过门禁，且无法确定性路由 -> 内部错误，转 failed
+            this.logger.error(`\n[门禁] 内部状态不一致，Case 转 failed: ${deliveryOutput.error}`);
+            this.caseService.transitionCaseStatus(caseId, 'failed');
+            routed = true;
+          } else if (deliveryOutput.route_to) {
+            // 5.6：按指令状态确定性路由（submitted -> 审核 Agent；issued/in_progress -> 返修 Agent）
+            this.logger.info(`  [门禁] 未通过，确定性路由到 ${deliveryOutput.route_to}: ${deliveryOutput.route_reason}`);
+            currentAgentKey = deliveryOutput.route_to;
+            currentMessage = deliveryOutput.route_reason ?? `交付门禁未通过，请按当前返修指令继续。`;
+            routed = true;
           } else {
             this.logger.info(`  [门禁] 未通过: ${JSON.stringify(deliveryOutput.checks?.filter((c: any) => !c.passed))}`);
             // 回到总控
@@ -478,20 +500,44 @@ export class CaseRunner {
         if (cr && (cr.status === 'approved' || cr.status === 'waiting_human')) {
           break;
         }
-        // 默认：如果当前 agent 没有产生路由，结束循环
+        // 5.4：非终态 Case（running/waiting_review/repairing）+ 无工具调用，不得静默返回。
         if (result.toolCallResults.length === 0) {
-          this.logger.info(`  [结束] Agent 未产生工具调用，循环结束`);
-          break;
+          consecutiveNoAction++;
+          if (consecutiveNoAction >= 2) {
+            // 连续第二次仍无动作：转 failed，记录原因
+            this.logger.error(`\n[停止] 非终态 Case(${cr?.status}) 连续 ${consecutiveNoAction} 次无工具调用，转为 failed`);
+            this.caseService.transitionCaseStatus(caseId, 'failed');
+            this.repo.insertControlEvent({
+              event_id: this.idGen.generate('evt'),
+              case_id: caseId,
+              event_type: 'agent_no_action_in_nonterminal_state',
+              actor: currentAgentKey,
+              detail: JSON.stringify({ case_status: cr?.status, agent: currentAgentKey, consecutive_no_action: consecutiveNoAction }),
+              created_at: this.clock.now(),
+            });
+            break;
+          }
+          // 第一次：追加确定性纠错消息（列活跃指令 + Issue + 允许工具），让同一 Agent 重试
+          this.logger.warn(`  [纠错] 非终态 Case(${cr?.status}) 无工具调用，追加确定性纠错消息重试`);
+          currentMessage = this.buildCorrectionMessage(caseId, currentAgentKey);
+          // currentAgentKey 保持不变，让同一 Agent 据纠错消息重试
+          continue;
         }
+        // 有工具调用但没产生路由：重置无动作计数，循环继续（沿用既有行为）
+        consecutiveNoAction = 0;
+      } else {
+        consecutiveNoAction = 0;
       }
     }
   }
 
   /**
-   * 构造崩溃恢复续跑消息
+   * 5.5：构造崩溃恢复续跑上下文消息（富上下文）。
+   * 包含 Case 状态、最新产物版本、全部未关闭 Issue（ID/severity/status/anchor）、
+   * 全部活跃返修指令（ID/status/target_agent/target_version/issue_ids）、下一步允许动作。
    */
   private buildResumeContextMessage(caseId: string): string {
-    const lines: string[] = ['系统崩溃恢复后续跑。请根据以下当前进度决定下一步：'];
+    const lines: string[] = ['系统崩溃恢复后续跑。当前进度如下：'];
     const caseRecord = this.repo.getCase(caseId);
     if (caseRecord) {
       lines.push(`- Case 状态: ${caseRecord.status}`);
@@ -502,33 +548,172 @@ export class CaseRunner {
       if (artifact) {
         const latest = this.repo.getLatestVersion(artifact.artifact_id as string);
         if (latest) {
-          lines.push(`- 最新产物 [${at.type}]: v${latest.version} (${latest.status})`);
+          lines.push(
+            `- 最新产物 [${at.type}]: v${latest.version} (status=${latest.status}, hash=${(latest.content_hash as string).slice(0, 8)})`,
+          );
         }
       }
     }
-    // 待处理 Issue
+    // 全部未关闭 Issue：ID / severity / status / anchor
     const issues = this.repo.getIssuesByCase(caseId);
-    const active = issues.filter((i) =>
+    const open = issues.filter((i) =>
       ['open', 'repairing', 'claimed_fixed', 'reopened'].includes(i.status as string),
     );
-    if (active.length > 0) {
-      lines.push(
-        `- 待处理 Issue: ${active.length} 个（${active.map((i) => `${i.severity}:${i.status}`).join(', ')}）`,
-      );
+    if (open.length > 0) {
+      lines.push(`- 未关闭 Issue（${open.length} 个）:`);
+      for (const i of open) {
+        let anchor: any = i.anchor;
+        try { anchor = i.anchor ? JSON.parse(i.anchor as string) : null; } catch { /* keep raw */ }
+        const anchorStr = anchor && typeof anchor === 'object'
+          ? `${anchor.type}:${anchor.value}`
+          : String(anchor ?? '');
+        lines.push(
+          `    - ${i.issue_id} [severity=${i.severity}, status=${i.status}] anchor=${anchorStr} problem=${(i.problem as string).slice(0, 60)}`,
+        );
+      }
     } else {
-      lines.push('- 待处理 Issue: 无');
+      lines.push('- 未关闭 Issue: 无');
     }
-    // 活跃返修指令
+    // 全部活跃返修指令：ID / status / target_agent / target_version / issue_ids
     const revisions = this.repo.getActiveRevisionInstructions(caseId);
     if (revisions.length > 0) {
-      lines.push(`- 活跃返修指令: ${revisions.length} 条`);
+      lines.push(`- 活跃返修指令（${revisions.length} 条）:`);
+      for (const ri of revisions) {
+        const issueIds = this.parseIssueIdsSafe(ri.issue_ids as string);
+        lines.push(
+          `    - ${ri.revision_instruction_id} [status=${ri.status}, target_agent=${ri.target_agent}, target_version=${ri.target_artifact_version_id ?? 'null'}] issue_ids=[${issueIds.join(',')}]`,
+        );
+      }
     } else {
       lines.push('- 活跃返修指令: 无');
     }
-    lines.push(
-      '请依据上述进度决定下一步：若产物待审核则路由给审核方，若需返修则下发返修指令，若已满足交付条件则申请交付。',
-    );
+    // 下一步系统允许的动作
+    lines.push('- 下一步允许动作:');
+    lines.push('    - 若产物版本为 under_review：路由给审核方（submit_evaluation）。');
+    lines.push('    - 若存在 issued/in_progress 返修指令：路由给指令 target_agent 发布修复版本。');
+    lines.push('    - 若 Issue 与指令均已关闭但 Case 未 approved：回到 start agent 申请交付。');
     return lines.join('\n');
+  }
+
+  /**
+   * 5.5：程序化恢复决策。根据当前状态确定性选择续跑 Agent，不把判断全交给模型。
+   * 返回 null 表示无法归类，调用方回退到 route_message 推断 / start_agent。
+   */
+  private decideResumeAgent(caseId: string): { agent: string; message: string } | null {
+    const caseRecord = this.repo.getCase(caseId);
+    if (!caseRecord) return null;
+    const status = caseRecord.status as string;
+    // 终态 / 等待人工：runCase 顶部已处理，这里不决定
+    if (['approved', 'failed', 'stopped', 'waiting_human'].includes(status)) return null;
+
+    // 1. 最新版本 under_review -> 路由审核 Agent
+    for (const at of this.scenarioConfig.artifact_types) {
+      const artifact = this.repo.getArtifactByTypeAndCase(caseId, at.type);
+      if (artifact) {
+        const latest = this.repo.getLatestVersion(artifact.artifact_id as string);
+        if (latest && latest.status === 'under_review') {
+          const reviewer = this.findReviewerAgentKey();
+          if (reviewer) {
+            return {
+              agent: reviewer,
+              message: `系统恢复续跑：最新产物版本 v${latest.version} 处于 under_review，请执行审核（submit_evaluation）。`,
+            };
+          }
+        }
+      }
+    }
+    // 2. 存在 issued/in_progress 指令 -> 路由其 target_agent
+    const active = this.repo.getActiveRevisionInstructions(caseId);
+    const inProgress = active.find(
+      (ri) => ri.status === 'issued' || ri.status === 'in_progress',
+    );
+    if (inProgress) {
+      return {
+        agent: inProgress.target_agent as string,
+        message: `系统恢复续跑：存在进行中的返修指令(${inProgress.revision_instruction_id})，请按指令的 editable_anchors 范围发布修复版本。\n${this.buildResumeContextMessage(caseId)}`,
+      };
+    }
+    // 3. 全部 Issue 已 verified、无活跃指令但未交付 -> 回到 start agent 申请交付
+    const openIssues = this.repo
+      .getIssuesByCase(caseId)
+      .filter((i) => (i.status as string) !== 'verified');
+    if (openIssues.length === 0 && active.length === 0) {
+      return {
+        agent: this.scenarioConfig.start_agent,
+        message: `系统恢复续跑：所有 Issue 已 verified、无活跃返修指令。若最新产物版本已审核通过，请申请交付（approve_delivery）。`,
+      };
+    }
+    // 4. 状态无法归类（如存在 submitted 指令但版本非 under_review）-> 返回 null，调用方回退
+    return null;
+  }
+
+  /**
+   * 5.4：非终态无工具调用时的确定性纠错消息。列出当前活跃指令、未关闭 Issue、
+   * 当前 Agent 允许的工具，让 Agent 据此重试，而不是自行猜测 ID。
+   */
+  private buildCorrectionMessage(caseId: string, agentKey: string): string {
+    const lines: string[] = [
+      `[系统纠错] 当前 Case 处于非终态，但你本轮没有产生任何工具调用。请根据以下状态立即执行下一步：`,
+    ];
+    const caseRecord = this.repo.getCase(caseId);
+    if (caseRecord) lines.push(`- Case 状态: ${caseRecord.status}`);
+
+    // 活跃返修指令
+    const active = this.repo.getActiveRevisionInstructions(caseId);
+    if (active.length > 0) {
+      lines.push(`- 活跃返修指令（${active.length} 条）:`);
+      for (const ri of active) {
+        const issueIds = this.parseIssueIdsSafe(ri.issue_ids as string);
+        lines.push(
+          `    - ${ri.revision_instruction_id} [status=${ri.status}, target_agent=${ri.target_agent}] issue_ids=[${issueIds.join(',')}]`,
+        );
+      }
+    } else {
+      lines.push('- 活跃返修指令: 无');
+    }
+    // 未关闭 Issue
+    const openIssues = this.repo
+      .getIssuesByCase(caseId)
+      .filter((i) => ['open', 'repairing', 'claimed_fixed', 'reopened'].includes(i.status as string));
+    if (openIssues.length > 0) {
+      lines.push(`- 未关闭 Issue（${openIssues.length} 个）:`);
+      for (const i of openIssues) {
+        lines.push(`    - ${i.issue_id} [${i.severity}/${i.status}] ${(i.problem as string).slice(0, 60)}`);
+      }
+    }
+    // 当前 Agent 允许的工具
+    const agentConfig = this.scenarioConfig.agents.find((a) => a.key === agentKey);
+    if (agentConfig) {
+      lines.push(`- 你（${agentKey}）允许的工具: ${agentConfig.tools.join(', ')}`);
+    }
+    // 确定性提示
+    if (agentConfig?.tools.includes('submit_evaluation')) {
+      const artifactType = this.scenarioConfig.artifact_types[0]?.type;
+      lines.push(`- 请立即调用 submit_evaluation 对最新 ${artifactType ?? '产物'} 版本给出审核结论。`);
+    } else if (agentConfig?.tools.includes('publish_artifact')) {
+      lines.push(`- 请立即调用 publish_artifact 按返修指令发布修复版本（只改 editable_anchors 范围）。`);
+    } else if (agentConfig?.tools.includes('approve_delivery')) {
+      lines.push(`- 请立即调用 approve_delivery 申请交付，或调用 route_message 派发任务。`);
+    }
+    lines.push('- 若再次无工具调用，Case 将被转为 failed。');
+    return lines.join('\n');
+  }
+
+  /** 安全解析 issue_ids JSON 字符串（case-runner 内部用） */
+  private parseIssueIdsSafe(raw: string | null | undefined): string[] {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((x) => typeof x === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** 查找持有 submit_evaluation 工具的 Agent（审核方），配置驱动 */
+  private findReviewerAgentKey(): string | null {
+    const reviewer = this.scenarioConfig.agents.find((a) => a.tools.includes('submit_evaluation'));
+    return reviewer?.key ?? null;
   }
 
   /**
