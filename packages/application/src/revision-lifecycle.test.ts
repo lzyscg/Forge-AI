@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { SqliteRepository, SystemClock, UuidGenerator } from '@forge-ai/adapters';
 import { ToolExecutor } from '@forge-ai/application';
 import { RecoveryService } from '@forge-ai/application';
-import { repairStaleSubmittedInstructions } from '@forge-ai/application';
+import { repairOrphanedInstructions } from '@forge-ai/application';
 import type { ScenarioConfig } from '@forge-ai/contracts';
 
 const SCENARIO: ScenarioConfig = {
@@ -461,11 +461,18 @@ describe('验收补充（4 项修复：恢复清理 / publish 排除 submitted /
     seedIssue(repo, clock, caseId, 'issue_rc2', 'av_rc_1', 'verified');
     seedInstruction(repo, clock, caseId, 'ri_rc1', 'av_rc_1', ['issue_rc1'], 'submitted');
     seedInstruction(repo, clock, caseId, 'ri_rc2', 'av_rc_1', ['issue_rc2'], 'submitted');
+    // 2 条 dirty issued：issue_ids 是 RI ID（无效引用，历史脏数据把指令 ID 当 issue_id），
+    // target 同一版本（匹配最新版本，后续 publish 会触发 AMBIGUOUS）--验收 issue 1 的真实场景。
+    seedInstruction(repo, clock, caseId, 'ri_rc3', 'av_rc_1', ['ri_rc1', 'ri_rc2'], 'issued');
+    seedInstruction(repo, clock, caseId, 'ri_rc4', 'av_rc_1', ['ri_rc1', 'ri_rc2'], 'issued');
 
-    const repaired = repairStaleSubmittedInstructions(repo, clock, idGen, caseId, 'recovery_cleanup');
-    expect(repaired.length).toBe(2);
+    const repaired = repairOrphanedInstructions(repo, clock, idGen, caseId, 'recovery_cleanup');
+    // 4 条孤儿指令（2 stale submitted + 2 dirty issued）全清理为 verified
+    expect(repaired.length).toBe(4);
     expect(repo.getRevisionInstruction('ri_rc1')?.status).toBe('verified');
     expect(repo.getRevisionInstruction('ri_rc2')?.status).toBe('verified');
+    expect(repo.getRevisionInstruction('ri_rc3')?.status).toBe('verified');
+    expect(repo.getRevisionInstruction('ri_rc4')?.status).toBe('verified');
     expect(repo.getControlEventsByCase(caseId).some((e) => e.event_type === 'consistency_repair')).toBe(true);
   });
 

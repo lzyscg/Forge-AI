@@ -16,9 +16,23 @@ import type {
   IssueStatus,
   RevisionInstructionStatus,
 } from '@forge-ai/contracts';
-import { findStaleSubmittedInstructions } from '@forge-ai/domain';
+import { findOrphanedInstructions } from '@forge-ai/domain';
 
-export function repairStaleSubmittedInstructions(
+/**
+ * 一致性修复：关闭"孤儿"活跃指令--其所有 issue_id 都不是"真实且未 verified 的 Issue"
+ * （全 verified，或引用了不存在的 ID，如历史脏数据把 RI ID 当 issue_id 写入）。
+ *
+ * 用于：
+ * - approve_delivery 门禁 no_active_revision 失败时（5.6）
+ * - runCase 恢复续跑前清理历史脏指令（验收 issue 1：dirty issued/submitted 匹配版本
+ *   会触发 AMBIGUOUS 或阻塞门禁）
+ *
+ * 覆盖任意活跃状态（issued/in_progress/submitted），比只清 submitted 更广--
+ * dirty issued（issue_ids 无效）也是孤儿，必须清理。
+ *
+ * 铁律 4：一致性修复以 control_event(consistency_repair) 追加记录，可追溯。
+ */
+export function repairOrphanedInstructions(
   repo: RepositoryPort,
   clock: ClockPort,
   idGen: IdGeneratorPort,
@@ -35,10 +49,10 @@ export function repairStaleSubmittedInstructions(
   const issueStatus = new Map<string, IssueStatus>();
   for (const i of issues) issueStatus.set(i.issue_id as string, i.status as IssueStatus);
 
-  const stale = findStaleSubmittedInstructions(refs, issueStatus);
-  if (stale.length === 0) return [];
+  const orphaned = findOrphanedInstructions(refs, issueStatus);
+  if (orphaned.length === 0) return [];
 
-  for (const id of stale) {
+  for (const id of orphaned) {
     repo.updateRevisionInstruction(id, { status: 'verified' });
   }
   repo.insertControlEvent({
@@ -46,8 +60,8 @@ export function repairStaleSubmittedInstructions(
     case_id: caseId,
     event_type: 'consistency_repair',
     actor: 'system',
-    detail: JSON.stringify({ closed_instruction_ids: stale, reason }),
+    detail: JSON.stringify({ closed_instruction_ids: orphaned, reason }),
     created_at: clock.now(),
   });
-  return stale;
+  return orphaned;
 }

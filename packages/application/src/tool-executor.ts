@@ -35,7 +35,7 @@ import {
   type InstructionRef,
 } from '@forge-ai/domain';
 import type { IssueStatus, RevisionInstructionStatus } from '@forge-ai/contracts';
-import { repairStaleSubmittedInstructions } from './revision-consistency.js';
+import { repairOrphanedInstructions } from './revision-consistency.js';
 
 export interface ToolExecutionContext {
   caseId: string;
@@ -684,7 +684,7 @@ export class ToolExecutor {
         failedChecks.length === 1 && failedChecks[0].check === 'no_active_revision';
       if (onlyNoActiveRevision) {
         // 5.6 一致性修复：关闭"关联 Issue 已全 verified 但仍 submitted"的陈旧指令（复用共享 helper）
-        const stale = repairStaleSubmittedInstructions(this.repo, this.clock, this.idGen, caseId, 'issues_all_verified');
+        const stale = repairOrphanedInstructions(this.repo, this.clock, this.idGen, caseId, 'issues_all_verified');
         if (stale.length > 0) {
           consistencyRepaired = true;
           // 重新评估门禁

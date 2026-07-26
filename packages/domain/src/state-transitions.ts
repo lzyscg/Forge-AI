@@ -166,7 +166,7 @@ export function findUnresolvableSubmittedInstructions(
 }
 
 /**
- * 检测“生命周期不一致”的 submitted 指令：
+ * 检测"生命周期不一致"的 submitted 指令：
  * 即其全部关联 Issue 已 verified，但指令本身仍 submitted。
  * 这类指令可由系统一致性修复直接关闭（5.6），不应让 Agent 重新建返修。
  */
@@ -182,6 +182,32 @@ export function findStaleSubmittedInstructions(
     if (allVerified) stale.push(instr.id);
   }
   return stale;
+}
+
+/**
+ * 检测"孤儿"活跃指令（issued/in_progress/submitted）：其所有 issue_id 都不是
+ * "真实且未 verified 的 Issue"（即全为已 verified，或引用了不存在的 ID--如历史脏数据
+ * 把 Revision Instruction ID 当 issue_id 写入）。这类指令无法导向有效返修，应被
+ * 一致性修复关闭，否则它们会匹配版本、触发 AMBIGUOUS_ACTIVE_INSTRUCTION 或阻塞门禁。
+ *
+ * 比-findStaleSubmittedInstructions 更广：覆盖任意活跃状态 + 无效引用，用于恢复路径
+ * 清理历史脏指令（验收 issue 1）。
+ */
+export function findOrphanedInstructions(
+  instructions: InstructionRef[],
+  currentIssueStatuses: Map<string, IssueStatus>,
+): string[] {
+  const orphaned: string[] = [];
+  for (const instr of instructions) {
+    if (instr.issueIds.length === 0) continue;
+    // 存在任一"真实且未 verified"的 Issue -> 不是孤儿（还有有效返修工作）
+    const hasRealOpenIssue = instr.issueIds.some((id) => {
+      const st = currentIssueStatuses.get(id);
+      return st !== undefined && st !== 'verified';
+    });
+    if (!hasRealOpenIssue) orphaned.push(instr.id);
+  }
+  return orphaned;
 }
 
 /**
