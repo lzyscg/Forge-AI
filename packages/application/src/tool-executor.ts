@@ -30,12 +30,12 @@ import {
   applyPublishArtifactRepair,
   applyEvaluationVerify,
   findUnresolvableSubmittedInstructions,
-  findStaleSubmittedInstructions,
   isRevisionInstructionActive,
   type DeliveryGateInput,
   type InstructionRef,
 } from '@forge-ai/domain';
 import type { IssueStatus, RevisionInstructionStatus } from '@forge-ai/contracts';
+import { repairStaleSubmittedInstructions } from './revision-consistency.js';
 
 export interface ToolExecutionContext {
   caseId: string;
@@ -144,6 +144,9 @@ export class ToolExecutor {
     if (activeInstructions.length > 0 && parentVersion) {
       const parentId = parentVersion.artifact_version_id as string;
       const candidates = activeInstructions.filter((ri) => {
+        // submitted = 该轮返修版本已发布、待审核，不是返修任务，不能再次绑定（否则
+        // 历史脏 submitted 指令会让新 publish 触发 AMBIGUOUS 或误绑已完成轮次）。
+        if (ri.status === 'submitted') return false;
         if (ri.target_agent !== ctx.agentKey) return false;
         const targetVersion = ri.target_artifact_version_id as string | null;
         // 优先匹配 target_artifact_version_id === parent；允许 null 兜底（指令创建时无版本）
@@ -355,32 +358,36 @@ export class ToolExecutor {
         submittedRefs,
       );
 
-      // Issue：claimed_fixed -> verified
-      for (const t of crossResult.issueTransitions) {
-        this.repo.updateIssue(t.issueId, {
-          status: t.to,
-          verified_by_evaluation_id: messageId,
-          updated_at: this.clock.now(),
-          closed_at: this.clock.now(),
+      // 5.1/4.2：Issue + Instruction + ArtifactVersion 的状态迁移在同一事务内提交，
+      // 中途异常整体回滚，不残留半批准状态（Issue verified 但 Instruction 仍 submitted 等）。
+      this.repo.runInTransaction(() => {
+        // Issue：claimed_fixed -> verified
+        for (const t of crossResult.issueTransitions) {
+          this.repo.updateIssue(t.issueId, {
+            status: t.to,
+            verified_by_evaluation_id: messageId,
+            updated_at: this.clock.now(),
+            closed_at: this.clock.now(),
+          });
+          this.repo.insertIssueEvent({
+            issue_event_id: this.idGen.generate('ie'),
+            issue_id: t.issueId,
+            event_type: 'verified',
+            actor: ctx.agentKey,
+            message_id: messageId,
+            detail: input.summary,
+            created_at: this.clock.now(),
+          });
+        }
+        // Instruction：submitted -> verified（5.1：全部可关闭的指令一并关闭）
+        for (const t of crossResult.instructionTransitions) {
+          this.repo.updateRevisionInstruction(t.instructionId, { status: t.to });
+        }
+        // ArtifactVersion：under_review -> approved
+        this.repo.updateArtifactVersion(latestVersion.artifact_version_id as string, {
+          status: 'approved',
+          approved_at: this.clock.now(),
         });
-        this.repo.insertIssueEvent({
-          issue_event_id: this.idGen.generate('ie'),
-          issue_id: t.issueId,
-          event_type: 'verified',
-          actor: ctx.agentKey,
-          message_id: messageId,
-          detail: input.summary,
-          created_at: this.clock.now(),
-        });
-      }
-      // Instruction：submitted -> verified（5.1：全部可关闭的指令一并关闭）
-      for (const t of crossResult.instructionTransitions) {
-        this.repo.updateRevisionInstruction(t.instructionId, { status: t.to });
-      }
-      // ArtifactVersion：under_review -> approved
-      this.repo.updateArtifactVersion(latestVersion.artifact_version_id as string, {
-        status: 'approved',
-        approved_at: this.clock.now(),
       });
     } else if (input.verdict === 'repair' || input.verdict === 'regenerate') {
       // 审核不通过：登记 issues
@@ -676,26 +683,9 @@ export class ToolExecutor {
       const onlyNoActiveRevision =
         failedChecks.length === 1 && failedChecks[0].check === 'no_active_revision';
       if (onlyNoActiveRevision) {
-        const allIssues = this.repo.getIssuesByCase(caseId);
-        const issueStatusMap = new Map<string, IssueStatus>();
-        for (const i of allIssues) issueStatusMap.set(i.issue_id as string, i.status as IssueStatus);
-
-        const activeRefs = this.collectInstructionRefs(caseId, 'active');
-        // 陈旧 submitted 指令：关联 Issue 已全部 verified（生命周期不一致）
-        const stale = findStaleSubmittedInstructions(activeRefs, issueStatusMap);
+        // 5.6 一致性修复：关闭"关联 Issue 已全 verified 但仍 submitted"的陈旧指令（复用共享 helper）
+        const stale = repairStaleSubmittedInstructions(this.repo, this.clock, this.idGen, caseId, 'issues_all_verified');
         if (stale.length > 0) {
-          // 系统一致性修复：把陈旧 submitted 指令关闭为 verified（不再让 Agent 重新建返修）
-          for (const id of stale) {
-            this.repo.updateRevisionInstruction(id, { status: 'verified' });
-          }
-          this.repo.insertControlEvent({
-            event_id: this.idGen.generate('evt'),
-            case_id: caseId,
-            event_type: 'consistency_repair',
-            actor: 'system',
-            detail: JSON.stringify({ closed_instruction_ids: stale, reason: 'issues_all_verified' }),
-            created_at: this.clock.now(),
-          });
           consistencyRepaired = true;
           // 重新评估门禁
           gateResult = this.evaluateGateForCase(caseId, latestVersion.artifact_version_id as string, ctx.turnId);
@@ -858,7 +848,7 @@ export class ToolExecutor {
 
     const gateInput: DeliveryGateInput = {
       artifactVersion: latestVersion ? { status: latestVersion.status as any } : null,
-      artifactVersionApproved: latestVersion?.status === 'approved',
+      artifactVersionApproved: latestVersion?.status === 'approved' || latestVersion?.status === 'delivered',
       blockingIssues,
       revisionInstructions,
       incompleteTurns,

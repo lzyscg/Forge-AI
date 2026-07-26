@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { SqliteRepository, SystemClock, UuidGenerator } from '@forge-ai/adapters';
 import { ToolExecutor } from '@forge-ai/application';
 import { RecoveryService } from '@forge-ai/application';
+import { repairStaleSubmittedInstructions } from '@forge-ai/application';
 import type { ScenarioConfig } from '@forge-ai/contracts';
 
 const SCENARIO: ScenarioConfig = {
@@ -430,5 +431,100 @@ describe('7.6 崩溃窗口幂等（5.5/不变量 4.5）', () => {
     expect(repo.getArtifactVersion('av_c_1')?.status).toBe('delivered');
     // 一致性修复事件可追溯
     expect(repo.getControlEventsByCase(caseId).some((e) => e.event_type === 'consistency_repair')).toBe(true);
+  });
+});
+
+describe('验收补充（4 项修复：恢复清理 / publish 排除 submitted / delivered 门禁）', () => {
+  let repo: SqliteRepository;
+  let clock: SystemClock;
+  let idGen: UuidGenerator;
+
+  beforeEach(() => {
+    repo = new SqliteRepository(':memory:');
+    clock = new SystemClock();
+    idGen = new UuidGenerator();
+  });
+
+  it('1: 恢复路径清理 2 条 stale submitted（issue 全 verified）', () => {
+    const caseId = 'case_rc_cleanup';
+    repo.insertCase({
+      case_id: caseId, title: 't', status: 'repairing', current_stage: 'repairing',
+      scenario_id: 'rev_test', scenario_snapshot: '{}', input_payload: '{}',
+      created_at: clock.now(), updated_at: clock.now(), completed_at: null,
+    });
+    repo.insertArtifact({
+      artifact_id: 'art_rc', case_id: caseId, artifact_type: 'lyrics',
+      scope_key: null, current_valid_version_id: 'av_rc_1', status: 'active', created_at: clock.now(),
+    });
+    seedVersion(repo, clock, caseId, 'art_rc', 'av_rc_1', 1, 'approved');
+    seedIssue(repo, clock, caseId, 'issue_rc1', 'av_rc_1', 'verified');
+    seedIssue(repo, clock, caseId, 'issue_rc2', 'av_rc_1', 'verified');
+    seedInstruction(repo, clock, caseId, 'ri_rc1', 'av_rc_1', ['issue_rc1'], 'submitted');
+    seedInstruction(repo, clock, caseId, 'ri_rc2', 'av_rc_1', ['issue_rc2'], 'submitted');
+
+    const repaired = repairStaleSubmittedInstructions(repo, clock, idGen, caseId, 'recovery_cleanup');
+    expect(repaired.length).toBe(2);
+    expect(repo.getRevisionInstruction('ri_rc1')?.status).toBe('verified');
+    expect(repo.getRevisionInstruction('ri_rc2')?.status).toBe('verified');
+    expect(repo.getControlEventsByCase(caseId).some((e) => e.event_type === 'consistency_repair')).toBe(true);
+  });
+
+  it('2: publish 不绑定 submitted 指令（待审核轮次不当返修任务，返回 NO_ACTIVE_INSTRUCTION）', () => {
+    const caseId = 'case_pub_excl';
+    repo.insertCase({
+      case_id: caseId, title: 't', status: 'repairing', current_stage: 'repairing',
+      scenario_id: 'rev_test', scenario_snapshot: '{}', input_payload: '{}',
+      created_at: clock.now(), updated_at: clock.now(), completed_at: null,
+    });
+    repo.insertArtifact({
+      artifact_id: 'art_p', case_id: caseId, artifact_type: 'lyrics',
+      scope_key: null, current_valid_version_id: 'av_p_1', status: 'active', created_at: clock.now(),
+    });
+    seedVersion(repo, clock, caseId, 'art_p', 'av_p_1', 1, 'under_review');
+    seedIssue(repo, clock, caseId, 'issue_p', 'av_p_1', 'repairing');
+    // 仅一条 submitted 指令（上一轮返修已发布待审核），无 issued/in_progress
+    seedInstruction(repo, clock, caseId, 'ri_p_sub', 'av_p_1', ['issue_p'], 'submitted');
+
+    const toolExecutor = new ToolExecutor(repo, clock, idGen);
+    const result = toolExecutor.execute(
+      'publish_artifact',
+      { artifact_type: 'lyrics', content: 'line1\nline2changed\nline3', summary: 'v2' },
+      { caseId, turnId: 'turn_p', sessionId: 'sess', agentKey: 'generator', messageId: 'msg_p', scenarioConfig: SCENARIO },
+    ) as Record<string, unknown>;
+
+    // 旧代码：submitted 在候选里 -> 绑定 + scope 校验（会成功，误把待审核轮次当返修任务）。
+    // 新代码：submitted 排除 -> 0 候选 -> NO_ACTIVE_INSTRUCTION。
+    expect(result.success).toBe(false);
+    expect(result.error_code).toBe('NO_ACTIVE_INSTRUCTION');
+    // submitted 指令未被误关/误绑
+    expect(repo.getRevisionInstruction('ri_p_sub')?.status).toBe('submitted');
+  });
+
+  it('4: delivered 版本（已交付未 approved 的崩溃窗口）门禁 artifact_version_approved 通过', () => {
+    const caseId = 'case_delivered';
+    repo.insertCase({
+      case_id: caseId, title: 't', status: 'running', current_stage: 'production',
+      scenario_id: 'rev_test', scenario_snapshot: '{}', input_payload: '{}',
+      created_at: clock.now(), updated_at: clock.now(), completed_at: null,
+    });
+    repo.insertArtifact({
+      artifact_id: 'art_d', case_id: caseId, artifact_type: 'lyrics',
+      scope_key: null, current_valid_version_id: 'av_d_1', status: 'active', created_at: clock.now(),
+    });
+    // 版本已 delivered（approve_delivery 在 turn 事务内置 delivered），Case 尚未 approved（崩溃窗口）
+    seedVersion(repo, clock, caseId, 'art_d', 'av_d_1', 1, 'delivered');
+    seedIssue(repo, clock, caseId, 'issue_d', 'av_d_1', 'verified');
+
+    const toolExecutor = new ToolExecutor(repo, clock, idGen);
+    const result = toolExecutor.execute(
+      'approve_delivery',
+      { summary: '交付' },
+      { caseId, turnId: 'turn_d', sessionId: 'sess', agentKey: 'supervisor', messageId: 'msg_d', scenarioConfig: SCENARIO },
+    ) as Record<string, unknown>;
+
+    // 旧代码 artifact_version_approved 只认 'approved'，delivered 失败 -> 门禁拦 -> 循环。
+    // 新代码接受 delivered，门禁通过。
+    expect(result.success).toBe(true);
+    expect(result.gate_passed).toBe(true);
   });
 });

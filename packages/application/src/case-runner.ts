@@ -25,6 +25,7 @@ import type {
 import { CaseService } from './case-service.js';
 import { TurnExecutor } from './turn-executor.js';
 import { RecoveryService } from './recovery.js';
+import { repairStaleSubmittedInstructions } from './revision-consistency.js';
 
 // === Logger 接口（注入，不直接 console.log） ===
 export interface Logger {
@@ -146,6 +147,14 @@ export class CaseRunner {
     // 4. RecoveryService.recoverCase（只恢复传入 caseId）
     const recoveryResult = this.recoveryService.recoverCase(caseId);
     this.logger.info(`[Recovery] ${caseId}: ${recoveryResult.detail}`);
+
+    // 4.5 一致性修复扩展到恢复路径：清理"关联 Issue 已全 verified 但仍 submitted"
+    // 的历史脏指令（如真实旧 Case 遗留的 stale submitted）。否则它们匹配最新版本，
+    // 后续 publish 会触发 AMBIGUOUS_ACTIVE_INSTRUCTION，且门禁 no_active_revision 拦截。
+    const repaired = repairStaleSubmittedInstructions(this.repo, this.clock, this.idGen, caseId, 'recovery_cleanup');
+    if (repaired.length > 0) {
+      this.logger.info(`[恢复] 清理 ${repaired.length} 条陈旧 submitted 指令（issue 已全 verified）`);
+    }
 
     // 5. 从最后完成 Turn 推断续跑起点
     let agentKey: string;

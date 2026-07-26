@@ -9,3 +9,4 @@ export * from './tool-executor.js';
 export * from './turn-executor.js';
 export * from './recovery.js';
 export * from './case-runner.js';
+export * from './revision-consistency.js';
