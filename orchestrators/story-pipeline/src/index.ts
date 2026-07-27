@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
@@ -564,6 +565,47 @@ function replacementCredentialPath(
 
 function removeReplacementCredential(path: string | null): void {
   if (path !== null) rmSync(path, { force: true });
+}
+
+function cleanupTerminalReplacementCredentials(
+  manifestPath: string,
+  manifest: PipelineManifest,
+): void {
+  const runDir = dirname(manifestPath);
+  for (const replacement of manifest.replacements) {
+    if (replacement.status === 'pending' || replacement.attempt_id === null) {
+      continue;
+    }
+    const attempt = manifest.attempts.find(
+      (item) => item.attempt_id === replacement.attempt_id,
+    );
+    if (!attempt) continue;
+    const credentialPath = resolve(
+      runDir,
+      'credentials',
+      `${sha256(attempt.attempt_id)}.runner-token`,
+    );
+    ensureInsideRunDir(runDir, credentialPath);
+    if (!existsSync(credentialPath)) continue;
+    if (attempt.runner_token_sha256 === null) {
+      throw new Error(
+        `terminal replacement credential has no Attempt secret hash: ${attempt.attempt_id}`,
+      );
+    }
+    const credentialStat = lstatSync(credentialPath);
+    if (!credentialStat.isFile() || credentialStat.isSymbolicLink()) {
+      throw new Error(
+        `terminal replacement credential is not a regular file: ${attempt.attempt_id}`,
+      );
+    }
+    const credential = readFileSync(credentialPath);
+    if (sha256(credential) !== attempt.runner_token_sha256) {
+      throw new Error(
+        `terminal replacement credential does not match Attempt: ${attempt.attempt_id}`,
+      );
+    }
+    rmSync(credentialPath, { force: true });
+  }
 }
 
 export function persistReplacementCommit(
@@ -1568,6 +1610,9 @@ export async function reconcileRun(
     || initialManifest.config_sha256 !== sha256(configText)
   ) {
     throw new Error('production config does not match the run manifest');
+  }
+  if (!options.dryRun) {
+    cleanupTerminalReplacementCredentials(manifestPath, initialManifest);
   }
   if (
     !options.dryRun

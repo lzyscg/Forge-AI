@@ -1,17 +1,22 @@
 import {
   existsSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { ForgeClient } from './forge-client.js';
+import { sha256 } from './hash.js';
 import {
   persistPendingReplacement,
   persistReplacementAttempt,
   persistReplacementCancellation,
   persistReplacementCandidate,
   persistReplacementCommit,
+  reconcileRun,
 } from './index.js';
 import {
   appendManifestEvent,
@@ -24,6 +29,7 @@ import {
   type StageRecordV21,
   type TemplateIdentity,
 } from './manifest.js';
+import { commitReplacement } from './replacement.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -76,6 +82,7 @@ function manifestPathWith(
   stages: StageRecordV21[],
   attempts: StageAttemptV21[] = [],
   withCredentials = false,
+  configSha256 = 'config',
 ): string {
   const runDirectory = mkdtempSync(join(tmpdir(), 'forge-replacement-'));
   temporaryDirectories.push(runDirectory);
@@ -98,7 +105,7 @@ function manifestPathWith(
     story_id: 'story-1',
     title: 'Story',
     mode: 'imitation',
-    config_sha256: 'config',
+    config_sha256: configSha256,
     boundary_map_path: 'structured/boundaries.json',
     boundary_map_sha256: 'boundaries',
     created_at: '2026-01-01T00:00:00.000Z',
@@ -113,6 +120,21 @@ function manifestPathWith(
   }));
   return manifestPath;
 }
+
+const unusedForgeClient: ForgeClient = {
+  async createCase() {
+    throw new Error('unexpected createCase');
+  },
+  async runCase() {
+    throw new Error('unexpected runCase');
+  },
+  async getCaseStatus() {
+    throw new Error('unexpected getCaseStatus');
+  },
+  async abortCase() {
+    throw new Error('unexpected abortCase');
+  },
+};
 
 function attemptFor(candidate: StageRecordV21): StageAttemptV21 {
   return {
@@ -371,5 +393,132 @@ describe('replacement Manifest CAS integration', () => {
     expect(existsSync(credentialPath)).toBe(false);
     expect(saved.stages).toEqual([old]);
     expect(saved.invalidations).toEqual([]);
+  });
+
+  it('cleans a committed replacement credential left by a crash on restart', async () => {
+    const old = record('outline-v1', 'outline');
+    const candidate = {
+      ...record('outline-v2', 'outline'),
+      input_sha256: 'outline-v2-input',
+    };
+    const attempt = attemptFor(candidate);
+    const config = {
+      run_id: 'run-1',
+      story_id: 'story-1',
+      title: 'Story',
+      mode: 'imitation',
+      source_file: 'source.md',
+      requirements: 'test only',
+      chapters: [{ id: 'B001' }],
+    };
+    const configText = `${JSON.stringify(config, null, 2)}\n`;
+    const path = manifestPathWith(
+      [old],
+      [attempt],
+      true,
+      sha256(configText),
+    );
+    const runDir = dirname(path);
+    const configPath = join(runDir, 'production-config.json');
+    writeFileSync(configPath, configText, 'utf8');
+    const credentialPath = join(runDir, attempt.runner_credential_path!);
+    const unrelatedPath = join(runDir, 'credentials', 'unrelated.runner-token');
+    writeFileSync(unrelatedPath, 'unrelated-secret', 'utf8');
+    const pending = persistPendingReplacement(path, {
+      stage_key: 'outline',
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      reason: 'input changed',
+    });
+    const replacementId = pending.replacements[0]!.replacement_id;
+    persistReplacementAttempt(path, replacementId, attempt.attempt_id);
+    const prepared = persistReplacementCandidate(
+      path,
+      replacementId,
+      attempt.attempt_id,
+      candidate,
+    );
+
+    saveManifestCas(path, prepared.revision, (manifest) => {
+      commitReplacement(manifest, replacementId);
+    });
+    expect(existsSync(credentialPath)).toBe(true);
+
+    await reconcileRun({
+      command: 'reconcile',
+      configPath,
+      runDir,
+      dbPath: join(runDir, 'forge.db'),
+      dryRun: false,
+      attestTemplateCompatibility: false,
+      attestLegacyCaseBindings: [],
+    }, unusedForgeClient, new AbortController().signal);
+
+    expect(existsSync(credentialPath)).toBe(false);
+    expect(readFileSync(unrelatedPath, 'utf8')).toBe('unrelated-secret');
+  });
+
+  it('fails closed when crash residue does not match the Attempt secret hash', async () => {
+    const old = record('outline-v1', 'outline');
+    const candidate = {
+      ...record('outline-v2', 'outline'),
+      input_sha256: 'outline-v2-input',
+    };
+    const attempt = attemptFor(candidate);
+    const config = {
+      run_id: 'run-1',
+      story_id: 'story-1',
+      title: 'Story',
+      mode: 'imitation',
+      source_file: 'source.md',
+      requirements: 'test only',
+      chapters: [{ id: 'B001' }],
+    };
+    const configText = `${JSON.stringify(config, null, 2)}\n`;
+    const path = manifestPathWith(
+      [old],
+      [attempt],
+      true,
+      sha256(configText),
+    );
+    const runDir = dirname(path);
+    const configPath = join(runDir, 'production-config.json');
+    writeFileSync(configPath, configText, 'utf8');
+    const credentialPath = join(runDir, attempt.runner_credential_path!);
+    const pending = persistPendingReplacement(path, {
+      stage_key: 'outline',
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      reason: 'input changed',
+    });
+    const replacementId = pending.replacements[0]!.replacement_id;
+    persistReplacementAttempt(path, replacementId, attempt.attempt_id);
+    const prepared = persistReplacementCandidate(
+      path,
+      replacementId,
+      attempt.attempt_id,
+      candidate,
+    );
+    saveManifestCas(path, prepared.revision, (manifest) => {
+      commitReplacement(manifest, replacementId);
+    });
+    writeFileSync(credentialPath, 'foreign-secret', 'utf8');
+
+    await expect(reconcileRun({
+      command: 'reconcile',
+      configPath,
+      runDir,
+      dbPath: join(runDir, 'forge.db'),
+      dryRun: false,
+      attestTemplateCompatibility: false,
+      attestLegacyCaseBindings: [],
+    }, unusedForgeClient, new AbortController().signal)).rejects.toThrow(
+      'terminal replacement credential does not match Attempt',
+    );
+    expect(readFileSync(credentialPath, 'utf8')).toBe('foreign-secret');
   });
 });
