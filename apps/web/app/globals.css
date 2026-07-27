@@ -66,6 +66,33 @@ body {
 .top-status i { width: 7px; height: 7px; border-radius: 50%; background: #657083; }
 .top-status i.live { background: #43d6a3; box-shadow: 0 0 0 5px rgba(67, 214, 163, .12); }
 
+/* ---------- env selector ---------- */
+.env-selector {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .06);
+  border: 1px solid rgba(255, 255, 255, .1);
+}
+.env-label {
+  color: #8490a3;
+  font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.env-select {
+  background: transparent;
+  color: #fff;
+  border: none;
+  outline: none;
+  font: 600 12px/1 -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.env-select option { color: #151c29; }
+
 /* ---------- layout ---------- */
 main { max-width: 1720px; margin: 0 auto; padding: 18px 22px 60px; }
 .workspace {
@@ -658,6 +685,13 @@ main { max-width: 1720px; margin: 0 auto; padding: 18px 22px 60px; }
 }
 .action-msg.error { background: var(--red-soft); color: var(--red); }
 .action-msg.success { background: var(--green-soft); color: var(--green); }
+.action-readonly-note {
+  display: block;
+  font-size: 11px;
+  color: var(--muted, #888);
+  margin-top: 6px;
+  line-height: 1.4;
+}
 
 /* ---------- responsive ---------- */
 @media (max-width: 1080px) {

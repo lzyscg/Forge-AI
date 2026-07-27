@@ -1,19 +1,31 @@
 /**
  * 数据库访问层（只读）
  * 铁律 6：不返回 API Key 等敏感信息
+ *
+ * 支持两库（生产/测试）+ all 聚合：
+ * - getCases(env)：按 env 解析 1 或 2 个库路径，聚合 Case 列表，每条带 dbPath 来源标签。
+ * - 详情函数（getCase/getTurns/...）：加 dbPath 参数，查指定库，不跨库 join。
  */
 
 import Database from 'better-sqlite3';
-import { resolve } from 'node:path';
+import { resolveDbPaths, type DbEnv } from '@forge-ai/adapters/paths';
+import { existsSync } from 'node:fs';
 
-const DB_PATH = process.env.DB_PATH ?? resolve(process.cwd(), '../../data/forge.db');
+/** 解析 URL ?env= 参数为 DbEnv（非法值默认 production） */
+export function parseEnvParam(env?: string): DbEnv {
+  if (env === 'production' || env === 'test' || env === 'all') return env;
+  return 'production';
+}
 
-let db: Database.Database | null = null;
+/** 每个 DB 路径对应一个缓存的只读连接 */
+const dbCache = new Map<string, Database.Database>();
 
-function getDb(): Database.Database {
+function getDb(dbPath: string): Database.Database {
+  let db = dbCache.get(dbPath);
   if (!db) {
-    db = new Database(DB_PATH, { readonly: true });
+    db = new Database(dbPath, { readonly: true });
     db.pragma('journal_mode = WAL');
+    dbCache.set(dbPath, db);
   }
   return db;
 }
@@ -28,6 +40,8 @@ export interface CaseRecord {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  /** 来源库绝对路径（聚合视图标明来自哪个库；详情查询用它定位库） */
+  dbPath: string;
 }
 
 export interface MessageRecord {
@@ -76,23 +90,41 @@ export interface DeliveryGateResultRecord {
   created_at: string;
 }
 
-export function getCases(): CaseRecord[] {
-  const db = getDb();
-  return db.prepare('SELECT * FROM cases ORDER BY created_at DESC').all() as CaseRecord[];
+/**
+ * 列出 Case（env=all 时聚合两库，每条带 dbPath 标签；按 created_at 倒序）。
+ * 跳过不存在的库文件（不创建空库）。
+ */
+export function getCases(env: DbEnv = 'production'): CaseRecord[] {
+  const dbPaths = resolveDbPaths(env);
+  const all: CaseRecord[] = [];
+  for (const dbPath of dbPaths) {
+    if (!existsSync(dbPath)) continue;
+    const db = getDb(dbPath);
+    const rows = db.prepare('SELECT * FROM cases ORDER BY created_at DESC').all() as CaseRecord[];
+    for (const r of rows) {
+      r.dbPath = dbPath;
+      all.push(r);
+    }
+  }
+  all.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  return all;
 }
 
-export function getCase(caseId: string): CaseRecord | null {
-  const db = getDb();
-  return db.prepare('SELECT * FROM cases WHERE case_id = ?').get(caseId) as CaseRecord | null;
+/** 取单个 Case（从指定库读，不跨库） */
+export function getCase(dbPath: string, caseId: string): CaseRecord | null {
+  const db = getDb(dbPath);
+  const r = db.prepare('SELECT * FROM cases WHERE case_id = ?').get(caseId) as CaseRecord | null;
+  if (r) r.dbPath = dbPath;
+  return r;
 }
 
-export function getMessages(caseId: string): MessageRecord[] {
-  const db = getDb();
+export function getMessages(dbPath: string, caseId: string): MessageRecord[] {
+  const db = getDb(dbPath);
   return db.prepare('SELECT * FROM messages WHERE case_id = ? ORDER BY created_at ASC').all(caseId) as MessageRecord[];
 }
 
-export function getArtifactVersions(caseId: string): ArtifactVersionRecord[] {
-  const db = getDb();
+export function getArtifactVersions(dbPath: string, caseId: string): ArtifactVersionRecord[] {
+  const db = getDb(dbPath);
   return db.prepare(`
     SELECT av.* FROM artifact_versions av
     JOIN artifacts a ON av.artifact_id = a.artifact_id
@@ -101,13 +133,13 @@ export function getArtifactVersions(caseId: string): ArtifactVersionRecord[] {
   `).all(caseId) as ArtifactVersionRecord[];
 }
 
-export function getIssues(caseId: string): IssueRecord[] {
-  const db = getDb();
+export function getIssues(dbPath: string, caseId: string): IssueRecord[] {
+  const db = getDb(dbPath);
   return db.prepare('SELECT * FROM evaluation_issues WHERE case_id = ? ORDER BY created_at ASC').all(caseId) as IssueRecord[];
 }
 
-export function getDeliveryGateResults(caseId: string): DeliveryGateResultRecord[] {
-  const db = getDb();
+export function getDeliveryGateResults(dbPath: string, caseId: string): DeliveryGateResultRecord[] {
+  const db = getDb(dbPath);
   return db.prepare('SELECT * FROM delivery_gate_results WHERE case_id = ? ORDER BY created_at DESC').all(caseId) as DeliveryGateResultRecord[];
 }
 
@@ -127,8 +159,8 @@ export interface TurnRecord {
   provider_error: string | null;
 }
 
-export function getTurns(caseId: string): TurnRecord[] {
-  const db = getDb();
+export function getTurns(dbPath: string, caseId: string): TurnRecord[] {
+  const db = getDb(dbPath);
   return db.prepare(`
     SELECT t.turn_id, t.case_id, t.sequence, t.status, t.session_id,
            t.input_message_id, t.output_message_id, t.produced_artifact_version_ids,
@@ -152,8 +184,8 @@ export interface RouteEdgeRecord {
   created_at: string;
 }
 
-export function getRouteEdges(caseId: string): RouteEdgeRecord[] {
-  const db = getDb();
+export function getRouteEdges(dbPath: string, caseId: string): RouteEdgeRecord[] {
+  const db = getDb(dbPath);
   return db.prepare('SELECT * FROM route_edges WHERE case_id = ? ORDER BY created_at ASC').all(caseId) as RouteEdgeRecord[];
 }
 
@@ -167,8 +199,8 @@ export interface ToolActionRecord {
   created_at: string;
 }
 
-export function getToolActions(caseId: string): ToolActionRecord[] {
-  const db = getDb();
+export function getToolActions(dbPath: string, caseId: string): ToolActionRecord[] {
+  const db = getDb(dbPath);
   return db.prepare(`
     SELECT ta.action_id, ta.turn_id, ta.tool_name, ta.arguments, ta.result, ta.status, ta.created_at
     FROM tool_actions ta
@@ -190,8 +222,8 @@ export interface RevisionInstructionRecord {
   created_at: string;
 }
 
-export function getRevisionInstructions(caseId: string): RevisionInstructionRecord[] {
-  const db = getDb();
+export function getRevisionInstructions(dbPath: string, caseId: string): RevisionInstructionRecord[] {
+  const db = getDb(dbPath);
   return db.prepare('SELECT * FROM revision_instructions WHERE case_id = ? ORDER BY created_at ASC').all(caseId) as RevisionInstructionRecord[];
 }
 
@@ -206,7 +238,7 @@ export interface ContextSnapshotRecord {
   created_at: string;
 }
 
-export function getContextSnapshots(caseId: string): ContextSnapshotRecord[] {
-  const db = getDb();
+export function getContextSnapshots(dbPath: string, caseId: string): ContextSnapshotRecord[] {
+  const db = getDb(dbPath);
   return db.prepare('SELECT * FROM context_snapshots WHERE case_id = ?').all(caseId) as ContextSnapshotRecord[];
 }

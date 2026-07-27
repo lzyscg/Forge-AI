@@ -2,13 +2,16 @@
  * forge case create / run / status / list / resume / stop
  */
 import { Command } from 'commander';
+import { dirname, basename } from 'node:path';
+import { existsSync } from 'node:fs';
 import { CaseRunner, ConcurrentCaseError, type Logger } from '@forge-ai/application';
-import { resolveFromRoot, FakePiAdapter } from '@forge-ai/adapters';
+import { resolveFromRoot, FakePiAdapter, ScriptArtifactValidator } from '@forge-ai/adapters';
 import type { ResultJson } from '@forge-ai/contracts';
 import { writeFirstLine, writeResultLine, writeErrorLine, writeStdoutLine } from '../output.js';
 import { createFileLogger, stderrLogger } from '../logger.js';
 import {
-  resolveDbPath, resolveMode, resolveScenarioPath, resolveInputPayload,
+  resolveReadDbPaths, resolveWriteDbPath, findCaseInfra,
+  resolveMode, resolveScenarioPath, resolveInputPayload,
   initInfra, createPiAdapter, TOOL_DEFINITIONS,
 } from '../setup.js';
 
@@ -24,13 +27,14 @@ export function registerCaseCommand(program: Command): void {
     .description('创建新 Case')
     .requiredOption('--template <name|path>', '场景模板名称或路径')
     .option('--input <json>', '输入 JSON')
-    .option('--db <path>', '数据库路径')
+    .option('--db <path>', '数据库路径（显式覆盖，优先级最高）')
+    .option('--env <production|test|all>', '数据库环境（写操作不可用 all）')
     .option('--mode <mode>', 'Pi 模式 (fake|real)')
     .option('--title <title>', 'Case 标题')
     .option('--human', '人类可读格式输出')
     .action((opts) => {
       try {
-        const dbPath = resolveDbPath(opts.db);
+        const dbPath = resolveWriteDbPath(opts.db, opts.env);
         const mode = resolveMode(opts.mode);
         const scenarioPath = resolveScenarioPath(opts.template);
         const { repo, clock, idGen, configLoader } = initInfra(dbPath);
@@ -45,6 +49,7 @@ export function registerCaseCommand(program: Command): void {
           configLoader,
           toolDefinitions: TOOL_DEFINITIONS,
           logger: stderrLogger,
+          artifactValidator: new ScriptArtifactValidator(dirname(scenarioPath)),
         });
 
         const inputPayload = resolveInputPayload(scenarioPath, scenarioConfig, opts.input);
@@ -66,16 +71,19 @@ export function registerCaseCommand(program: Command): void {
     .description('运行 Case（默认阻塞到终态）')
     .option('--wait', '阻塞等待完成（默认）', true)
     .option('--max-turns <n>', '最大 Turn 数', '20')
-    .option('--db <path>', '数据库路径')
+    .option('--db <path>', '数据库路径（显式覆盖，优先级最高）')
+    .option('--env <production|test|all>', '数据库环境（写操作不可用 all）')
     .option('--mode <mode>', 'Pi 模式 (fake|real)')
     .option('--human', '人类可读格式输出')
     .action(async (id: string, opts) => {
-      const dbPath = resolveDbPath(opts.db);
-      const mode = resolveMode(opts.mode);
-      const logPath = resolveFromRoot('data', `case-${id}.log`);
-      const logger = createFileLogger(logPath);
-
       try {
+        // resolveWriteDbPath/resolveMode 必须在 try 内：--env all 会抛错，
+        // 需走 writeErrorLine（stdout errorJson + exit 非 0），不能漏到 stderr 堆栈（坑 19）。
+        const dbPath = resolveWriteDbPath(opts.db, opts.env);
+        const mode = resolveMode(opts.mode);
+        const logPath = resolveFromRoot('data', `case-${id}.log`);
+        const logger = createFileLogger(logPath);
+
         const { repo, clock, idGen, configLoader } = initInfra(dbPath);
 
         // 从 case 记录获取 scenario 信息
@@ -108,6 +116,7 @@ export function registerCaseCommand(program: Command): void {
           configLoader,
           toolDefinitions: TOOL_DEFINITIONS,
           logger,
+          artifactValidator: new ScriptArtifactValidator(dirname(scenarioPath)),
           maxTurns,
         });
 
@@ -132,12 +141,18 @@ export function registerCaseCommand(program: Command): void {
   caseCmd
     .command('status <id>')
     .description('查看 Case 状态')
-    .option('--db <path>', '数据库路径')
+    .option('--db <path>', '数据库路径（显式覆盖，优先级最高）')
+    .option('--env <production|test|all>', '数据库环境（all 时在两库中查找）')
     .option('--human', '人类可读格式输出')
     .action((id: string, opts) => {
       try {
-        const dbPath = resolveDbPath(opts.db);
-        const { repo, clock, idGen, configLoader } = initInfra(dbPath);
+        const dbPaths = resolveReadDbPaths(opts.db, opts.env);
+        const found = findCaseInfra(dbPaths, id);
+        if (!found) {
+          writeErrorLine(`Case not found: ${id}`);
+          process.exit(1);
+        }
+        const { repo, clock, idGen, configLoader } = found;
 
         const caseRecord = repo.getCase(id);
         if (!caseRecord) {
@@ -199,39 +214,45 @@ export function registerCaseCommand(program: Command): void {
   caseCmd
     .command('list')
     .description('列出所有 Case')
-    .option('--db <path>', '数据库路径')
+    .option('--db <path>', '数据库路径（显式覆盖，优先级最高）')
+    .option('--env <production|test|all>', '数据库环境（all 聚合两库）')
     .option('--human', '人类可读格式输出')
     .action((opts) => {
       try {
-        const dbPath = resolveDbPath(opts.db);
-        const { repo } = initInfra(dbPath);
-
-        const allCases: Record<string, unknown>[] = [];
-        for (const status of ALL_STATUSES) {
-          allCases.push(...repo.getCasesByStatus(status));
+        const dbPaths = resolveReadDbPaths(opts.db, opts.env);
+        const summaries: (Record<string, unknown> & { dbPath: string })[] = [];
+        for (const dbPath of dbPaths) {
+          if (!existsSync(dbPath)) continue; // 跳过不存在的库，不创建空库
+          const { repo } = initInfra(dbPath);
+          for (const status of ALL_STATUSES) {
+            for (const c of repo.getCasesByStatus(status)) {
+              summaries.push({
+                case_id: c.case_id,
+                title: c.title,
+                status: c.status,
+                created_at: c.created_at,
+                dbPath,
+              });
+            }
+          }
+          repo.close();
         }
-
-        const summaries = allCases.map((c) => ({
-          case_id: c.case_id,
-          title: c.title,
-          status: c.status,
-          created_at: c.created_at,
-        }));
+        // 按 created_at 倒序
+        summaries.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
 
         if (opts.human) {
           if (summaries.length === 0) {
             process.stdout.write('没有 Case。\n');
           } else {
-            process.stdout.write(`${'ID'.padEnd(28)} ${'状态'.padEnd(16)} ${'标题'}\n`);
-            process.stdout.write('-'.repeat(70) + '\n');
+            process.stdout.write(`${'ID'.padEnd(28)} ${'状态'.padEnd(16)} ${'库'.padEnd(16)} ${'标题'}\n`);
+            process.stdout.write('-'.repeat(86) + '\n');
             for (const s of summaries) {
-              process.stdout.write(`${String(s.case_id).padEnd(28)} ${String(s.status).padEnd(16)} ${s.title}\n`);
+              process.stdout.write(`${String(s.case_id).padEnd(28)} ${String(s.status).padEnd(16)} ${basename(s.dbPath).padEnd(16)} ${s.title}\n`);
             }
           }
         } else {
           writeStdoutLine(summaries);
         }
-        repo.close();
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         writeErrorLine(msg);
@@ -244,16 +265,19 @@ export function registerCaseCommand(program: Command): void {
     .command('resume <id>')
     .description('人工输入后续跑 Case')
     .requiredOption('--answer <text>', '人工回答')
-    .option('--db <path>', '数据库路径')
+    .option('--db <path>', '数据库路径（显式覆盖，优先级最高）')
+    .option('--env <production|test|all>', '数据库环境（写操作不可用 all）')
     .option('--mode <mode>', 'Pi 模式 (fake|real)')
     .option('--human', '人类可读格式输出')
     .action(async (id: string, opts) => {
-      const dbPath = resolveDbPath(opts.db);
-      const mode = resolveMode(opts.mode);
-      const logPath = resolveFromRoot('data', `case-${id}.log`);
-      const logger = createFileLogger(logPath);
-
       try {
+        // resolveWriteDbPath/resolveMode 必须在 try 内：--env all 会抛错，
+        // 需走 writeErrorLine（stdout errorJson + exit 非 0），不能漏到 stderr 堆栈（坑 19）。
+        const dbPath = resolveWriteDbPath(opts.db, opts.env);
+        const mode = resolveMode(opts.mode);
+        const logPath = resolveFromRoot('data', `case-${id}.log`);
+        const logger = createFileLogger(logPath);
+
         const { repo, clock, idGen, configLoader } = initInfra(dbPath);
 
         const caseRecord = repo.getCase(id);
@@ -281,6 +305,7 @@ export function registerCaseCommand(program: Command): void {
           configLoader,
           toolDefinitions: TOOL_DEFINITIONS,
           logger,
+          artifactValidator: new ScriptArtifactValidator(dirname(scenarioPath)),
         });
 
         runner.assertNoConcurrentCase(id); // 先检查并发
@@ -303,11 +328,12 @@ export function registerCaseCommand(program: Command): void {
   caseCmd
     .command('stop <id>')
     .description('停止 Case')
-    .option('--db <path>', '数据库路径')
+    .option('--db <path>', '数据库路径（显式覆盖，优先级最高）')
+    .option('--env <production|test|all>', '数据库环境（写操作不可用 all）')
     .option('--human', '人类可读格式输出')
     .action((id: string, opts) => {
       try {
-        const dbPath = resolveDbPath(opts.db);
+        const dbPath = resolveWriteDbPath(opts.db, opts.env);
         const { repo, clock } = initInfra(dbPath);
 
         const caseRecord = repo.getCase(id);

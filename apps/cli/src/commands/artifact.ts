@@ -3,7 +3,7 @@
  */
 import { Command } from 'commander';
 import { writeStdoutLine, writeErrorLine } from '../output.js';
-import { resolveDbPath, initInfra } from '../setup.js';
+import { resolveReadDbPaths, findCaseInfra } from '../setup.js';
 import { stderrLogger } from '../logger.js';
 
 export function registerArtifactCommand(program: Command): void {
@@ -13,12 +13,18 @@ export function registerArtifactCommand(program: Command): void {
     .command('get <case_id>')
     .description('获取产物内容')
     .option('--version <n>', '指定版本号')
-    .option('--db <path>', '数据库路径')
+    .option('--db <path>', '数据库路径（显式覆盖，优先级最高）')
+    .option('--env <production|test|all>', '数据库环境（all 时在两库中查找）')
     .option('--human', '人类可读格式输出')
     .action((caseId: string, opts) => {
       try {
-        const dbPath = resolveDbPath(opts.db);
-        const { repo } = initInfra(dbPath);
+        const dbPaths = resolveReadDbPaths(opts.db, opts.env);
+        const found = findCaseInfra(dbPaths, caseId);
+        if (!found) {
+          writeErrorLine(`Case not found: ${caseId}`);
+          process.exit(1);
+        }
+        const { repo } = found;
 
         const caseRecord = repo.getCase(caseId);
         if (!caseRecord) {

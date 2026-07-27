@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 
 export async function POST(req: NextRequest) {
-  const { caseId, answer, dbPath } = await req.json();
+  const { caseId, answer, dbPath, env } = await req.json();
 
   if (!caseId) {
     return NextResponse.json({ error: 'caseId is required' }, { status: 400 });
@@ -16,7 +16,9 @@ export async function POST(req: NextRequest) {
   const cliBin = resolve(projectRoot, 'apps/cli/bin.js');
 
   const args = [cliBin, 'case', 'resume', caseId, '--answer', answer];
+  // 写操作：--db 优先级最高（精确库，all 视图下用选中 Case 的 dbPath），否则透传 --env（单库）。
   if (dbPath) args.push('--db', dbPath);
+  else if (env) args.push('--env', env);
 
   const child = spawn('node', args, {
     detached: true,

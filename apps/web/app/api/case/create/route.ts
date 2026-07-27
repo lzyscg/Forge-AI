@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 
 export async function POST(req: NextRequest) {
-  const { template, input, dbPath, title } = await req.json();
+  const { template, input, dbPath, env, title } = await req.json();
 
   if (!template) {
     return NextResponse.json({ error: 'template is required' }, { status: 400 });
@@ -14,7 +14,9 @@ export async function POST(req: NextRequest) {
 
   const args = [cliBin, 'case', 'create', '--template', template];
   if (input) args.push('--input', typeof input === 'string' ? input : JSON.stringify(input));
+  // 写操作：--db 优先级最高（精确库），否则透传 --env（必须单库 production|test，all 由 CLI 报错）。
   if (dbPath) args.push('--db', dbPath);
+  else if (env) args.push('--env', env);
   if (title) args.push('--title', title);
 
   const child = spawn('node', args, {

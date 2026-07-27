@@ -52,7 +52,8 @@ npm rebuild better-sqlite3 esbuild
 | 变量 | 必需 | 默认 | 说明 |
 |---|---|---|---|
 | `PI_MODE` | 是 | `fake` | `fake` 用脚本驱动；`real` 接真实 Pi + DeepSeek 模型 |
-| `DB_PATH` | 是 | `./data/forge.db` | SQLite 文件路径（自动创建父目录） |
+| `DB_PATH` | 否 | `data/production.db` | SQLite 文件路径（显式覆盖，优先级最高；自动创建父目录）。不设时按两库模型：`FORGE_ENV=test` -> `data/test.db`，否则 `data/production.db` |
+| `FORGE_ENV` | 否 | `production` | 数据库环境选择（`production` / `test`），与 CLI `--env`、Web env 选择器共用同一配置 |
 | `SCENARIO_PATH` | 是 | `./scenarios/songwriting/scenario.yaml` | 场景配置 YAML |
 | `DEEPSEEK_API_KEY` | `PI_MODE=real` 时必需 | — | DeepSeek API Key（铁律 6：只走环境变量，不进日志/DB/前端） |
 | `PI_MODEL_ID` | 否 | `deepseek-v4-flash` | 模型 ID（`deepseek-v4-flash` 或 `deepseek-v4-pro`） |

@@ -8,7 +8,17 @@ import { resolve, dirname } from 'node:path';
 import { mkdirSync, existsSync, readFileSync } from 'node:fs';
 import type { PiPort, PiToolDefinition, ScenarioConfig } from '@forge-ai/contracts';
 import { CaseRunner, RecoveryService, type Logger } from '@forge-ai/application';
-import { SqliteRepository, FakePiAdapter, RealPiAdapter, SystemClock, UuidGenerator, FileConfigLoader } from '@forge-ai/adapters';
+import {
+  SqliteRepository,
+  FakePiAdapter,
+  RealPiAdapter,
+  SystemClock,
+  UuidGenerator,
+  FileConfigLoader,
+  ScriptArtifactValidator,
+  resolveSingleDbPath,
+  defaultDbEnv,
+} from '@forge-ai/adapters';
 import type { FakePiScript } from '@forge-ai/adapters';
 
 // === 工具定义（注册给 Pi 的） ===
@@ -156,11 +166,15 @@ const consoleLogger: Logger = {
 async function main() {
   // 读取环境变量
   const piMode = process.env.PI_MODE ?? 'fake';
-  const dbPath = process.env.DB_PATH ?? './data/forge.db';
+  // 两库模型：DB_PATH 显式覆盖优先级最高；否则按 FORGE_ENV 选 production(默认)/test 库。
+  // 与 CLI/web 共用 resolveSingleDbPath/defaultDbEnv（计划第 2 节：配置共享）。
+  const dbEnv = defaultDbEnv();
+  const dbPath = process.env.DB_PATH ?? resolveSingleDbPath(dbEnv);
   const scenarioPath = process.env.SCENARIO_PATH ?? './scenarios/songwriting/scenario.yaml';
 
   console.log(`[Forge AI Worker] 启动`);
   console.log(`  PI_MODE: ${piMode}`);
+  console.log(`  DB_ENV: ${dbEnv}`);
   console.log(`  DB_PATH: ${dbPath}`);
   console.log(`  SCENARIO_PATH: ${scenarioPath}`);
 
@@ -220,6 +234,7 @@ async function main() {
     configLoader,
     toolDefinitions: TOOL_DEFINITIONS,
     logger: consoleLogger,
+    artifactValidator: new ScriptArtifactValidator(dirname(resolve(scenarioPath))),
     maxTurns: parseInt(process.env.MAX_TURNS ?? '20', 10),
   });
 

@@ -3,18 +3,19 @@
  * 轮询刷新（不做 SSE）。服务端取数 → 客户端 LaneBoard 画泳道+箭头。
  */
 
-import { getCases, getMessages, getArtifactVersions, getIssues, getDeliveryGateResults, getTurns, getRouteEdges, getToolActions, getRevisionInstructions, getContextSnapshots } from '../lib/db';
+import { getCases, getMessages, getArtifactVersions, getIssues, getDeliveryGateResults, getTurns, getRouteEdges, getToolActions, getRevisionInstructions, getContextSnapshots, parseEnvParam } from '../lib/db';
 import type { CaseRecord, MessageRecord, ArtifactVersionRecord, IssueRecord, DeliveryGateResultRecord, TurnRecord, RouteEdgeRecord, ToolActionRecord, RevisionInstructionRecord } from '../lib/db';
 import { AutoRefresh } from './auto-refresh';
 import { LaneBoard } from './lane-board';
 import { VersionDiff } from './version-diff';
 import { CaseActions } from './case-actions';
+import { EnvSelector } from './env-selector';
 import type { AgentInfo, TurnData, RouteEdgeData, ToolActionData, MessageData } from './lane-board';
 
 export const dynamic = 'force-dynamic';
 
 interface PageProps {
-  searchParams: { case?: string };
+  searchParams: { case?: string; env?: string };
 }
 
 interface ScenarioAgent {
@@ -50,19 +51,22 @@ function statusDotClass(status: string): string {
 }
 
 export default function Home({ searchParams }: PageProps) {
-  const cases = getCases();
+  const env = parseEnvParam(searchParams.env);
+  const cases = getCases(env);
   const selectedCaseId = searchParams.case ?? cases[0]?.case_id;
   const selectedCase = selectedCaseId ? cases.find((c) => c.case_id === selectedCaseId) ?? null : null;
+  // 详情查指定库（用选中 Case 的 dbPath 定位），不跨库 join
+  const dbPath = selectedCase?.dbPath;
 
-  const messages: MessageRecord[] = selectedCaseId ? getMessages(selectedCaseId) : [];
-  const versions: ArtifactVersionRecord[] = selectedCaseId ? getArtifactVersions(selectedCaseId) : [];
-  const issues: IssueRecord[] = selectedCaseId ? getIssues(selectedCaseId) : [];
-  const gateResults: DeliveryGateResultRecord[] = selectedCaseId ? getDeliveryGateResults(selectedCaseId) : [];
-  const turnRows: TurnRecord[] = selectedCaseId ? getTurns(selectedCaseId) : [];
-  const routeEdgeRows: RouteEdgeRecord[] = selectedCaseId ? getRouteEdges(selectedCaseId) : [];
-  const toolActionRows: ToolActionRecord[] = selectedCaseId ? getToolActions(selectedCaseId) : [];
-  const revisionInstructionRows: RevisionInstructionRecord[] = selectedCaseId ? getRevisionInstructions(selectedCaseId) : [];
-  const contextSnapshotRows = selectedCaseId ? getContextSnapshots(selectedCaseId) : [];
+  const messages: MessageRecord[] = (selectedCaseId && dbPath) ? getMessages(dbPath, selectedCaseId) : [];
+  const versions: ArtifactVersionRecord[] = (selectedCaseId && dbPath) ? getArtifactVersions(dbPath, selectedCaseId) : [];
+  const issues: IssueRecord[] = (selectedCaseId && dbPath) ? getIssues(dbPath, selectedCaseId) : [];
+  const gateResults: DeliveryGateResultRecord[] = (selectedCaseId && dbPath) ? getDeliveryGateResults(dbPath, selectedCaseId) : [];
+  const turnRows: TurnRecord[] = (selectedCaseId && dbPath) ? getTurns(dbPath, selectedCaseId) : [];
+  const routeEdgeRows: RouteEdgeRecord[] = (selectedCaseId && dbPath) ? getRouteEdges(dbPath, selectedCaseId) : [];
+  const toolActionRows: ToolActionRecord[] = (selectedCaseId && dbPath) ? getToolActions(dbPath, selectedCaseId) : [];
+  const revisionInstructionRows: RevisionInstructionRecord[] = (selectedCaseId && dbPath) ? getRevisionInstructions(dbPath, selectedCaseId) : [];
+  const contextSnapshotRows = (selectedCaseId && dbPath) ? getContextSnapshots(dbPath, selectedCaseId) : [];
   const contextByTurn: Record<string, string> = {};
   for (const cs of contextSnapshotRows) {
     if (cs.turn_id) contextByTurn[cs.turn_id] = cs.rendered_context;
@@ -181,6 +185,7 @@ export default function Home({ searchParams }: PageProps) {
           </div>
         </div>
         <div className="top-status">
+          <EnvSelector currentEnv={env} />
           <i className={selectedCase ? 'live' : ''} />
           <span>{selectedCase ? selectedCase.status : '未选择 Case'}</span>
         </div>
@@ -197,7 +202,7 @@ export default function Home({ searchParams }: PageProps) {
             <p className="rail-note">5 秒轮询 · 可创建 / 运行 / 恢复 Case</p>
             <div className="task-list">
               {cases.map((c) => (
-                <a key={c.case_id} href={`/?case=${c.case_id}`} className="task-item-link">
+                <a key={c.case_id} href={`/?env=${env}&case=${c.case_id}`} className="task-item-link">
                   <article className={`task-item${c.case_id === selectedCaseId ? ' active' : ''}`}>
                     <div className="task-main">
                       <div className="task-title-row">
@@ -215,7 +220,7 @@ export default function Home({ searchParams }: PageProps) {
                 </a>
               ))}
             </div>
-            <CaseActions caseId={selectedCaseId} caseStatus={selectedCase?.status} />
+            <CaseActions caseId={selectedCaseId} caseStatus={selectedCase?.status} env={env} caseDbPath={selectedCase?.dbPath} />
           </aside>
 
           {/* 主区 */}

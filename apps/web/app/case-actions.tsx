@@ -12,7 +12,7 @@ interface InputField {
   label: string;
 }
 
-export function CaseActions({ caseId, caseStatus }: { caseId?: string; caseStatus?: string }) {
+export function CaseActions({ caseId, caseStatus, env, caseDbPath }: { caseId?: string; caseStatus?: string; env: string; caseDbPath?: string }) {
   const [templates, setTemplates] = useState<TemplateInfo[]>([]);
   const [selectedTemplate, setSelectedTemplate] = useState('');
   const [inputFields, setInputFields] = useState<InputField[]>([]);
@@ -24,6 +24,9 @@ export function CaseActions({ caseId, caseStatus }: { caseId?: string; caseStatu
   // resume 相关
   const [resumeAnswer, setResumeAnswer] = useState('');
   const [resumeLoading, setResumeLoading] = useState(false);
+
+  // 写操作必须单库（production|test）；all 为只读聚合视图，禁用写按钮。
+  const isReadOnly = env === 'all';
 
   // 加载模板列表
   useEffect(() => {
@@ -64,15 +67,16 @@ export function CaseActions({ caseId, caseStatus }: { caseId?: string; caseStatu
 
   // 创建 + 运行 case
   const handleCreateAndRun = async () => {
+    if (isReadOnly) return; // all 视图只读，写按钮已禁用（防御）
     setLoading(true);
     setError('');
     setSuccess('');
     try {
-      // 1. create
+      // 1. create（带 env，写操作必须单库；create 后落在 env 对应的库）
       const createRes = await fetch('/api/case/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ template: selectedTemplate, input: fieldValues }),
+        body: JSON.stringify({ template: selectedTemplate, input: fieldValues, env }),
       });
       const createData = await createRes.json();
       if (!createRes.ok || createData.error) {
@@ -83,11 +87,11 @@ export function CaseActions({ caseId, caseStatus }: { caseId?: string; caseStatu
 
       const newCaseId = createData.case_id;
 
-      // 2. run
+      // 2. run（带 env，定位到刚创建的库）
       const runRes = await fetch('/api/case/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ caseId: newCaseId }),
+        body: JSON.stringify({ caseId: newCaseId, env }),
       });
       const runData = await runRes.json();
       if (!runRes.ok || runData.error) {
@@ -100,9 +104,9 @@ export function CaseActions({ caseId, caseStatus }: { caseId?: string; caseStatu
       }
 
       setSuccess(`Case ${newCaseId} 已启动`);
-      // 跳转到新 case
+      // 跳转到新 case，保留 env（写操作 env 必为单库）
       setTimeout(() => {
-        window.location.href = `/?case=${newCaseId}`;
+        window.location.href = `/?env=${env}&case=${newCaseId}`;
       }, 1000);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unknown error');
@@ -118,10 +122,11 @@ export function CaseActions({ caseId, caseStatus }: { caseId?: string; caseStatu
     setError('');
     setSuccess('');
     try {
+      // env 单库时透传 env；all 视图下用选中 Case 的 dbPath 精确定位库（--db 优先级最高）。
       const res = await fetch('/api/case/resume', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ caseId, answer: resumeAnswer.trim() }),
+        body: JSON.stringify({ caseId, answer: resumeAnswer.trim(), env, dbPath: caseDbPath }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
@@ -177,11 +182,15 @@ export function CaseActions({ caseId, caseStatus }: { caseId?: string; caseStatu
 
         <button
           className="action-btn primary"
-          disabled={!selectedTemplate || loading}
+          disabled={!selectedTemplate || loading || isReadOnly}
           onClick={handleCreateAndRun}
+          title={isReadOnly ? '全部视图为只读，请切换到生产或测试库后再创建任务' : undefined}
         >
           {loading ? '启动中…' : '创建并运行'}
         </button>
+        {isReadOnly && (
+          <small className="action-readonly-note">「全部」为只读聚合视图，无法创建任务。请切换到「生产」或「测试」库。</small>
+        )}
       </div>
 
       {/* Resume 区域 —— 仅 waiting_human 时显示 */}

@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 
 export async function POST(req: NextRequest) {
-  const { caseId, dbPath } = await req.json();
+  const { caseId, dbPath, env } = await req.json();
 
   if (!caseId) {
     return NextResponse.json({ error: 'caseId is required' }, { status: 400 });
@@ -14,7 +14,9 @@ export async function POST(req: NextRequest) {
   const cliBin = resolve(projectRoot, 'apps/cli/bin.js');
 
   const args = [cliBin, 'case', 'run', caseId, '--wait'];
+  // 写操作：--db 优先级最高（精确库），否则透传 --env（必须单库 production|test）。
   if (dbPath) args.push('--db', dbPath);
+  else if (env) args.push('--env', env);
 
   // detached spawn，stderr 必须 ignore 否则缓冲满会阻塞
   const child = spawn('node', args, {

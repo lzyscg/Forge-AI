@@ -4,7 +4,7 @@
 import { config } from 'dotenv';
 import { resolve, dirname } from 'node:path';
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { getPackageRoot, resolveFromRoot } from '@forge-ai/adapters';
+import { getPackageRoot, resolveFromRoot, resolveDbPaths, resolveSingleDbPath, defaultDbEnv, type DbEnv } from '@forge-ai/adapters';
 import { SqliteRepository, FakePiAdapter, RealPiAdapter, SystemClock, UuidGenerator, FileConfigLoader } from '@forge-ai/adapters';
 import type { FakePiScript } from '@forge-ai/adapters';
 import type { PiPort, PiToolDefinition, ScenarioConfig } from '@forge-ai/contracts';
@@ -14,6 +14,54 @@ import { writeErrorLine } from './output.js';
 // CLI 启动即加载 .env（相对包根）
 config({ path: resolveFromRoot('.env') });
 
+/** 合法 env 取值 */
+const VALID_DB_ENVS = new Set<string>(['production', 'test', 'all']);
+
+/**
+ * 校验并解析 --env 字符串为 DbEnv。
+ * 传入 undefined 时返回默认 env（production，可被 FORGE_ENV 覆盖）。
+ */
+export function parseDbEnv(envOption?: string): DbEnv {
+  const env = envOption ?? defaultDbEnv();
+  if (!VALID_DB_ENVS.has(env)) {
+    throw new Error(`无效的 --env: ${env}（支持 production | test | all）`);
+  }
+  return env as DbEnv;
+}
+
+/**
+ * 解析 DB 路径用于读操作（--env all 时返回两个库做聚合）。
+ * 优先级：--db > --env > DB_PATH(回退，向后兼容) > 默认 production。
+ */
+export function resolveReadDbPaths(dbOption?: string, envOption?: string): string[] {
+  if (dbOption) return [resolve(dbOption)];
+  if (envOption) return resolveDbPaths(parseDbEnv(envOption));
+  if (process.env.DB_PATH && process.env.DB_PATH.trim() !== '') {
+    return [resolve(process.env.DB_PATH)];
+  }
+  return resolveDbPaths(defaultDbEnv());
+}
+
+/**
+ * 解析 DB 路径用于写操作（必须单库，--env all 报错）。
+ * 优先级：--db > --env > DB_PATH(回退，向后兼容) > 默认 production。
+ */
+export function resolveWriteDbPath(dbOption?: string, envOption?: string): string {
+  if (dbOption) return resolve(dbOption);
+  if (envOption) {
+    const env = parseDbEnv(envOption);
+    if (env === 'all') {
+      throw new Error('写操作必须指定单个库（--env production|test），不支持 --env all');
+    }
+    return resolveSingleDbPath(env);
+  }
+  if (process.env.DB_PATH && process.env.DB_PATH.trim() !== '') {
+    return resolve(process.env.DB_PATH);
+  }
+  return resolveSingleDbPath(defaultDbEnv());
+}
+
+/** @deprecated 用 resolveReadDbPaths / resolveWriteDbPath 代替。保留供旧调用回退。 */
 export function resolveDbPath(dbOption?: string): string {
   return resolve(dbOption ?? process.env.DB_PATH ?? resolveFromRoot('data', 'forge.db'));
 }
@@ -164,6 +212,26 @@ export function initInfra(dbPath: string) {
   const idGen = new UuidGenerator();
   const configLoader = new FileConfigLoader();
   return { repo, clock, idGen, configLoader };
+}
+
+/**
+ * 在多个库中查找包含指定 case 的库（读操作 --env all 聚合搜索用）。
+ * 跳过不存在的库文件（不创建空库）。返回首个命中的 infra + dbPath，未命中返回 null。
+ * 命中库的 repo 保持打开，调用方负责关闭。
+ */
+export function findCaseInfra(
+  dbPaths: string[],
+  caseId: string,
+): { dbPath: string; repo: SqliteRepository; clock: SystemClock; idGen: UuidGenerator; configLoader: FileConfigLoader } | null {
+  for (const dbPath of dbPaths) {
+    if (!existsSync(dbPath)) continue;
+    const infra = initInfra(dbPath);
+    if (infra.repo.getCase(caseId)) {
+      return { dbPath, ...infra };
+    }
+    infra.repo.close();
+  }
+  return null;
 }
 
 /**
