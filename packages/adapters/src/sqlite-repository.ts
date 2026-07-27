@@ -3,8 +3,153 @@
  * 启用 WAL 模式 + busy-timeout（worker 写、web 回放页轮询读会同时访问同一个数据库文件）
  */
 
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  rmdirSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import type { RepositoryPort } from '@forge-ai/contracts';
+import type {
+  CaseStatus,
+  ExecutionLease,
+  ExecutionLeaseAbortResult,
+  RepositoryPort,
+} from '@forge-ai/contracts';
+
+const READONLY_SNAPSHOT_PREFIX = 'forge-readonly-db-';
+const READONLY_SNAPSHOT_ATTEMPTS = 12;
+const CLOSE_ATTEMPTS = 3;
+
+interface SnapshotFile {
+  bytes: Buffer;
+  length: number;
+  sha256: string;
+}
+
+interface SQLiteSourceImage {
+  database: SnapshotFile;
+  wal: SnapshotFile | null;
+}
+
+function snapshotFile(path: string): SnapshotFile {
+  const bytes = readFileSync(path);
+  return {
+    bytes,
+    length: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  };
+}
+
+function optionalSnapshotFile(path: string): SnapshotFile | null {
+  try {
+    return snapshotFile(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function sourceImage(dbPath: string): SQLiteSourceImage {
+  return {
+    database: snapshotFile(dbPath),
+    wal: optionalSnapshotFile(`${dbPath}-wal`),
+  };
+}
+
+function sameSnapshotFile(
+  left: SnapshotFile | null,
+  right: SnapshotFile | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return left.length === right.length && left.sha256 === right.sha256;
+}
+
+function sameSourceImage(
+  left: SQLiteSourceImage,
+  right: SQLiteSourceImage,
+): boolean {
+  return sameSnapshotFile(left.database, right.database)
+    && sameSnapshotFile(left.wal, right.wal);
+}
+
+function removeSnapshotFiles(directory: string): void {
+  if (!existsSync(directory)) return;
+  for (const name of readdirSync(directory)) {
+    rmSync(join(directory, name), { force: true });
+  }
+}
+
+function cleanupSnapshotDirectory(directory: string): void {
+  if (!existsSync(directory)) return;
+  removeSnapshotFiles(directory);
+  rmdirSync(directory);
+}
+
+function openStableReadonlySnapshot(
+  sourcePath: string,
+  directory: string,
+): Database.Database {
+  const snapshotPath = join(directory, 'forge.db');
+  let lastError: unknown;
+  for (
+    let attempt = 1;
+    attempt <= READONLY_SNAPSHOT_ATTEMPTS;
+    attempt += 1
+  ) {
+    let database: Database.Database | null = null;
+    try {
+      removeSnapshotFiles(directory);
+      const before = sourceImage(sourcePath);
+      writeFileSync(snapshotPath, before.database.bytes);
+      chmodSync(snapshotPath, 0o600);
+      if (before.wal) {
+        writeFileSync(`${snapshotPath}-wal`, before.wal.bytes);
+        chmodSync(`${snapshotPath}-wal`, 0o600);
+      }
+      const after = sourceImage(sourcePath);
+      const copied = sourceImage(snapshotPath);
+      if (
+        !sameSourceImage(before, after)
+        || !sameSourceImage(before, copied)
+      ) {
+        continue;
+      }
+
+      database = new Database(snapshotPath, { fileMustExist: true });
+      database.pragma('busy_timeout = 5000');
+      database.pragma('query_only = ON');
+      const quickCheck = database.pragma('quick_check') as Array<
+        Record<string, unknown>
+      >;
+      if (
+        quickCheck.length !== 1
+        || Object.values(quickCheck[0]!)[0] !== 'ok'
+      ) {
+        throw new Error('SQLite quick_check rejected the snapshot');
+      }
+      return database;
+    } catch (error) {
+      lastError = error;
+      try {
+        database?.close();
+      } finally {
+        removeSnapshotFiles(directory);
+      }
+    }
+  }
+  throw new Error(
+    'could not capture a stable read-only SQLite snapshot',
+    { cause: lastError },
+  );
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cases (
@@ -12,11 +157,31 @@ CREATE TABLE IF NOT EXISTS cases (
   title TEXT NOT NULL,
   status TEXT NOT NULL,
   current_stage TEXT NOT NULL DEFAULT 'init',
+  scenario_id TEXT,
   scenario_snapshot TEXT NOT NULL,
   input_payload TEXT NOT NULL,
+  scenario_snapshot_sha256 TEXT,
+  input_payload_sha256 TEXT,
+  run_id TEXT,
+  story_id TEXT,
+  stage_key TEXT,
+  chapter_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS execution_leases (
+  case_id TEXT PRIMARY KEY,
+  runner_token_sha256 TEXT NOT NULL,
+  runner_pid INTEGER NOT NULL,
+  runner_started_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS case_stop_authorizations (
+  case_id TEXT PRIMARY KEY,
+  runner_token_sha256 TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS agent_sessions (
@@ -94,6 +259,7 @@ CREATE TABLE IF NOT EXISTS artifact_versions (
   parent_version_id TEXT,
   diff TEXT,
   content_hash TEXT NOT NULL,
+  template_bundle_sha256 TEXT,
   status TEXT NOT NULL,
   approved_at TEXT,
   created_at TEXT NOT NULL
@@ -154,6 +320,7 @@ CREATE TABLE IF NOT EXISTS delivery_gate_results (
   gate_result_id TEXT PRIMARY KEY,
   case_id TEXT NOT NULL,
   artifact_version_id TEXT NOT NULL,
+  template_bundle_sha256 TEXT,
   status TEXT NOT NULL,
   checks TEXT NOT NULL,
   blocking_issue_ids TEXT,
@@ -180,6 +347,11 @@ CREATE TABLE IF NOT EXISTS control_events (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS database_metadata (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  db_instance_id TEXT NOT NULL UNIQUE
+);
+
 -- 幂等键唯一索引
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_actions_idempotent
   ON tool_actions(turn_id, provider_tool_call_id);
@@ -195,17 +367,66 @@ CREATE INDEX IF NOT EXISTS idx_revision_instructions_case ON revision_instructio
 
 export class SqliteRepository implements RepositoryPort {
   private db: Database.Database;
+  private databaseClosed = false;
+  private readonlySnapshotDirectory: string | null = null;
 
-  constructor(dbPath: string) {
-    this.db = new Database(dbPath);
+  constructor(
+    dbPath: string,
+    options: { readonly?: boolean } = {},
+  ) {
+    const readonly = options.readonly === true;
+    const openPath = dbPath;
+    if (readonly) {
+      const snapshotDirectory = mkdtempSync(
+        join(tmpdir(), READONLY_SNAPSHOT_PREFIX),
+      );
+      try {
+        chmodSync(snapshotDirectory, 0o700);
+        this.db = openStableReadonlySnapshot(dbPath, snapshotDirectory);
+        this.readonlySnapshotDirectory = snapshotDirectory;
+        return;
+      } catch (error) {
+        cleanupSnapshotDirectory(snapshotDirectory);
+        throw error;
+      }
+    }
+    this.db = new Database(openPath);
     // 启用 WAL 模式 + busy-timeout
-    this.db.pragma('journal_mode = WAL');
     this.db.pragma('busy_timeout = 5000');
+    this.db.pragma('journal_mode = WAL');
     this.db.exec(SCHEMA);
+    this.migrateIdentitySchema();
   }
 
   close(): void {
-    this.db.close();
+    if (!this.databaseClosed) {
+      let closeError: unknown;
+      for (let attempt = 1; attempt <= CLOSE_ATTEMPTS; attempt += 1) {
+        try {
+          this.db.close();
+          this.databaseClosed = true;
+          closeError = undefined;
+          break;
+        } catch (error) {
+          closeError = error;
+        }
+      }
+      if (!this.databaseClosed) throw closeError;
+    }
+    if (!this.readonlySnapshotDirectory) return;
+
+    const snapshotDirectory = this.readonlySnapshotDirectory;
+    let cleanupError: unknown;
+    for (let attempt = 1; attempt <= CLOSE_ATTEMPTS; attempt += 1) {
+      try {
+        cleanupSnapshotDirectory(snapshotDirectory);
+        this.readonlySnapshotDirectory = null;
+        return;
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    throw cleanupError;
   }
 
   // === 事务支持 ===
@@ -227,11 +448,38 @@ export class SqliteRepository implements RepositoryPort {
   }
 
   // === Cases ===
+  getDbInstanceId(): string {
+    const row = this.db.prepare(
+      'SELECT db_instance_id FROM database_metadata WHERE singleton = 1',
+    ).get() as { db_instance_id: string } | undefined;
+    if (!row) throw new Error('Database identity metadata is missing');
+    return row.db_instance_id;
+  }
+
   insertCase(record: Record<string, unknown>): void {
     this.db.prepare(`
-      INSERT INTO cases (case_id, title, status, current_stage, scenario_snapshot, input_payload, created_at, updated_at, completed_at)
-      VALUES (@case_id, @title, @status, @current_stage, @scenario_snapshot, @input_payload, @created_at, @updated_at, @completed_at)
-    `).run(record);
+      INSERT INTO cases (
+        case_id, title, status, current_stage, scenario_id,
+        scenario_snapshot, input_payload, scenario_snapshot_sha256,
+        input_payload_sha256, run_id, story_id, stage_key, chapter_id,
+        created_at, updated_at, completed_at
+      )
+      VALUES (
+        @case_id, @title, @status, @current_stage, @scenario_id,
+        @scenario_snapshot, @input_payload, @scenario_snapshot_sha256,
+        @input_payload_sha256, @run_id, @story_id, @stage_key, @chapter_id,
+        @created_at, @updated_at, @completed_at
+      )
+    `).run({
+      scenario_id: null,
+      scenario_snapshot_sha256: null,
+      input_payload_sha256: null,
+      run_id: null,
+      story_id: null,
+      stage_key: null,
+      chapter_id: null,
+      ...record,
+    });
   }
 
   updateCase(caseId: string, fields: Record<string, unknown>): void {
@@ -245,6 +493,245 @@ export class SqliteRepository implements RepositoryPort {
 
   getCasesByStatus(status: string): Record<string, unknown>[] {
     return this.db.prepare('SELECT * FROM cases WHERE status = ?').all(status) as Record<string, unknown>[];
+  }
+
+  acquireExecutionLease(caseId: string, lease: ExecutionLease): boolean {
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO execution_leases (
+        case_id, runner_token_sha256, runner_pid, runner_started_at, heartbeat_at
+      )
+      SELECT @case_id, @runner_token_sha256, @runner_pid, @runner_started_at, @heartbeat_at
+      WHERE EXISTS (
+        SELECT 1
+        FROM cases
+        WHERE case_id = @case_id AND status = 'created'
+      )
+    `).run({ case_id: caseId, ...lease });
+    return result.changes === 1;
+  }
+
+  getExecutionLease(caseId: string): ExecutionLease | null {
+    const lease = this.db.prepare(`
+      SELECT runner_token_sha256, runner_pid, runner_started_at, heartbeat_at
+      FROM execution_leases
+      WHERE case_id = ?
+    `).get(caseId) as ExecutionLease | undefined;
+    return lease ?? null;
+  }
+
+  validateExecutionLease(caseId: string, runnerTokenSha256: string): boolean {
+    const row = this.db.prepare(`
+      SELECT 1
+      FROM execution_leases
+      WHERE case_id = ? AND runner_token_sha256 = ?
+    `).get(caseId, runnerTokenSha256);
+    return row !== undefined;
+  }
+
+  claimExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+    claimedAt: string,
+  ): boolean {
+    const result = this.db.prepare(`
+      UPDATE execution_leases
+      SET runner_pid = @runner_pid,
+          runner_started_at = @claimed_at,
+          heartbeat_at = @claimed_at
+      WHERE case_id = @case_id
+        AND runner_token_sha256 = @runner_token_sha256
+        AND runner_pid = 0
+    `).run({
+      case_id: caseId,
+      runner_token_sha256: runnerTokenSha256,
+      runner_pid: runnerPid,
+      claimed_at: claimedAt,
+    });
+    return result.changes === 1;
+  }
+
+  releaseExecutionLeaseOwner(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+  ): boolean {
+    const result = this.db.prepare(`
+      UPDATE execution_leases
+      SET runner_pid = 0
+      WHERE case_id = ?
+        AND runner_token_sha256 = ?
+        AND runner_pid = ?
+    `).run(caseId, runnerTokenSha256, runnerPid);
+    return result.changes === 1;
+  }
+
+  transferExecutionLease(
+    caseId: string,
+    oldRunnerTokenSha256: string,
+    lease: ExecutionLease,
+  ): boolean {
+    const result = this.db.prepare(`
+      UPDATE execution_leases
+      SET runner_token_sha256 = @runner_token_sha256,
+          runner_pid = @runner_pid,
+          runner_started_at = @runner_started_at,
+          heartbeat_at = @heartbeat_at
+      WHERE case_id = @case_id
+        AND runner_token_sha256 = @old_runner_token_sha256
+    `).run({
+      case_id: caseId,
+      old_runner_token_sha256: oldRunnerTokenSha256,
+      ...lease,
+    });
+    return result.changes === 1;
+  }
+
+  heartbeatExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+    heartbeatAt: string,
+  ): boolean {
+    const result = this.db.prepare(`
+      UPDATE execution_leases
+      SET heartbeat_at = ?
+      WHERE case_id = ? AND runner_token_sha256 = ? AND runner_pid = ?
+    `).run(heartbeatAt, caseId, runnerTokenSha256, runnerPid);
+    return result.changes === 1;
+  }
+
+  abortCaseWithExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    stoppedAt: string,
+    abortableStatuses: readonly CaseStatus[],
+  ): ExecutionLeaseAbortResult {
+    const abort = this.db.transaction((): ExecutionLeaseAbortResult => {
+      const caseRow = this.db.prepare(
+        'SELECT status FROM cases WHERE case_id = ?',
+      ).get(caseId) as { status: CaseStatus } | undefined;
+      if (!caseRow) return { ok: false, reason: 'case_not_found' };
+
+      if (caseRow.status === 'stopped') {
+        const authorization = this.db.prepare(`
+          SELECT 1
+          FROM case_stop_authorizations
+          WHERE case_id = ? AND runner_token_sha256 = ?
+        `).get(caseId, runnerTokenSha256);
+        return authorization
+          ? { ok: true, status: 'stopped' }
+          : { ok: false, reason: 'invalid_token', status: caseRow.status };
+      }
+
+      if (caseRow.status === 'approved' || caseRow.status === 'failed') {
+        return { ok: false, reason: 'terminal_status', status: caseRow.status };
+      }
+      if (!abortableStatuses.includes(caseRow.status)) {
+        return { ok: false, reason: 'invalid_status', status: caseRow.status };
+      }
+
+      const lease = this.db.prepare(`
+        SELECT 1
+        FROM execution_leases
+        WHERE case_id = ? AND runner_token_sha256 = ?
+      `).get(caseId, runnerTokenSha256);
+      if (!lease) {
+        return { ok: false, reason: 'invalid_token', status: caseRow.status };
+      }
+
+      this.db.prepare(`
+        UPDATE cases
+        SET status = 'stopped', updated_at = ?, completed_at = ?
+        WHERE case_id = ?
+      `).run(stoppedAt, stoppedAt, caseId);
+      this.db.prepare(`
+        INSERT INTO case_stop_authorizations (case_id, runner_token_sha256)
+        VALUES (?, ?)
+        ON CONFLICT(case_id) DO UPDATE SET runner_token_sha256 = excluded.runner_token_sha256
+      `).run(caseId, runnerTokenSha256);
+      this.db.prepare('DELETE FROM execution_leases WHERE case_id = ?').run(caseId);
+      return { ok: true, status: 'stopped' };
+    });
+    return abort.immediate();
+  }
+
+  clearExecutionLease(caseId: string): void {
+    this.db.prepare('DELETE FROM execution_leases WHERE case_id = ?').run(caseId);
+  }
+
+  stopCaseWithoutExecutionLease(
+    caseId: string,
+    expectedStatus: CaseStatus,
+    stoppedAt: string,
+  ): boolean {
+    const stop = this.db.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE cases
+        SET status = 'stopped',
+            updated_at = @stopped_at,
+            completed_at = @stopped_at
+        WHERE case_id = @case_id
+          AND status = @expected_status
+          AND NOT EXISTS (
+            SELECT 1
+            FROM execution_leases
+            WHERE execution_leases.case_id = cases.case_id
+          )
+      `).run({
+        case_id: caseId,
+        expected_status: expectedStatus,
+        stopped_at: stoppedAt,
+      });
+      return result.changes === 1;
+    });
+    return stop.immediate();
+  }
+
+  compareAndSetCaseStatus(
+    caseId: string,
+    expectedStatus: CaseStatus,
+    fields: Record<string, unknown>,
+    options?: {
+      runnerTokenSha256?: string;
+      clearExecutionLease?: boolean;
+    },
+  ): boolean {
+    const compareAndSet = this.db.transaction(() => {
+      const sets = Object.keys(fields)
+        .map((key) => `${key} = @${key}`)
+        .join(', ');
+      const tokenCondition = options?.runnerTokenSha256 === undefined
+        ? `AND NOT EXISTS (
+            SELECT 1
+            FROM execution_leases
+            WHERE execution_leases.case_id = cases.case_id
+          )`
+        : `AND EXISTS (
+            SELECT 1
+            FROM execution_leases
+            WHERE execution_leases.case_id = cases.case_id
+              AND runner_token_sha256 = @runner_token_sha256
+          )`;
+      const result = this.db.prepare(`
+        UPDATE cases
+        SET ${sets}
+        WHERE case_id = @case_id
+          AND status = @expected_status
+          ${tokenCondition}
+      `).run({
+        ...fields,
+        case_id: caseId,
+        expected_status: expectedStatus,
+        runner_token_sha256: options?.runnerTokenSha256,
+      });
+      if (result.changes !== 1) return false;
+      if (options?.clearExecutionLease) {
+        this.clearExecutionLease(caseId);
+      }
+      return true;
+    });
+    return compareAndSet.immediate();
   }
 
   // === Turns ===
@@ -344,9 +831,17 @@ export class SqliteRepository implements RepositoryPort {
   // === Artifact Versions ===
   insertArtifactVersion(record: Record<string, unknown>): void {
     this.db.prepare(`
-      INSERT INTO artifact_versions (artifact_version_id, artifact_id, version, content, summary, source_message_id, source_turn_id, parent_version_id, diff, content_hash, status, approved_at, created_at)
-      VALUES (@artifact_version_id, @artifact_id, @version, @content, @summary, @source_message_id, @source_turn_id, @parent_version_id, @diff, @content_hash, @status, @approved_at, @created_at)
-    `).run(record);
+      INSERT INTO artifact_versions (
+        artifact_version_id, artifact_id, version, content, summary,
+        source_message_id, source_turn_id, parent_version_id, diff, content_hash,
+        template_bundle_sha256, status, approved_at, created_at
+      )
+      VALUES (
+        @artifact_version_id, @artifact_id, @version, @content, @summary,
+        @source_message_id, @source_turn_id, @parent_version_id, @diff, @content_hash,
+        @template_bundle_sha256, @status, @approved_at, @created_at
+      )
+    `).run({ template_bundle_sha256: null, ...record });
   }
 
   updateArtifactVersion(versionId: string, fields: Record<string, unknown>): void {
@@ -447,9 +942,15 @@ export class SqliteRepository implements RepositoryPort {
   // === Delivery Gate Results ===
   insertDeliveryGateResult(record: Record<string, unknown>): void {
     this.db.prepare(`
-      INSERT INTO delivery_gate_results (gate_result_id, case_id, artifact_version_id, status, checks, blocking_issue_ids, created_at)
-      VALUES (@gate_result_id, @case_id, @artifact_version_id, @status, @checks, @blocking_issue_ids, @created_at)
-    `).run(record);
+      INSERT INTO delivery_gate_results (
+        gate_result_id, case_id, artifact_version_id, template_bundle_sha256,
+        status, checks, blocking_issue_ids, created_at
+      )
+      VALUES (
+        @gate_result_id, @case_id, @artifact_version_id, @template_bundle_sha256,
+        @status, @checks, @blocking_issue_ids, @created_at
+      )
+    `).run({ template_bundle_sha256: null, ...record });
   }
 
   getDeliveryGateResults(caseId: string): Record<string, unknown>[] {
@@ -499,5 +1000,31 @@ export class SqliteRepository implements RepositoryPort {
 
   getControlEventsByCase(caseId: string): Record<string, unknown>[] {
     return this.db.prepare('SELECT * FROM control_events WHERE case_id = ? ORDER BY created_at').all(caseId) as Record<string, unknown>[];
+  }
+
+  private migrateIdentitySchema(): void {
+    const addColumn = (table: string, column: string, declaration: string): void => {
+      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!columns.some((candidate) => candidate.name === column)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
+      }
+    };
+
+    const migrate = this.db.transaction(() => {
+      addColumn('cases', 'scenario_id', 'TEXT');
+      addColumn('cases', 'scenario_snapshot_sha256', 'TEXT');
+      addColumn('cases', 'input_payload_sha256', 'TEXT');
+      addColumn('cases', 'run_id', 'TEXT');
+      addColumn('cases', 'story_id', 'TEXT');
+      addColumn('cases', 'stage_key', 'TEXT');
+      addColumn('cases', 'chapter_id', 'TEXT');
+      addColumn('artifact_versions', 'template_bundle_sha256', 'TEXT');
+      addColumn('delivery_gate_results', 'template_bundle_sha256', 'TEXT');
+      this.db.prepare(`
+        INSERT OR IGNORE INTO database_metadata (singleton, db_instance_id)
+        VALUES (1, ?)
+      `).run(randomUUID());
+    });
+    migrate();
   }
 }

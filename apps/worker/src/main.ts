@@ -16,6 +16,7 @@ import {
   UuidGenerator,
   FileConfigLoader,
   ScriptArtifactValidator,
+  computeScenarioBundleSha256,
   resolveSingleDbPath,
   defaultDbEnv,
 } from '@forge-ai/adapters';
@@ -166,6 +167,10 @@ const consoleLogger: Logger = {
 async function main() {
   // 读取环境变量
   const piMode = process.env.PI_MODE ?? 'fake';
+  const runnerToken = process.env.FORGE_RUNNER_TOKEN;
+  if (!runnerToken) {
+    throw new Error('FORGE_RUNNER_TOKEN is required');
+  }
   // 两库模型：DB_PATH 显式覆盖优先级最高；否则按 FORGE_ENV 选 production(默认)/test 库。
   // 与 CLI/web 共用 resolveSingleDbPath/defaultDbEnv（计划第 2 节：配置共享）。
   const dbEnv = defaultDbEnv();
@@ -189,6 +194,10 @@ async function main() {
 
   // 加载场景配置
   const scenarioConfig = configLoader.loadScenario(resolve(scenarioPath));
+  const templateBundleSha256 = computeScenarioBundleSha256(
+    resolve(scenarioPath),
+    scenarioConfig,
+  );
   console.log(`  场景: ${scenarioConfig.scenario.name} (v${scenarioConfig.scenario.version})`);
 
   // 选择 Pi adapter
@@ -235,6 +244,7 @@ async function main() {
     toolDefinitions: TOOL_DEFINITIONS,
     logger: consoleLogger,
     artifactValidator: new ScriptArtifactValidator(dirname(resolve(scenarioPath))),
+    templateBundleSha256,
     maxTurns: parseInt(process.env.MAX_TURNS ?? '20', 10),
   });
 
@@ -246,7 +256,10 @@ async function main() {
     console.log(`\n[恢复] 发现 ${casesNeedingRecovery.length} 个需要恢复的 Case`);
     const caseId = casesNeedingRecovery[0];
     console.log(`\n[Case] 续跑: ${caseId}`);
-    const result = await runner.runCase(caseId);
+    const result = await runner.runCase(caseId, {
+      runnerToken,
+      runnerPid: process.pid,
+    });
     console.log(`\n[最终] Case ${result.case_id} 状态: ${result.status}`);
   } else {
     // 创建新 Case
@@ -257,7 +270,10 @@ async function main() {
     });
     console.log(`\n[Case] 创建: ${caseId}`);
 
-    const result = await runner.runCase(caseId);
+    const result = await runner.runCase(caseId, {
+      runnerToken,
+      runnerPid: process.pid,
+    });
     console.log(`\n[最终] Case ${result.case_id} 状态: ${result.status}`);
   }
 
@@ -266,6 +282,17 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('[Fatal]', err);
+  if (
+    err instanceof Error
+    && err.message === 'Execution lease owner claim failed'
+  ) {
+    console.error(
+      "[Fatal] Execution lease owner claim failed. "
+      + "Run 'forge case transfer-lease <id> "
+      + "--old-runner-token <uuid> --new-runner-token <uuid>' before retrying.",
+    );
+  } else {
+    console.error('[Fatal]', err);
+  }
   process.exit(1);
 });

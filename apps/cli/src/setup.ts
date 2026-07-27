@@ -5,7 +5,15 @@ import { config } from 'dotenv';
 import { resolve, dirname } from 'node:path';
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { getPackageRoot, resolveFromRoot, resolveDbPaths, resolveSingleDbPath, defaultDbEnv, type DbEnv } from '@forge-ai/adapters';
-import { SqliteRepository, FakePiAdapter, RealPiAdapter, SystemClock, UuidGenerator, FileConfigLoader } from '@forge-ai/adapters';
+import {
+  SqliteRepository,
+  FakePiAdapter,
+  RealPiAdapter,
+  SystemClock,
+  UuidGenerator,
+  FileConfigLoader,
+  computeScenarioBundleSha256,
+} from '@forge-ai/adapters';
 import type { FakePiScript } from '@forge-ai/adapters';
 import type { PiPort, PiToolDefinition, ScenarioConfig } from '@forge-ai/contracts';
 import type { Logger } from '@forge-ai/application';
@@ -174,6 +182,13 @@ export function resolveScenarioPath(templateOption: string): string {
   return resolveFromRoot('scenarios', templateOption, 'scenario.yaml');
 }
 
+export function resolveScenarioBundleSha256(
+  scenarioPath: string,
+  scenarioConfig: ScenarioConfig,
+): string {
+  return computeScenarioBundleSha256(scenarioPath, scenarioConfig);
+}
+
 /**
  * 创建 Pi adapter（fake / real）
  */
@@ -214,6 +229,14 @@ export function initInfra(dbPath: string) {
   return { repo, clock, idGen, configLoader };
 }
 
+function initReadInfra(dbPath: string) {
+  const repo = new SqliteRepository(dbPath, { readonly: true });
+  const clock = new SystemClock();
+  const idGen = new UuidGenerator();
+  const configLoader = new FileConfigLoader();
+  return { repo, clock, idGen, configLoader };
+}
+
 /**
  * 在多个库中查找包含指定 case 的库（读操作 --env all 聚合搜索用）。
  * 跳过不存在的库文件（不创建空库）。返回首个命中的 infra + dbPath，未命中返回 null。
@@ -225,7 +248,7 @@ export function findCaseInfra(
 ): { dbPath: string; repo: SqliteRepository; clock: SystemClock; idGen: UuidGenerator; configLoader: FileConfigLoader } | null {
   for (const dbPath of dbPaths) {
     if (!existsSync(dbPath)) continue;
-    const infra = initInfra(dbPath);
+    const infra = initReadInfra(dbPath);
     if (infra.repo.getCase(caseId)) {
       return { dbPath, ...infra };
     }

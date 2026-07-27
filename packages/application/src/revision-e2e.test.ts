@@ -10,9 +10,10 @@
  *    active revision count=0、delivery gate pass、Case approved。
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resolve, dirname } from 'node:path';
 import { mkdirSync, rmSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import {
   SqliteRepository,
   FakePiAdapter,
@@ -21,7 +22,11 @@ import {
   FileConfigLoader,
 } from '@forge-ai/adapters';
 import { CaseRunner, type Logger } from '@forge-ai/application';
-import type { PiToolDefinition, ScenarioConfig } from '@forge-ai/contracts';
+import type {
+  PiToolDefinition,
+  PiTurnResult,
+  ScenarioConfig,
+} from '@forge-ai/contracts';
 
 const SCENARIO_PATH = resolve('./scenarios/songwriting/scenario.yaml');
 const TEST_DB_PATH = resolve('./data/test-revision-e2e.db');
@@ -115,7 +120,33 @@ const silentLogger: Logger = {
   warn: () => {},
 };
 
-function makeRunner(repo: SqliteRepository, pi: FakePiAdapter, scenarioConfig: ScenarioConfig, maxTurns = 20): CaseRunner {
+class BlockingFakePiAdapter extends FakePiAdapter {
+  private releaseTurn!: () => void;
+  private markEntered!: () => void;
+  readonly enteredTurn = new Promise<void>((resolve) => {
+    this.markEntered = resolve;
+  });
+
+  release(): void {
+    this.releaseTurn();
+  }
+
+  override async executeTurn(): Promise<PiTurnResult> {
+    this.markEntered();
+    await new Promise<void>((resolve) => {
+      this.releaseTurn = resolve;
+    });
+    return { content: 'paused', tool_calls: [], finish_reason: 'stop' };
+  }
+}
+
+function makeRunner(
+  repo: SqliteRepository,
+  pi: FakePiAdapter,
+  scenarioConfig: ScenarioConfig,
+  maxTurns = 20,
+  logger: Logger = silentLogger,
+): CaseRunner {
   return new CaseRunner({
     repo,
     clock: new SystemClock(),
@@ -125,7 +156,7 @@ function makeRunner(repo: SqliteRepository, pi: FakePiAdapter, scenarioConfig: S
     scenarioPath: SCENARIO_PATH,
     configLoader: new FileConfigLoader(),
     toolDefinitions: TOOL_DEFINITIONS,
-    logger: silentLogger,
+    logger,
     maxTurns,
   });
 }
@@ -144,6 +175,108 @@ describe('7.4 非终态无工具调用（5.4）', () => {
   });
   afterEach(() => repo.close());
 
+  it('requires a runner token even for a fresh CaseRunner run', async () => {
+    const runner = makeRunner(repo, new FakePiAdapter(), scenarioConfig, 0);
+    const caseId = runner.createCase({
+      title: 'required runner token',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+
+    // @ts-expect-error verifies the runtime guard for JavaScript callers
+    await expect(runner.runCase(caseId, { maxTurns: 0 }))
+      .rejects.toThrow('Runner token is required');
+    expect(repo.getExecutionLease(caseId)).toBeNull();
+    expect(repo.getCase(caseId)?.status).toBe('created');
+  });
+
+  it('claims one owner, heartbeats while executing, rejects a second owner, and releases on return', async () => {
+    const pi = new BlockingFakePiAdapter();
+    const firstRunner = makeRunner(repo, pi, scenarioConfig, 1);
+    const secondRunner = makeRunner(repo, new FakePiAdapter(), scenarioConfig, 0);
+    const caseId = firstRunner.createCase({
+      title: 'exclusive owner claim',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+    const token = 'shared-runner-token';
+
+    const firstRun = firstRunner.runCase(caseId, {
+      maxTurns: 1,
+      runnerToken: token,
+      runnerPid: 101,
+    });
+    await pi.enteredTurn;
+    const firstHeartbeat = repo.getExecutionLease(caseId)?.heartbeat_at;
+    expect(repo.getExecutionLease(caseId)?.runner_pid).toBe(101);
+
+    await expect(secondRunner.runCase(caseId, {
+      maxTurns: 0,
+      runnerToken: token,
+      runnerPid: 202,
+    })).rejects.toThrow('Execution lease owner claim failed');
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    expect(repo.getExecutionLease(caseId)?.heartbeat_at).not.toBe(firstHeartbeat);
+
+    pi.release();
+    await firstRun;
+    expect(repo.getExecutionLease(caseId)).toMatchObject({ runner_pid: 0 });
+  });
+
+  it('clears its heartbeat timer and releases its owner after a controlled run error', async () => {
+    const throwingLogger: Logger = {
+      info: () => {
+        throw new Error('controlled runner failure');
+      },
+      error: () => {},
+      warn: () => {},
+    };
+    const runner = makeRunner(
+      repo,
+      new FakePiAdapter(),
+      scenarioConfig,
+      1,
+      throwingLogger,
+    );
+    const caseId = runner.createCase({
+      title: 'controlled failure owner release',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+    const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval');
+
+    await expect(runner.runCase(caseId, {
+      maxTurns: 1,
+      runnerToken: 'controlled-failure-token',
+      runnerPid: 303,
+    })).rejects.toThrow('controlled runner failure');
+
+    expect(clearIntervalSpy).toHaveBeenCalled();
+    expect(repo.getExecutionLease(caseId)).toMatchObject({ runner_pid: 0 });
+    clearIntervalSpy.mockRestore();
+  });
+
+  it('releases a claimed owner when human resume rejects the current state', async () => {
+    const runner = makeRunner(repo, new FakePiAdapter(), scenarioConfig, 0);
+    const caseId = runner.createCase({
+      title: 'invalid resume state',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+    const token = 'invalid-resume-token';
+    repo.acquireExecutionLease(caseId, {
+      runner_token_sha256: createHash('sha256').update(token).digest('hex'),
+      runner_pid: 0,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+    repo.updateCase(caseId, { status: 'running' });
+
+    await expect(runner.resumeCaseWithHumanInput(
+      caseId,
+      'continue',
+      { runnerToken: token, runnerPid: 404 },
+    )).rejects.toThrow();
+    expect(repo.getExecutionLease(caseId)).toMatchObject({ runner_pid: 0 });
+  });
+
   it('连续 2 次无工具调用 -> Case 转 failed + agent_no_action_in_nonterminal_state 事件', async () => {
     const fakePi = new FakePiAdapter();
     fakePi.registerScript('songwriting', {
@@ -159,7 +292,10 @@ describe('7.4 非终态无工具调用（5.4）', () => {
       inputPayload: { reference_lyrics: '参考', fixed_phrase: '金句' },
     });
 
-    const result = await runner.runCase(caseId, { maxTurns: 5 });
+    const result = await runner.runCase(caseId, {
+      maxTurns: 5,
+      runnerToken: 'no-action-test-token',
+    });
 
     expect(result.status).toBe('failed');
     const events = repo.getControlEventsByCase(caseId);
@@ -187,11 +323,83 @@ describe('7.4 非终态无工具调用（5.4）', () => {
       title: '纠错测试',
       inputPayload: { reference_lyrics: '参考', fixed_phrase: '金句' },
     });
-    const result = await runner.runCase(caseId, { maxTurns: 2 });
+    const runnerToken = 'revision-e2e-runner-token';
+    expect(repo.getCase(caseId)?.status).toBe('created');
+    const result = await runner.runCase(caseId, {
+      maxTurns: 2,
+      runnerToken,
+      runnerPid: 101,
+    });
 
     // 第一次无动作被纠错而非失败；路由后进入 waiting_review
     expect(result.status).not.toBe('failed');
     expect(repo.getControlEventsByCase(caseId).some((e) => e.event_type === 'agent_no_action_in_nonterminal_state')).toBe(false);
+    expect(repo.validateExecutionLease(
+      caseId,
+      createHash('sha256').update(runnerToken).digest('hex'),
+    )).toBe(true);
+  });
+
+  it('carries the runner token through a human-input resume transition', async () => {
+    const runner = makeRunner(repo, new FakePiAdapter(), scenarioConfig, 0);
+    const caseId = runner.createCase({
+      title: 'resume lease test',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+    repo.updateCase(caseId, { status: 'created' });
+    const runnerToken = 'resume-runner-token';
+    repo.acquireExecutionLease(caseId, {
+      runner_token_sha256: createHash('sha256').update(runnerToken).digest('hex'),
+      runner_pid: 0,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+    repo.updateCase(caseId, { status: 'waiting_human' });
+
+    const result = await runner.resumeCaseWithHumanInput(
+      caseId,
+      'continue',
+      { runnerToken, runnerPid: 202 },
+    );
+
+    expect(result.status).toBe('running');
+  });
+
+  it('accepts only the new runner token after a CaseRunner lease transfer', async () => {
+    const runner = makeRunner(repo, new FakePiAdapter(), scenarioConfig, 0);
+    const caseId = runner.createCase({
+      title: 'runner transfer test',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+    await runner.runCase(caseId, {
+      maxTurns: 0,
+      runnerToken: 'old-runner-token',
+      runnerPid: 101,
+    });
+    expect(repo.transferExecutionLease(
+      caseId,
+      createHash('sha256').update('old-runner-token').digest('hex'),
+      {
+        runner_token_sha256: createHash('sha256')
+          .update('new-runner-token')
+          .digest('hex'),
+        runner_pid: 0,
+        runner_started_at: '2026-07-27T00:00:02.000Z',
+        heartbeat_at: '2026-07-27T00:00:02.000Z',
+      },
+    )).toBe(true);
+
+    // @ts-expect-error verifies the runtime guard for JavaScript callers
+    await expect(runner.runCase(caseId, { maxTurns: 0 }))
+      .rejects.toThrow('Runner token is required');
+    await expect(runner.runCase(caseId, {
+      maxTurns: 0,
+      runnerToken: 'old-runner-token',
+    })).rejects.toThrow('Execution lease owner claim failed');
+    await expect(runner.runCase(caseId, {
+      maxTurns: 0,
+      runnerToken: 'new-runner-token',
+    })).resolves.toMatchObject({ status: 'running' });
   });
 });
 
@@ -227,7 +435,7 @@ describe('7.5 同 Case 恢复（5.5：程序化恢复决策）', () => {
     // 直接构造 Case 状态：repairing + v2 under_review + ri1 submitted + issueA claimed_fixed
     const caseId = 'case_resume_1';
     repo.insertCase({
-      case_id: caseId, title: '恢复测试', status: 'repairing', current_stage: 'repairing',
+      case_id: caseId, title: '恢复测试', status: 'created', current_stage: 'repairing',
       scenario_snapshot: JSON.stringify(scenarioConfig), input_payload: JSON.stringify({ reference_lyrics: 'r', fixed_phrase: 'f' }),
       created_at: clock.now(), updated_at: clock.now(), completed_at: null,
     });
@@ -265,7 +473,19 @@ describe('7.5 同 Case 恢复（5.5：程序化恢复决策）', () => {
       retry_of_turn_id: null, provider_error: null,
     });
 
-    const result = await runner.runCase(caseId, { maxTurns: 6 });
+    repo.acquireExecutionLease(caseId, {
+      runner_token_sha256: createHash('sha256')
+        .update('recovery-test-token')
+        .digest('hex'),
+      runner_pid: 0,
+      runner_started_at: clock.now(),
+      heartbeat_at: clock.now(),
+    });
+    repo.updateCase(caseId, { status: 'repairing' });
+    const result = await runner.runCase(caseId, {
+      maxTurns: 6,
+      runnerToken: 'recovery-test-token',
+    });
 
     // 不创建新 Case
     expect(repo.getCase(caseId)).not.toBeNull();
@@ -395,7 +615,10 @@ describe('7.7 真实形态回归（v1 -> repair -> v2 -> repair -> v3 -> approve
       title: '两轮返修回归',
       inputPayload: { reference_lyrics: '参考', fixed_phrase: '你是我的山歌' },
     });
-    const result = await runner.runCase(caseId, { maxTurns: 15 });
+    const result = await runner.runCase(caseId, {
+      maxTurns: 15,
+      runnerToken: 'full-regression-test-token',
+    });
 
     // Case = approved
     expect(result.status).toBe('approved');
@@ -420,4 +643,3 @@ describe('7.7 真实形态回归（v1 -> repair -> v2 -> repair -> v3 -> approve
     expect(result.gate?.checks.every((c) => c.passed)).toBe(true);
   });
 });
-

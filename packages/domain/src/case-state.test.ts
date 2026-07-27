@@ -23,6 +23,14 @@ describe('Case 状态机', () => {
     expect(canTransitionCase('running', 'waiting_human')).toBe(true);
   });
 
+  it('waiting_review → waiting_human 合法', () => {
+    expect(canTransitionCase('waiting_review', 'waiting_human')).toBe(true);
+  });
+
+  it('repairing → waiting_human 合法', () => {
+    expect(canTransitionCase('repairing', 'waiting_human')).toBe(true);
+  });
+
   it('running → approved 合法', () => {
     expect(canTransitionCase('running', 'approved')).toBe(true);
   });

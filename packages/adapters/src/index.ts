@@ -8,3 +8,5 @@ export * from './fake-pi.js';
 export * from './pi-adapter.js';
 export * from './base-adapters.js';
 export * from './paths.js';
+export * from './script-artifact-validator.js';
+export * from './scenario-bundle-identity.js';

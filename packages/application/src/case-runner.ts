@@ -4,7 +4,9 @@
  * 铁律 1：不硬编码业务角色名，所有角色来自配置。
  */
 
+import { createHash } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
+import { CASE_IDENTITY_PROTOCOL_VERSION } from '@forge-ai/contracts';
 import type {
   RepositoryPort,
   ClockPort,
@@ -21,6 +23,11 @@ import type {
   ResultGate,
   ResultGateCheck,
   GateCheckResult,
+  ArtifactValidatorPort,
+  CaseRunBinding,
+  ResultCaseIdentity,
+  ResultExecutionIdentity,
+  ResultLegacyCaseEvidence,
 } from '@forge-ai/contracts';
 import { CaseService } from './case-service.js';
 import { TurnExecutor } from './turn-executor.js';
@@ -55,7 +62,36 @@ export interface CaseRunnerOptions {
   configLoader: ConfigLoaderPort;
   toolDefinitions: PiToolDefinition[];
   logger: Logger;
+  artifactValidator?: ArtifactValidatorPort;
+  templateBundleSha256?: string | null;
   maxTurns?: number; // 默认 20
+}
+
+export interface RunCaseOptions {
+  maxTurns?: number;
+  runnerToken: string;
+  runnerPid?: number;
+}
+
+export interface ResumeCaseOptions {
+  runnerToken: string;
+  runnerPid?: number;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
 }
 
 export class CaseRunner {
@@ -71,6 +107,7 @@ export class CaseRunner {
   private configLoader: ConfigLoaderPort;
   private toolDefinitions: PiToolDefinition[];
   private logger: Logger;
+  private templateBundleSha256: string | null;
   private maxTurns: number;
 
   constructor(opts: CaseRunnerOptions) {
@@ -83,10 +120,17 @@ export class CaseRunner {
     this.configLoader = opts.configLoader;
     this.toolDefinitions = opts.toolDefinitions;
     this.logger = opts.logger;
+    this.templateBundleSha256 = opts.templateBundleSha256 ?? null;
     this.maxTurns = opts.maxTurns ?? 20;
 
     this.caseService = new CaseService(opts.repo, opts.clock, opts.idGen);
-    this.turnExecutor = new TurnExecutor(opts.repo, opts.clock, opts.idGen, opts.pi);
+    this.turnExecutor = new TurnExecutor(
+      opts.repo,
+      opts.clock,
+      opts.idGen,
+      opts.pi,
+      opts.artifactValidator,
+    );
     this.recoveryService = new RecoveryService(opts.repo, opts.clock);
 
     // 注册上下文解析器（闭包捕获 repo，FakePi 用于动态替换脚本占位符）
@@ -108,23 +152,28 @@ export class CaseRunner {
   /**
    * 创建 Case（委托 CaseService）
    */
-  createCase(input: { title: string; inputPayload: Record<string, unknown> }): string {
+  createCase(input: {
+    title: string;
+    inputPayload: Record<string, unknown>;
+    runBinding?: CaseRunBinding;
+  }): string {
     const caseId = this.caseService.createCase({
       title: input.title,
       scenarioConfig: this.scenarioConfig,
       inputPayload: input.inputPayload,
+      runBinding: input.runBinding,
     });
-    this.caseService.startCase(caseId);
     return caseId;
   }
 
   /**
    * 运行 Case（含崩溃恢复 + 并发守卫 + Turn 循环）
    */
-  async runCase(caseId: string, opts?: { maxTurns?: number }): Promise<ResultJson> {
-    const maxTurns = opts?.maxTurns ?? this.maxTurns;
-
-    // 1. 终态 case → 幂等返回（不报错）
+  async runCase(caseId: string, opts: RunCaseOptions): Promise<ResultJson> {
+    if (!opts?.runnerToken) {
+      throw new Error('Runner token is required');
+    }
+    const runnerPid = opts.runnerPid ?? process.pid;
     const caseRecord = this.repo.getCase(caseId);
     if (!caseRecord) {
       throw new Error(`Case not found: ${caseId}`);
@@ -132,6 +181,65 @@ export class CaseRunner {
     const status = caseRecord.status as string;
     if (status === 'approved' || status === 'failed' || status === 'stopped') {
       return this.buildResultJson(caseId);
+    }
+
+    const lease = this.repo.getExecutionLease(caseId);
+    if (status === 'created' && !lease) {
+      if (!this.caseService.acquireExecutionLease(
+        caseId,
+        opts.runnerToken,
+        runnerPid,
+      )) {
+        throw new Error('Execution lease acquisition failed');
+      }
+    } else if (
+      !lease
+      || !this.caseService.claimExecutionLease(
+        caseId,
+        opts.runnerToken,
+        runnerPid,
+      )
+    ) {
+      throw new Error('Execution lease owner claim failed');
+    }
+
+    return this.executeWithLeaseOwner(
+      caseId,
+      opts.runnerToken,
+      runnerPid,
+      () => this.runCaseWithOwnedLease(caseId, opts),
+    );
+  }
+
+  private async runCaseWithOwnedLease(
+    caseId: string,
+    opts: RunCaseOptions,
+  ): Promise<ResultJson> {
+    const maxTurns = opts.maxTurns ?? this.maxTurns;
+    const runnerToken = opts.runnerToken;
+
+    // 1. 终态 case → 幂等返回（不报错）
+    const caseRecord = this.repo.getCase(caseId);
+    if (!caseRecord) {
+      throw new Error(`Case not found: ${caseId}`);
+    }
+    let status = caseRecord.status as string;
+    if (status === 'approved' || status === 'failed' || status === 'stopped') {
+      return this.buildResultJson(caseId);
+    }
+
+    const lease = this.repo.getExecutionLease(caseId);
+    if (
+      !lease
+      || lease.runner_pid !== (opts.runnerPid ?? process.pid)
+      || !this.caseService.validateExecutionLease(caseId, runnerToken)
+    ) {
+      throw new Error('Execution lease authorization failed');
+    }
+
+    if (status === 'created') {
+      this.caseService.startCase(caseId, runnerToken);
+      status = 'running';
     }
 
     // 2. waiting_human → 返回 JSON + action_required hint
@@ -145,7 +253,12 @@ export class CaseRunner {
     this.assertNoConcurrentCase(caseId);
 
     // 4. RecoveryService.recoverCase（只恢复传入 caseId）
-    const recoveryResult = this.recoveryService.recoverCase(caseId);
+    const recoveryResult = this.recoveryService.recoverCase(
+      caseId,
+      runnerToken === undefined
+        ? undefined
+        : createHash('sha256').update(runnerToken).digest('hex'),
+    );
     this.logger.info(`[Recovery] ${caseId}: ${recoveryResult.detail}`);
 
     // 4.5 一致性修复扩展到恢复路径：清理"关联 Issue 已全 verified 但仍 submitted"
@@ -208,7 +321,7 @@ export class CaseRunner {
     }
 
     // 7. runTurnLoop
-    await this.runTurnLoop(caseId, agentKey, message, maxTurns);
+    await this.runTurnLoop(caseId, agentKey, message, maxTurns, runnerToken);
 
     // 8. 返回 buildResultJson
     return this.buildResultJson(caseId);
@@ -217,12 +330,44 @@ export class CaseRunner {
   /**
    * 人工输入后续跑
    */
-  async resumeCaseWithHumanInput(caseId: string, answer: string): Promise<ResultJson> {
+  async resumeCaseWithHumanInput(
+    caseId: string,
+    answer: string,
+    opts: ResumeCaseOptions,
+  ): Promise<ResultJson> {
+    if (!opts?.runnerToken) {
+      throw new Error('Runner token is required');
+    }
+    const runnerPid = opts.runnerPid ?? process.pid;
+    if (!this.caseService.claimExecutionLease(
+      caseId,
+      opts.runnerToken,
+      runnerPid,
+    )) {
+      throw new Error('Execution lease owner claim failed');
+    }
+    return this.executeWithLeaseOwner(
+      caseId,
+      opts.runnerToken,
+      runnerPid,
+      () => this.resumeCaseWithHumanInputOwned(caseId, answer, opts),
+    );
+  }
+
+  private async resumeCaseWithHumanInputOwned(
+    caseId: string,
+    answer: string,
+    opts: ResumeCaseOptions,
+  ): Promise<ResultJson> {
     // 并发守卫
     this.assertNoConcurrentCase(caseId);
 
     // 1. transitionCase(waiting_human → running)
-    this.caseService.transitionCaseStatus(caseId, 'running');
+    this.caseService.transitionCaseStatus(
+      caseId,
+      'running',
+      opts.runnerToken,
+    );
 
     // 2. 找最后 Turn 的 tool_actions 中 request_human_input 的 agent
     const lastTurn = this.repo.getLastCompletedTurn(caseId);
@@ -252,16 +397,55 @@ export class CaseRunner {
     const message = `用户对你提出的问题'${question}'的回答：\n${answer}`;
 
     // 5. runTurnLoop（不 recover）
-    await this.runTurnLoop(caseId, targetAgent, message, this.maxTurns);
+    await this.runTurnLoop(
+      caseId,
+      targetAgent,
+      message,
+      this.maxTurns,
+      opts.runnerToken,
+    );
 
     // 6. 返回 buildResultJson
     return this.buildResultJson(caseId);
   }
 
+  private async executeWithLeaseOwner(
+    caseId: string,
+    runnerToken: string,
+    runnerPid: number,
+    execute: () => Promise<ResultJson>,
+  ): Promise<ResultJson> {
+    const heartbeat = setInterval(() => {
+      this.caseService.heartbeatExecutionLease(
+        caseId,
+        runnerToken,
+        runnerPid,
+      );
+    }, 1_000);
+    heartbeat.unref?.();
+
+    try {
+      return await execute();
+    } finally {
+      clearInterval(heartbeat);
+      this.caseService.releaseExecutionLeaseOwner(
+        caseId,
+        runnerToken,
+        runnerPid,
+      );
+    }
+  }
+
   /**
    * Turn 循环（核心路由逻辑，从 main.ts 原样搬迁）
    */
-  private async runTurnLoop(caseId: string, agentKey: string, message: string, maxTurns: number): Promise<void> {
+  private async runTurnLoop(
+    caseId: string,
+    agentKey: string,
+    message: string,
+    maxTurns: number,
+    runnerToken?: string,
+  ): Promise<void> {
     let currentAgentKey = agentKey;
     let currentMessage = message;
     let consecutiveErrors = 0;
@@ -357,6 +541,7 @@ export class CaseRunner {
         systemPrompt,
         userMessage: currentMessage,
         tools: agentTools,
+        templateBundleSha256: this.templateBundleSha256,
       });
 
       if (result.status === 'failed') {
@@ -364,7 +549,7 @@ export class CaseRunner {
         this.logger.info(`  [失败] ${result.error}`);
         if (consecutiveErrors >= maxConsecutiveErrors) {
           this.logger.error(`\n[停止] 连续 ${maxConsecutiveErrors} 次异常，停下汇报`);
-          this.caseService.transitionCaseStatus(caseId, 'failed');
+          this.caseService.transitionCaseStatus(caseId, 'failed', runnerToken);
           break;
         }
         continue;
@@ -388,11 +573,11 @@ export class CaseRunner {
 
             // 更新 Case 状态
             if (args.scope?.issue_ids?.length > 0) {
-              this.caseService.transitionCaseStatus(caseId, 'repairing');
+              this.caseService.transitionCaseStatus(caseId, 'repairing', runnerToken);
             } else {
               const cr = this.repo.getCase(caseId);
               if (cr && cr.status === 'running') {
-                this.caseService.transitionCaseStatus(caseId, 'waiting_review');
+                this.caseService.transitionCaseStatus(caseId, 'waiting_review', runnerToken);
               }
             }
             break;
@@ -402,13 +587,13 @@ export class CaseRunner {
         if (action.tool_name === 'approve_delivery' && action.result) {
           const deliveryOutput = JSON.parse(action.result as string);
           if (deliveryOutput.gate_passed) {
-            this.caseService.transitionCaseStatus(caseId, 'approved');
+            this.caseService.transitionCaseStatus(caseId, 'approved', runnerToken);
             this.repo.closeSessionsByCase(caseId);
             this.logger.info(`\n[交付] 门禁通过，Case 已交付！`);
           } else if (deliveryOutput.error_code === 'INTERNAL_STATE_INCONSISTENT') {
             // 5.6：一致性修复后仍无法通过门禁，且无法确定性路由 -> 内部错误，转 failed
             this.logger.error(`\n[门禁] 内部状态不一致，Case 转 failed: ${deliveryOutput.error}`);
-            this.caseService.transitionCaseStatus(caseId, 'failed');
+            this.caseService.transitionCaseStatus(caseId, 'failed', runnerToken);
             routed = true;
           } else if (deliveryOutput.route_to) {
             // 5.6：按指令状态确定性路由（submitted -> 审核 Agent；issued/in_progress -> 返修 Agent）
@@ -435,7 +620,7 @@ export class CaseRunner {
             routed = true;
             const cr = this.repo.getCase(caseId);
             if (cr && (cr.status === 'repairing' || cr.status === 'waiting_review')) {
-              this.caseService.transitionCaseStatus(caseId, 'running');
+              this.caseService.transitionCaseStatus(caseId, 'running', runnerToken);
             }
           } else {
             // 审核不通过，回到总控
@@ -457,7 +642,7 @@ export class CaseRunner {
             routed = true;
             const cr = this.repo.getCase(caseId);
             if (cr && cr.status === 'waiting_review') {
-              this.caseService.transitionCaseStatus(caseId, 'running');
+              this.caseService.transitionCaseStatus(caseId, 'running', runnerToken);
             }
           }
         }
@@ -489,7 +674,7 @@ export class CaseRunner {
                   // 返修版发布：repairing -> waiting_review（否则 case 卡在 repairing，
                   // 后续 reviewer 再判 repair、supervisor 再发返修会触发 repairing->repairing 非法转换）
                   if (cr && (cr.status === 'running' || cr.status === 'repairing')) {
-                    this.caseService.transitionCaseStatus(caseId, 'waiting_review');
+                    this.caseService.transitionCaseStatus(caseId, 'waiting_review', runnerToken);
                   }
                 }
               }
@@ -498,7 +683,7 @@ export class CaseRunner {
         }
 
         if (action.tool_name === 'request_human_input') {
-          this.caseService.transitionCaseStatus(caseId, 'waiting_human');
+          this.caseService.transitionCaseStatus(caseId, 'waiting_human', runnerToken);
           this.logger.info(`  [人工] Case 进入 waiting_human 状态`);
         }
       }
@@ -515,7 +700,7 @@ export class CaseRunner {
           if (consecutiveNoAction >= 2) {
             // 连续第二次仍无动作：转 failed，记录原因
             this.logger.error(`\n[停止] 非终态 Case(${cr?.status}) 连续 ${consecutiveNoAction} 次无工具调用，转为 failed`);
-            this.caseService.transitionCaseStatus(caseId, 'failed');
+            this.caseService.transitionCaseStatus(caseId, 'failed', runnerToken);
             this.repo.insertControlEvent({
               event_id: this.idGen.generate('evt'),
               case_id: caseId,
@@ -753,26 +938,100 @@ export class CaseRunner {
     const caseRecord = this.repo.getCase(caseId);
     const status = (caseRecord?.status as string) ?? 'unknown';
     const success = status === 'approved';
+    let scenarioSnapshot: ScenarioConfig | null = null;
+    try {
+      scenarioSnapshot = JSON.parse(String(caseRecord?.scenario_snapshot)) as ScenarioConfig;
+    } catch {
+      scenarioSnapshot = null;
+    }
+    const identityProtocolVersion = caseRecord
+      && this.repo.getControlEventsByCase(caseId).some(
+        (event) =>
+          event.event_type === 'case_identity_protocol'
+          && event.detail === CASE_IDENTITY_PROTOCOL_VERSION,
+      )
+      ? CASE_IDENTITY_PROTOCOL_VERSION
+      : null;
+
+    let caseIdentity: ResultCaseIdentity | null = null;
+    if (
+      caseRecord
+      && identityProtocolVersion === CASE_IDENTITY_PROTOCOL_VERSION
+      && typeof caseRecord.scenario_id === 'string'
+      && typeof caseRecord.scenario_snapshot_sha256 === 'string'
+      && typeof caseRecord.input_payload_sha256 === 'string'
+    ) {
+      caseIdentity = {
+        db_instance_id: this.repo.getDbInstanceId(),
+        scenario_id: caseRecord.scenario_id,
+        scenario_snapshot_sha256: caseRecord.scenario_snapshot_sha256,
+        input_payload_sha256: caseRecord.input_payload_sha256,
+        run_binding: {
+          run_id: (caseRecord.run_id as string | null) ?? null,
+          story_id: (caseRecord.story_id as string | null) ?? null,
+          stage_key: (caseRecord.stage_key as string | null) ?? null,
+          chapter_id: (caseRecord.chapter_id as string | null) ?? null,
+        },
+      };
+    }
+    let legacyCaseEvidence: ResultLegacyCaseEvidence | null = null;
+    if (
+      caseRecord
+      && identityProtocolVersion === null
+      && caseIdentity === null
+      && scenarioSnapshot
+    ) {
+      let inputPayload: unknown;
+      try {
+        inputPayload = JSON.parse(String(caseRecord.input_payload));
+      } catch {
+        inputPayload = null;
+      }
+      const scenarioId = scenarioSnapshot.scenario?.id;
+      if (
+        typeof scenarioId === 'string'
+        && typeof caseRecord.created_at === 'string'
+        && inputPayload !== null
+      ) {
+        legacyCaseEvidence = {
+          scenario_id: scenarioId,
+          scenario_snapshot_sha256: sha256(canonicalJson(scenarioSnapshot)),
+          input_payload_sha256: sha256(canonicalJson(inputPayload)),
+          created_at: caseRecord.created_at,
+          protocol_identity_absent: true,
+        };
+      }
+    }
 
     // final_artifact
     let finalArtifact: ResultArtifact | null = null;
-    const deliverableType = this.scenarioConfig.delivery?.deliverable_artifact_type;
+    let finalVersion: Record<string, unknown> | null = null;
+    const deliverableType = scenarioSnapshot?.delivery?.deliverable_artifact_type;
     if (deliverableType) {
       const artifact = this.repo.getArtifactByTypeAndCase(caseId, deliverableType);
       if (artifact) {
         const latestVersion = this.repo.getLatestVersion(artifact.artifact_id as string);
         if (latestVersion) {
+          finalVersion = latestVersion;
           finalArtifact = {
             type: deliverableType,
             version: latestVersion.version as number,
             status: latestVersion.status as string,
             content: latestVersion.content as string,
             artifact_id: artifact.artifact_id as string,
-            version_id: latestVersion.version_id as string,
+            version_id: latestVersion.artifact_version_id as string,
           };
         }
       }
     }
+    const executionIdentity: ResultExecutionIdentity | null = (
+      finalVersion
+      && typeof finalVersion.template_bundle_sha256 === 'string'
+    ) ? {
+        template_bundle_sha256: finalVersion.template_bundle_sha256,
+        artifact_version_id: finalVersion.artifact_version_id as string,
+      }
+      : null;
 
     // turns
     const turns = this.repo.getTurnsByCase(caseId);
@@ -802,8 +1061,12 @@ export class CaseRunner {
     // gate
     let gate: ResultGate | null = null;
     const gateResults = this.repo.getDeliveryGateResults(caseId);
-    if (gateResults.length > 0) {
-      const lastGate = gateResults[gateResults.length - 1];
+    const lastGate = finalArtifact
+      ? [...gateResults].reverse().find(
+          (candidate) => candidate.artifact_version_id === finalArtifact.version_id,
+        )
+      : undefined;
+    if (lastGate) {
       let checks: ResultGateCheck[] = [];
       try {
         const parsed: GateCheckResult[] = JSON.parse(lastGate.checks as string);
@@ -811,6 +1074,7 @@ export class CaseRunner {
       } catch { /* empty */ }
       gate = {
         status: lastGate.status as 'pass' | 'fail',
+        artifact_version_id: lastGate.artifact_version_id as string,
         checks,
       };
     }
@@ -825,7 +1089,11 @@ export class CaseRunner {
       case_id: caseId,
       status,
       success,
+      identity_protocol_version: identityProtocolVersion,
       final_artifact: finalArtifact,
+      case_identity: caseIdentity,
+      execution_identity: executionIdentity,
+      legacy_case_evidence: legacyCaseEvidence,
       turns: { count: turns.length, items: turnItems },
       issues: resultIssues,
       gate,

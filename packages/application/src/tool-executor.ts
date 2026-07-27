@@ -20,6 +20,8 @@ import type {
   RequestHumanInputInput,
   RequestHumanInputOutput,
   ToolName,
+  ArtifactValidatorPort,
+  GateCheckResult,
 } from '@forge-ai/contracts';
 import {
   transitionArtifactVersion,
@@ -44,6 +46,7 @@ export interface ToolExecutionContext {
   agentKey: string;
   messageId: string;
   scenarioConfig: ScenarioConfig;
+  templateBundleSha256?: string | null;
 }
 
 export class ToolExecutor {
@@ -51,6 +54,7 @@ export class ToolExecutor {
     private repo: RepositoryPort,
     private clock: ClockPort,
     private idGen: IdGeneratorPort,
+    private artifactValidator?: ArtifactValidatorPort,
   ) {}
 
   execute(
@@ -189,6 +193,7 @@ export class ToolExecutor {
           parent_version_id: parentVersion.artifact_version_id,
           diff,
           content_hash: contentHash,
+          template_bundle_sha256: ctx.templateBundleSha256 ?? null,
           status: 'rejected',
           approved_at: null,
           created_at: this.clock.now(),
@@ -271,6 +276,7 @@ export class ToolExecutor {
       parent_version_id: parentVersion?.artifact_version_id ?? null,
       diff,
       content_hash: contentHash,
+      template_bundle_sha256: ctx.templateBundleSha256 ?? null,
       status,
       approved_at: null,
       created_at: this.clock.now(),
@@ -446,18 +452,34 @@ export class ToolExecutor {
       };
     }
 
-    // 支柱一：模型不应被要求完美管理 issue_ids。supervisor 发返修（带 editable/frozen scope）
-    // 却漏填 issue_ids 时，系统自动补齐为当前 Case 的 open blocking issues--否则 Issue 生命周期
-    // 断裂（不进 repairing/claimed_fixed/verified），交付门禁会永远拦截，真实模型下频繁触发。
+    // 模型不应被要求完美管理 issue_ids。带 editable/frozen scope 的返修若漏填 issue_ids，
+    // 优先绑定同一审核消息刚创建的 open/reopened Issues（包含 minor/major/blocking）。
+    // 只有找不到同轮 Issue 时，才兼容旧行为：补齐当前 Case 的 open blocking Issues。
     const scope = input.scope;
     const hasRepairScope = !!scope
       && ((scope.editable_anchors?.length ?? 0) > 0 || (scope.frozen_anchors?.length ?? 0) > 0);
     if (hasRepairScope && (!scope!.issue_ids || scope!.issue_ids.length === 0)) {
-      const openBlocking = this.repo.getIssuesByCase(caseId).filter(
-        (i) => i.status === 'open' && i.severity === 'blocking',
+      const sameEvaluationIssues = this.repo.getIssuesByCase(caseId).filter(
+        (i) =>
+          (i.status === 'open' || i.status === 'reopened')
+          && i.evaluation_message_id === messageId,
       );
-      if (openBlocking.length > 0) {
-        scope!.issue_ids = openBlocking.map((i) => i.issue_id as string);
+      if (sameEvaluationIssues.length > 0) {
+        scope!.issue_ids = sameEvaluationIssues.map((i) => i.issue_id as string);
+      } else {
+        const openBlocking = this.repo.getIssuesByCase(caseId).filter(
+          (i) => i.status === 'open' && i.severity === 'blocking',
+        );
+        if (openBlocking.length > 0) {
+          scope!.issue_ids = openBlocking.map((i) => i.issue_id as string);
+        }
+      }
+      if (!scope!.issue_ids || scope!.issue_ids.length === 0) {
+        return {
+          success: false,
+          error: 'route_message 拒绝：返修 scope 未绑定任何 open/reopened Issue',
+          error_code: 'UNBOUND_REPAIR_SCOPE',
+        };
       }
     }
 
@@ -661,7 +683,13 @@ export class ToolExecutor {
       return { success: false, error: '未找到产物版本' };
     }
 
-    let gateResult = this.evaluateGateForCase(caseId, latestVersion.artifact_version_id as string, ctx.turnId);
+    let gateResult = this.evaluateGateForCase(
+      caseId,
+      latestVersion.artifact_version_id as string,
+      ctx.turnId,
+      scenarioConfig,
+      artifactType,
+    );
 
     // 记录门禁结果（若发生一致性修复，下面会追加第二条并通过 finalGateResultId 返回最终结果）
     let finalGateResultId = this.idGen.generate('gate');
@@ -669,6 +697,7 @@ export class ToolExecutor {
       gate_result_id: finalGateResultId,
       case_id: caseId,
       artifact_version_id: latestVersion.artifact_version_id,
+      template_bundle_sha256: latestVersion.template_bundle_sha256 ?? null,
       status: gateResult.passed ? 'pass' : 'fail',
       checks: JSON.stringify(gateResult.checks),
       blocking_issue_ids: JSON.stringify(gateResult.blockingIssueIds),
@@ -688,13 +717,20 @@ export class ToolExecutor {
         if (stale.length > 0) {
           consistencyRepaired = true;
           // 重新评估门禁
-          gateResult = this.evaluateGateForCase(caseId, latestVersion.artifact_version_id as string, ctx.turnId);
+          gateResult = this.evaluateGateForCase(
+            caseId,
+            latestVersion.artifact_version_id as string,
+            ctx.turnId,
+            scenarioConfig,
+            artifactType,
+          );
           // 记录修复后的门禁结果（作为最终返回的 gate_result_id）
           finalGateResultId = this.idGen.generate('gate');
           this.repo.insertDeliveryGateResult({
             gate_result_id: finalGateResultId,
             case_id: caseId,
             artifact_version_id: latestVersion.artifact_version_id,
+            template_bundle_sha256: latestVersion.template_bundle_sha256 ?? null,
             status: gateResult.passed ? 'pass' : 'fail',
             checks: JSON.stringify(gateResult.checks),
             blocking_issue_ids: JSON.stringify(gateResult.blockingIssueIds),
@@ -824,7 +860,13 @@ export class ToolExecutor {
   }
 
   /** 计算当前 Case 的交付门禁结果（用于 approveDelivery 与一致性修复后重评估） */
-  private evaluateGateForCase(caseId: string, versionId: string, currentTurnId: string) {
+  private evaluateGateForCase(
+    caseId: string,
+    versionId: string,
+    currentTurnId: string,
+    scenarioConfig: ScenarioConfig,
+    artifactType: string,
+  ) {
     const latestVersion = this.repo.getArtifactVersion(versionId);
     const allIssues = this.repo.getIssuesByCase(caseId);
     const blockingIssues = allIssues
@@ -853,7 +895,73 @@ export class ToolExecutor {
       revisionInstructions,
       incompleteTurns,
     };
-    return evaluateDeliveryGate(gateInput);
+    const baseResult = evaluateDeliveryGate(gateInput);
+    const validatorChecks = this.evaluateScenarioValidators(
+      caseId,
+      artifactType,
+      latestVersion?.content as string | undefined,
+      scenarioConfig,
+    );
+    const checks = [...baseResult.checks, ...validatorChecks];
+    return {
+      ...baseResult,
+      checks,
+      passed: checks.every((check) => check.passed),
+    };
+  }
+
+  private evaluateScenarioValidators(
+    caseId: string,
+    artifactType: string,
+    artifactContent: string | undefined,
+    scenarioConfig: ScenarioConfig,
+  ): GateCheckResult[] {
+    const validators = scenarioConfig.delivery.validators ?? [];
+    if (validators.length === 0) return [];
+
+    const caseRecord = this.repo.getCase(caseId);
+    let inputPayload: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(String(caseRecord?.input_payload ?? '{}'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        inputPayload = parsed as Record<string, unknown>;
+      }
+    } catch {
+      return validators.map((validator) => ({
+        check: `scenario_validator:${validator.id}`,
+        passed: false,
+        detail: 'Case input payload is not valid JSON',
+      }));
+    }
+
+    return validators.map((validator) => {
+      if (!this.artifactValidator) {
+        return {
+          check: `scenario_validator:${validator.id}`,
+          passed: false,
+          detail: 'Scenario validator runtime is unavailable',
+        };
+      }
+      try {
+        const result = this.artifactValidator.validate({
+          validator,
+          artifactType,
+          artifactContent: artifactContent ?? '',
+          inputPayload,
+        });
+        return {
+          check: `scenario_validator:${validator.id}`,
+          passed: result.passed,
+          detail: result.detail,
+        };
+      } catch (error) {
+        return {
+          check: `scenario_validator:${validator.id}`,
+          passed: false,
+          detail: `Scenario validator execution failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    });
   }
 
   /** 数组去重合并（保持顺序） */

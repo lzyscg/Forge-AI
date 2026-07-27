@@ -2,8 +2,13 @@
  * 端口接口定义（铁律 5：application 层通过端口调用外部实现，不直接碰具体实现）
  */
 
-import type { ScenarioConfig } from './scenario.js';
+import type { DeliveryValidatorConfig, ScenarioConfig } from './scenario.js';
 import type { ToolName } from './tools.js';
+import type {
+  CaseStatus,
+  ExecutionLease,
+  ExecutionLeaseAbortResult,
+} from './case.js';
 
 // === Pi 端口 ===
 export interface PiSessionOptions {
@@ -81,10 +86,57 @@ export interface RepositoryPort {
   runInTransaction<T>(fn: () => T): T;
 
   // Cases
+  getDbInstanceId(): string;
   insertCase(record: Record<string, unknown>): void;
   updateCase(caseId: string, fields: Record<string, unknown>): void;
   getCase(caseId: string): Record<string, unknown> | null;
   getCasesByStatus(status: string): Record<string, unknown>[];
+  acquireExecutionLease(caseId: string, lease: ExecutionLease): boolean;
+  getExecutionLease(caseId: string): ExecutionLease | null;
+  validateExecutionLease(caseId: string, runnerTokenSha256: string): boolean;
+  claimExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+    claimedAt: string,
+  ): boolean;
+  releaseExecutionLeaseOwner(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+  ): boolean;
+  transferExecutionLease(
+    caseId: string,
+    oldRunnerTokenSha256: string,
+    lease: ExecutionLease,
+  ): boolean;
+  heartbeatExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+    heartbeatAt: string,
+  ): boolean;
+  abortCaseWithExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    stoppedAt: string,
+    abortableStatuses: readonly CaseStatus[],
+  ): ExecutionLeaseAbortResult;
+  clearExecutionLease(caseId: string): void;
+  stopCaseWithoutExecutionLease(
+    caseId: string,
+    expectedStatus: CaseStatus,
+    stoppedAt: string,
+  ): boolean;
+  compareAndSetCaseStatus(
+    caseId: string,
+    expectedStatus: CaseStatus,
+    fields: Record<string, unknown>,
+    options?: {
+      runnerTokenSha256?: string;
+      clearExecutionLease?: boolean;
+    },
+  ): boolean;
 
   // Turns
   insertTurn(record: Record<string, unknown>): void;
@@ -175,4 +227,21 @@ export interface IdGeneratorPort {
 export interface ConfigLoaderPort {
   loadScenario(path: string): ScenarioConfig;
   loadPrompt(path: string): string;
+}
+
+// === Scenario-owned deterministic delivery validation ===
+export interface ArtifactValidationRequest {
+  validator: DeliveryValidatorConfig;
+  artifactType: string;
+  artifactContent: string;
+  inputPayload: Record<string, unknown>;
+}
+
+export interface ArtifactValidationResult {
+  passed: boolean;
+  detail: string;
+}
+
+export interface ArtifactValidatorPort {
+  validate(request: ArtifactValidationRequest): ArtifactValidationResult;
 }

@@ -55,7 +55,10 @@ export class RecoveryService {
   /**
    * 对单个 Case 执行恢复
    */
-  recoverCase(caseId: string): RecoveryResult {
+  recoverCase(
+    caseId: string,
+    runnerTokenSha256?: string,
+  ): RecoveryResult {
     const caseRecord = this.repo.getCase(caseId);
     if (!caseRecord) {
       return {
@@ -74,19 +77,23 @@ export class RecoveryService {
     // 不再因"没有 incomplete turn"就跳过恢复：Turn 事务化（P0-3）下崩溃 Turn 会回滚不残留，
     // 只要 Case 处于运行中状态就说明上次没跑完，需要从最后完成 Turn 续跑。
     if (currentStatus === 'waiting_review' || currentStatus === 'repairing') {
-      this.repo.updateCase(caseId, {
-        status: transitionCase(currentStatus, 'running'),
-        updated_at: this.clock.now(),
-      });
+      this.commitStatus(
+        caseId,
+        currentStatus,
+        transitionCase(currentStatus, 'running'),
+        runnerTokenSha256,
+      );
       currentStatus = 'running';
     }
 
     // Case → waiting_recovery
     if (currentStatus === 'running') {
-      this.repo.updateCase(caseId, {
-        status: transitionCase(currentStatus, 'waiting_recovery'),
-        updated_at: this.clock.now(),
-      });
+      this.commitStatus(
+        caseId,
+        currentStatus,
+        transitionCase(currentStatus, 'waiting_recovery'),
+        runnerTokenSha256,
+      );
     }
 
     // 记录恢复事件（4.5 幂等：用进程级计数器保证 event_id 唯一，
@@ -121,10 +128,12 @@ export class RecoveryService {
     const lastSequence = lastCompleted ? (lastCompleted.sequence as number) : null;
 
     // Case → running（恢复后续跑）
-    this.repo.updateCase(caseId, {
-      status: transitionCase('waiting_recovery', 'running'),
-      updated_at: this.clock.now(),
-    });
+    this.commitStatus(
+      caseId,
+      'waiting_recovery',
+      transitionCase('waiting_recovery', 'running'),
+      runnerTokenSha256,
+    );
 
     // 记录恢复完成事件
     this.repo.insertControlEvent({
@@ -146,5 +155,27 @@ export class RecoveryService {
       failedTurnIds,
       detail: `Recovery completed. Last completed turn sequence: ${lastSequence}. Failed turns: ${failedTurnIds.length}`,
     };
+  }
+
+  private commitStatus(
+    caseId: string,
+    expectedStatus: CaseStatus,
+    status: CaseStatus,
+    runnerTokenSha256?: string,
+  ): void {
+    const committed = this.repo.compareAndSetCaseStatus(
+      caseId,
+      expectedStatus,
+      {
+        status,
+        updated_at: this.clock.now(),
+      },
+      { runnerTokenSha256 },
+    );
+    if (!committed) {
+      throw new Error(
+        'Case state changed concurrently or lease authorization failed',
+      );
+    }
   }
 }
