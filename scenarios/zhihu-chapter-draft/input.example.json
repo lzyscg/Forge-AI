@@ -2,5 +2,6 @@
   "chapter_id": "B001",
   "chapter_label": "第一章",
   "chapter_packet": "已通过门禁的无剧透章节执行包。",
+  "reference_chapter_text": "仅包含当前章节机械边界内的参考原文。",
   "repair_context": "首稿生产。"
 }

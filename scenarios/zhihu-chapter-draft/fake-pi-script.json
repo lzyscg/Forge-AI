@@ -2,99 +2,21 @@
   "turns": [
     {
       "agentKey": "chapter_writer",
-      "content": "完成重点与权限。",
-      "toolCalls": [
-        {
-          "name": "route_message",
-          "arguments": {
-            "target_agent": "chapter_writer",
-            "instruction": "进入第2轮：只搭建变化骨架与场景因果。"
-          }
-        }
-      ]
-    },
-    {
-      "agentKey": "chapter_writer",
-      "content": "完成变化骨架。",
-      "toolCalls": [
-        {
-          "name": "route_message",
-          "arguments": {
-            "target_agent": "chapter_writer",
-            "instruction": "进入第3轮：依据骨架展开可读正文。"
-          }
-        }
-      ]
-    },
-    {
-      "agentKey": "chapter_writer",
-      "content": "完成正文展开。",
-      "toolCalls": [
-        {
-          "name": "route_message",
-          "arguments": {
-            "target_agent": "chapter_writer",
-            "instruction": "进入第4轮：只校正因果、反馈、转场和章尾状态。"
-          }
-        }
-      ]
-    },
-    {
-      "agentKey": "chapter_writer",
-      "content": "完成因果校正。",
-      "toolCalls": [
-        {
-          "name": "route_message",
-          "arguments": {
-            "target_agent": "chapter_writer",
-            "instruction": "进入第5轮：只校正人物目标、对白策略与情绪压力。"
-          }
-        }
-      ]
-    },
-    {
-      "agentKey": "chapter_writer",
-      "content": "完成人物与情绪校正。",
-      "toolCalls": [
-        {
-          "name": "route_message",
-          "arguments": {
-            "target_agent": "chapter_writer",
-            "instruction": "进入第6轮：只校正事实授权、知识边界与连续性。"
-          }
-        }
-      ]
-    },
-    {
-      "agentKey": "chapter_writer",
-      "content": "完成信息与连续性校正。",
-      "toolCalls": [
-        {
-          "name": "route_message",
-          "arguments": {
-            "target_agent": "chapter_writer",
-            "instruction": "进入第7轮：删除无功能文字，发布最终 chapter_draft。"
-          }
-        }
-      ]
-    },
-    {
-      "agentKey": "chapter_writer",
-      "content": "完成压缩并发布正文。",
+      "content": "完成章节正文。",
       "toolCalls": [
         {
           "name": "publish_artifact",
           "arguments": {
             "artifact_type": "chapter_draft",
-            "content": "# 第一章\n\n父亲去世后的第三天，我才开始整理他的东西。\n\n桌角那台旧录音机落着一层薄灰。我按下播放键，本以为会听见新闻，却先听见父亲咳了一声。\n\n“十年前，替你承担责任的人，不是我。”\n\n磁带在这句话后卡住，只剩齿轮空转的轻响。\n\n我按了两次倒带。那句话一次比一次清楚，也一次比一次不像遗言。父亲否定了我相信十年的答案，却没有留下新的答案。\n\n敲门声就在这时响起。\n\n我隔着门问是谁。门外沉默片刻，姐姐叫了我的名字。\n\n我们已经很多年没有见面。十年前那场事故之后，她一直说，是父亲毁了她的人生。\n\n“我不想见你。”我说。\n\n她没有争辩，只把什么东西举到猫眼前。那是另一盘录音，标签上的字迹和桌上这一盘一样。\n\n“爸隐瞒那件事，不只是为了你。”她说，“他也在保护我。”\n\n这只是她的说法。我没有开门，也没有回答。\n\n门外传来衣料摩擦的声音。姐姐说她把录音留下就走，不需要我现在相信她。\n\n我握住门把时，掌心全是冷汗。\n\n门打开后，她没有往里走，只把录音递给我。我没有接，她便越过门槛，将它轻轻放在桌上。\n\n“听完以后，你再决定要不要原谅我。”\n\n她站在门边，等我赶她出去。\n\n我看着桌上的两盘录音，最终把门完全打开。\n\n第二盘录音没有播放。至少这一刻，我只允许它留在我的视线里。",
-            "summary": "按七轮工作流完成第一章正文并压缩无功能文字"
+            "content": "# 第一章\n\n父亲去世后的第三天，我才开始整理他的东西。\n\n桌角那台旧录音机落着一层薄灰。我按下播放键，本以为会听见新闻，却先听见父亲咳了一声。\n\n“十年前，替你承担责任的人，不是我。”\n\n磁带在这句话后卡住，只剩齿轮空转的轻响。\n\n我反复倒带。那句话越来越清楚，也越来越不像遗言。父亲否定了我相信十年的答案，却没有留下新的答案。\n\n敲门声就在这时响起。\n\n我隔着门问是谁。门外沉默片刻，姐姐叫了我的名字。\n\n我们已经很多年没有见面。十年前那场事故之后，她一直说，是父亲毁了她的人生。\n\n“我不想见你。”我说。\n\n她没有争辩，只把什么东西举到猫眼前。那是另一盘录音，标签上的字迹和桌上这一盘一样。\n\n“爸隐瞒那件事，不只是为了你。”她说，“他也在保护我。”\n\n这只是她的说法。我没有开门，也没有回答。\n\n门外传来衣料摩擦的声音。姐姐说她把录音留下就走，不需要我现在相信她。\n\n我握住门把时，掌心全是冷汗。\n\n门打开后，她没有往里走，只把录音递给我。我没有接，她便越过门槛，将它轻轻放在桌上。\n\n“听完以后，你再决定要不要原谅我。”\n\n她站在门边，等我赶她出去。\n\n我看着桌上的两盘录音，最终把门完全打开。\n\n第二盘录音没有播放。至少这一刻，我只允许它留在我的视线里。",
+            "summary": "按执行包完成第一章正文"
           }
         }
       ]
     },
     {
       "agentKey": "chapter_auditor",
-      "content": "P0、场景闭环、知识边界和连续性均通过。",
+      "content": "章节正文通过审核。",
       "toolCalls": [
         {
           "name": "submit_evaluation",
@@ -107,7 +29,7 @@
         {
           "name": "approve_delivery",
           "arguments": {
-            "summary": "章节正文满足 Forge 交付门禁"
+            "summary": "章节正文满足交付门禁"
           }
         }
       ]

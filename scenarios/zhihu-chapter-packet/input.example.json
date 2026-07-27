@@ -1,7 +1,10 @@
 {
   "chapter_id": "B001",
   "chapter_label": "第一章",
+  "chapter_boundary": "{\"id\":\"B001\",\"sequence\":1}",
+  "reference_chapter_text": "仅包含当前章节机械边界内的参考原文。",
   "blueprint_bundle": "已通过门禁的大纲包。",
+  "blueprint_sidecar": "已通过门禁的大纲结构化 Sidecar。",
   "previous_ledger": "这是第一章，暂无账本。",
   "previous_chapter_ending": "这是第一章，暂无前章结尾。"
 }

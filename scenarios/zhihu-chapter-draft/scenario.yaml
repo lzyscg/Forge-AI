@@ -1,7 +1,7 @@
 scenario:
   id: zhihu-chapter-draft
   name: 知乎故事单章正文
-  version: 1
+  version: 5
 
 input_fields:
   - key: chapter_id
@@ -10,6 +10,8 @@ input_fields:
     label: 章节标签
   - key: chapter_packet
     label: 已交付的无剧透章节执行包
+  - key: reference_chapter_text
+    label: 当前章节参考原文（仅供去重审核）
   - key: repair_context
     label: 当前返修上下文
 
@@ -50,3 +52,9 @@ artifact_types:
 
 delivery:
   deliverable_artifact_type: chapter_draft
+  validators:
+    - id: chapter_surface
+      command: python
+      entrypoint: skills/zhihu-salt-chapter-drafter/scripts/validate_chapter_output.py
+      args: [--stdin-json, --overlap-width, "12"]
+      timeout_ms: 10000
