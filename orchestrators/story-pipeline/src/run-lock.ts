@@ -66,6 +66,8 @@ export interface AcquireStageLockOptions {
 
 export interface StageLock {
   path: string;
+  cleanup_paths: string[];
+  warnings: string[];
   release(): void;
 }
 
@@ -75,6 +77,11 @@ interface StageLockPayload {
   hostname: string;
   nonce: string;
   owner_token_sha256: string;
+}
+
+interface PublicationResult {
+  deferred_cleanup_path: string | null;
+  warning: string | null;
 }
 
 const defaultFsOps: StageLockFsOps = {
@@ -236,7 +243,7 @@ function publishExclusiveJson(
   finalPath: string,
   payload: StageLockPayload,
   fsOps: StageLockFsOps,
-): void {
+): PublicationResult {
   const temporaryPath = join(
     dirname(finalPath),
     `.${basename(finalPath)}.${process.pid}.${randomUUID()}.tmp`,
@@ -264,13 +271,24 @@ function publishExclusiveJson(
       }
     }
   }
+  let deferredCleanupPath: string | null = null;
   try {
     removeWithRetry(temporaryPath, fsOps);
   } catch (cleanupError) {
-    if (primaryError === undefined) primaryError = cleanupError;
+    if (published && primaryError === undefined) {
+      deferredCleanupPath = temporaryPath;
+    } else if (primaryError === undefined) {
+      primaryError = cleanupError;
+    }
   }
   if (primaryError !== undefined) throw primaryError;
   if (!published) throw new Error('stage lock publication did not complete');
+  return {
+    deferred_cleanup_path: deferredCleanupPath,
+    warning: deferredCleanupPath
+      ? 'stage lock temp cleanup deferred until release'
+      : null,
+  };
 }
 
 function isLive(
@@ -326,57 +344,46 @@ function acquireReclaimGuard(
   runDirectory: string,
   guardPath: string,
   guardPayload: StageLockPayload,
-  lockName: string,
-  staleDirectory: string,
-  inspector: ProcessInspector,
   fsOps: StageLockFsOps,
-): StageLock | null {
+): StageLock {
+  let publication: PublicationResult;
   try {
-    publishExclusiveJson(runDirectory, guardPath, guardPayload, fsOps);
+    publication = publishExclusiveJson(
+      runDirectory,
+      guardPath,
+      guardPayload,
+      fsOps,
+    );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     ensureSafeLeafPath(runDirectory, guardPath, fsOps);
-    let observed: StageLockPayload;
-    try {
-      observed = readLock(guardPath, fsOps);
-    } catch (readError) {
-      if ((readError as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      throw readError;
-    }
-    if (isLive(observed, inspector)) {
-      waitBriefly();
-      return null;
-    }
-    const staleGuardPath = auditPath(
-      staleDirectory,
-      lockName,
-      observed,
-      guardPayload.nonce,
-      'reclaim',
+    throw new Error(
+      'reclaim guard already exists; manual audit and recovery required',
     );
-    ensureSafeLeafPath(runDirectory, staleGuardPath, fsOps);
-    try {
-      fsOps.rename(guardPath, staleGuardPath);
-    } catch (renameError) {
-      if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      throw renameError;
-    }
-    ensureSafeLeafPath(runDirectory, staleGuardPath, fsOps);
-    return null;
   }
+  const cleanupPaths = publication.deferred_cleanup_path
+    ? [publication.deferred_cleanup_path]
+    : [];
+  const warnings = publication.warning ? [publication.warning] : [];
   let released = false;
   return {
     path: guardPath,
+    cleanup_paths: cleanupPaths,
+    warnings,
     release: () => {
       if (released) return;
-      if (releaseOwnedPath(
+      const guardReleased = releaseOwnedPath(
         runDirectory,
         guardPath,
         guardPayload,
         fsOps,
-      )) {
-        released = true;
+      );
+      if (!guardReleased) return;
+      for (const cleanupPath of cleanupPaths) {
+        ensureSafeLeafPath(runDirectory, cleanupPath, fsOps);
+        removeWithRetry(cleanupPath, fsOps);
       }
+      released = true;
     },
   };
 }
@@ -476,9 +483,20 @@ export function acquireStageLock(
   ensureSafeLeafPath(runDirectory, lockPath, fsOps);
   ensureSafeLeafPath(runDirectory, guardPath, fsOps);
 
+  const cleanupPaths: string[] = [];
+  const warnings: string[] = [];
   for (;;) {
     try {
-      publishExclusiveJson(runDirectory, lockPath, payload, fsOps);
+      const publication = publishExclusiveJson(
+        runDirectory,
+        lockPath,
+        payload,
+        fsOps,
+      );
+      if (publication.deferred_cleanup_path) {
+        cleanupPaths.push(publication.deferred_cleanup_path);
+      }
+      if (publication.warning) warnings.push(publication.warning);
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
@@ -500,12 +518,8 @@ export function acquireStageLock(
       runDirectory,
       guardPath,
       guardPayload,
-      lockName,
-      staleDirectory,
-      inspector,
       fsOps,
     );
-    if (!guard) continue;
     try {
       let currentLock: StageLockPayload;
       try {
@@ -531,7 +545,16 @@ export function acquireStageLock(
       }
       ensureSafeLeafPath(runDirectory, staleLockPath, fsOps);
       try {
-        publishExclusiveJson(runDirectory, lockPath, payload, fsOps);
+        const publication = publishExclusiveJson(
+          runDirectory,
+          lockPath,
+          payload,
+          fsOps,
+        );
+        if (publication.deferred_cleanup_path) {
+          cleanupPaths.push(publication.deferred_cleanup_path);
+        }
+        if (publication.warning) warnings.push(publication.warning);
         break;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
@@ -544,11 +567,22 @@ export function acquireStageLock(
   let released = false;
   return {
     path: lockPath,
+    cleanup_paths: cleanupPaths,
+    warnings,
     release: () => {
       if (released) return;
-      if (releaseOwnedPath(runDirectory, lockPath, payload, fsOps)) {
-        released = true;
+      const finalReleased = releaseOwnedPath(
+        runDirectory,
+        lockPath,
+        payload,
+        fsOps,
+      );
+      if (!finalReleased) return;
+      for (const cleanupPath of cleanupPaths) {
+        ensureSafeLeafPath(runDirectory, cleanupPath, fsOps);
+        removeWithRetry(cleanupPath, fsOps);
       }
+      released = true;
     },
   };
 }

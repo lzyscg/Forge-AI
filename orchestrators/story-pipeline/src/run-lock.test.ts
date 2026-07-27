@@ -245,7 +245,7 @@ describe('stage run locks', () => {
     expect(existsSync(lockPath)).toBe(false);
   });
 
-  it('recovers a stale reclaim guard before reclaiming its stale lock', () => {
+  it('fails closed on an existing reclaim guard without moving either file', () => {
     const runDir = temporaryRun();
     const oldInspector = inspector('2026-07-27T00:00:00.000Z');
     acquireStageLock({
@@ -271,22 +271,23 @@ describe('stage run locks', () => {
       owner_token_sha256: sha256('dead-guard-owner'),
     }, null, 2)}\n`, 'utf8');
 
-    const recovered = acquireStageLock({
+    const lockBefore = readFileSync(lockPath, 'utf8');
+    const guardBefore = readFileSync(guardPath, 'utf8');
+
+    expect(() => acquireStageLock({
       run_dir: runDir,
       run_id: 'run-1',
       stage_key: 'draft-b001',
       owner_token: 'new-owner',
       nonce: 'new-lock',
       process_inspector: inspector('2026-07-27T01:00:00.000Z'),
-    });
-
-    expect(existsSync(guardPath)).toBe(false);
-    const staleNames = readdirSync(join(runDir, '.locks', 'stages', 'stale'));
-    expect(staleNames.some((name) => name.includes('.reclaim.'))).toBe(true);
-    expect(JSON.parse(readFileSync(recovered.path, 'utf8')).nonce).toBe(
-      'new-lock',
+    })).toThrow(
+      'reclaim guard already exists; manual audit and recovery required',
     );
-    recovered.release();
+
+    expect(readFileSync(lockPath, 'utf8')).toBe(lockBefore);
+    expect(readFileSync(guardPath, 'utf8')).toBe(guardBefore);
+    expect(readdirSync(join(runDir, '.locks', 'stages', 'stale'))).toEqual([]);
   });
 
   it('allows only one independent process to reclaim the same stale lock', async () => {
@@ -351,8 +352,126 @@ describe('stage run locks', () => {
     expect(results.filter((result) => result === 'acquired')).toHaveLength(1);
     expect(results.filter((result) =>
       result.includes('stage lock is held by a live process')
+      || result.includes(
+        'reclaim guard already exists; manual audit and recovery required',
+      )
     ), JSON.stringify(results)).toHaveLength(1);
   }, 20_000);
+
+  it('never lets independent processes recover or rename a pre-existing guard', async () => {
+    const runDir = temporaryRun();
+    const stageDirectory = join(runDir, '.locks', 'stages');
+    mkdirSync(stageDirectory, { recursive: true });
+    const lockPath = join(
+      stageDirectory,
+      `${sha256('run-1\0draft-b001')}.lock`,
+    );
+    const guardPath = `${lockPath}.reclaim`;
+    const stalePayload = {
+      pid: 999_999,
+      process_started_at: '2020-01-01T00:00:00.000Z',
+      hostname: 'dead-worker',
+      nonce: 'stale-lock',
+      owner_token_sha256: sha256('dead-owner'),
+    };
+    const guardPayload = {
+      ...stalePayload,
+      nonce: 'stale-guard',
+      owner_token_sha256: sha256('dead-guard-owner'),
+    };
+    writeFileSync(lockPath, `${JSON.stringify(stalePayload, null, 2)}\n`);
+    writeFileSync(guardPath, `${JSON.stringify(guardPayload, null, 2)}\n`);
+    const lockBefore = readFileSync(lockPath, 'utf8');
+    const guardBefore = readFileSync(guardPath, 'utf8');
+    const moduleUrl = pathToFileURL(join(import.meta.dirname, 'run-lock.ts')).href;
+    const children = ['one', 'two'].map((worker) => {
+      const resultPath = join(runDir, `${worker}.guard-result`);
+      const script = `
+        import { writeFileSync } from 'node:fs';
+        import { acquireStageLock } from ${JSON.stringify(moduleUrl)};
+        try {
+          const lock = acquireStageLock({
+            run_dir: ${JSON.stringify(runDir)},
+            run_id: 'run-1',
+            stage_key: 'draft-b001',
+            owner_token: ${JSON.stringify(`owner-${worker}`)},
+          });
+          writeFileSync(${JSON.stringify(resultPath)}, 'acquired');
+          lock.release();
+        } catch (error) {
+          writeFileSync(${JSON.stringify(resultPath)}, 'error:' + error.message);
+        }
+      `;
+      const child = spawn(process.execPath, [
+        '--import',
+        'tsx/esm',
+        '--input-type=module',
+        '-e',
+        script,
+      ], {
+        shell: false,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      return { child, resultPath };
+    });
+    await Promise.all(children.map(({ child }) => waitForExit(child)));
+
+    const results = children.map(({ resultPath }) =>
+      readFileSync(resultPath, 'utf8')
+    );
+    expect(results.every((result) => result.includes(
+      'reclaim guard already exists; manual audit and recovery required',
+    ))).toBe(true);
+    expect(readFileSync(lockPath, 'utf8')).toBe(lockBefore);
+    expect(readFileSync(guardPath, 'utf8')).toBe(guardBefore);
+    expect(readdirSync(stageDirectory).filter((name) =>
+      name.includes('.stale')
+    )).toEqual([]);
+  }, 15_000);
+
+  it('returns an acquired handle when linked temp cleanup must wait for release', () => {
+    const runDir = temporaryRun();
+    let tempRemoveAttempts = 0;
+    const lock = acquireStageLock({
+      run_dir: runDir,
+      run_id: 'run-1',
+      stage_key: 'draft-b001',
+      owner_token: 'owner-1',
+      process_inspector: inspector(),
+      fs_ops: {
+        remove: (path) => {
+          if (path.includes('.tmp') && tempRemoveAttempts < 3) {
+            tempRemoveAttempts += 1;
+            const error = new Error('temp busy') as NodeJS.ErrnoException;
+            error.code = 'EBUSY';
+            throw error;
+          }
+          rmSync(path);
+        },
+      },
+    });
+
+    expect(existsSync(lock.path)).toBe(true);
+    expect(lock.cleanup_paths).toHaveLength(1);
+    expect(lock.warnings).toEqual([
+      'stage lock temp cleanup deferred until release',
+    ]);
+    expect(() => acquireStageLock({
+      run_dir: runDir,
+      run_id: 'run-1',
+      stage_key: 'draft-b001',
+      owner_token: 'owner-2',
+      process_inspector: inspector(),
+    })).toThrow('stage lock is held by a live process');
+
+    const cleanupPath = lock.cleanup_paths[0]!;
+    expect(existsSync(cleanupPath)).toBe(true);
+    lock.release();
+    expect(existsSync(lock.path)).toBe(false);
+    expect(existsSync(cleanupPath)).toBe(false);
+    expect(tempRemoveAttempts).toBe(3);
+  });
 });
 
 function waitForOutput(
