@@ -1,174 +1,200 @@
-# Forge AI MVP
+# Forge AI
 
-让多个 AI Agent 协作完成一次内容生产任务的运行平台。核心不是"模型多强"，而是在多个 Agent 之间搭一个可靠的中间层：让它们安全交接工作成果，并让系统始终独立掌握"现在生产到哪了、哪些成果有效、什么问题没解决"。
+> 多 Agent 协作内容生产平台。在多个 AI Agent 之间搭一个可靠的中间层：让它们安全交接工作成果，系统独立掌握"生产到哪了、哪些成果有效、什么问题没解决"，交付由系统门禁决定而非 Agent 自说自话。
 
-典型链路（歌词场景）：总控派任务 → 生成写初稿 v1 → 审核挑出问题 → 总控下发"只改第 4 行、其余冻结"的返修 → 生成改出 v2 → 复审通过 → 总控申请交付 → **系统独立核对门禁** → 正式交付。歌词只是示例，换"文案 + 质检"骨架不变。
+## 这是什么
 
-> 入口文档顺序：`CLAUDE.md` → `AGENTS.md`（六条铁律）→ `Forge_AI_MVP_需求文档.md` → `PLAN.md` → `交付标准.md` → `返修清单.md`。
+Forge AI 不是"模型多强"，而是**中间层接管工程、模型只管内容**。典型链路（歌词场景）：
 
----
-
-## 技术栈
-
-- **Node v24 / npm 11**，TypeScript ^5.5，npm workspaces 单仓多包
-- **SQLite**（better-sqlite3 11.x，WAL + busy_timeout=5000）作为唯一持久化
-- **Pi SDK**：`@earendil-works/pi-coding-agent`@0.82（Agent Runtime，**不是** `pi-ai`）
-- **typebox**@1.1.38（数据契约）
-- **vitest**（单测 + 集成），**Next.js 14**（只读回放页，轮询非 SSE），**tsx**（worker 运行）
-
-分层（铁律 5：单向依赖）：
 ```
-contracts  ->  domain  ->  application  ->  adapters  ->  apps
+总控派任务 → 生成 v1 → 审核挑刺 → 总控下发定点返修(editable/frozen) → 生成 v2 → 复审通过 → 申请交付 → 系统门禁核对 → approved
 ```
-- `packages/contracts`：typebox 数据契约 + 端口接口（PiPort/RepositoryPort/ClockPort/IdGeneratorPort/ConfigLoaderPort）
-- `packages/domain`：纯状态机 + 门禁 + 越界校验（可纯内存单测，不碰 DB/Pi）
-- `packages/application`：Turn 编排 + 工具执行 + 上下文构建 + 崩溃恢复
-- `packages/adapters`：SQLite + Fake Pi + Real Pi + 基础适配器
-- `apps/worker`：唯一启动 Pi Session 的入口
-- `apps/web`：只读回放页（不调 Pi）
 
----
+歌词只是示例，换"文案+质检"或"故事大纲+章节"骨架不变（配置驱动，零代码改场景）。
 
-## 安装依赖
+## 四根支柱
+
+| 支柱 | 含义 |
+|---|---|
+| **中间层接管工程** | 模型只调工具，系统补齐 ID/版本/时间戳/路由/JSON。模型不碰工程数据。 |
+| **产物与问题是第一等对象** | 交付由系统门禁决定，不是 Agent 说了算。`claimed_fixed` ≠ 关闭，只有 `verified` 算。 |
+| **受控返修** | editable/frozen 行级范围，越界版本 `rejected` 不进复审。 |
+| **配置驱动** | 平台代码零业务分支，新场景只写 YAML + 提示词。 |
+
+## 架构（单向依赖：`contracts → domain → application → adapters → apps`）
+
+| 层 | 职责 | 关键文件 |
+|---|---|---|
+| **contracts** | typebox 数据契约 + 端口接口（PiPort/RepositoryPort/ClockPort/ConfigLoaderPort）+ ResultJson | `packages/contracts/src/{scenario,ports,tools,result}.ts` |
+| **domain** | 纯状态机 + 门禁 + 越界校验（纯内存单测，不碰 DB/Pi） | `packages/domain/src/{case-state,issue-state,delivery-gate,scope-validator,state-transitions}.ts` |
+| **application** | Turn 编排 + 工具执行 + 上下文构建 + 崩溃恢复 + **CaseRunner**（核心） | `packages/application/src/{case-runner,turn-executor,tool-executor,recovery,context-builder}.ts` |
+| **adapters** | SQLite + Fake Pi + Real Pi + 路径/两库配置 | `packages/adapters/src/{sqlite-repository,fake-pi,pi-adapter,paths}.ts` |
+| **apps** | 三入口：worker（薄封装）/ cli（`forge`，主入口）/ web（人操作台） | `apps/{worker,cli,web}` |
+
+## 运行时模型
+
+```
+Case（一次生产任务）
+ └─ Turn 循环（CaseRunner.runTurnLoop，每个 Agent 一轮）
+     ├─ 取/建 Pi Session（persistent 跨轮记忆 / cold_per_version 每轮新开）
+     ├─ ContextBuilder 组装上下文（system prompt + context_rules）
+     ├─ 调 Pi（真实模型 / Fake 脚本）→ 模型调工具
+     ├─ ToolExecutor 执行工具（事务内）→ 改 Issue/产物/指令状态
+     └─ 路由决策（publish→reviewer / eval-fail→返修 / gate-fail→start_agent）
+```
+
+**5+1 工具**：`publish_artifact` / `submit_evaluation` / `route_message` / `approve_delivery` + `request_human_input`（降级停 waiting_human）+ `read`（受限，仅可读 `scenarios/<name>/skills/`，铁律 6 白名单）。
+
+**交付门禁 5 项**（domain 层，Agent 调 `approve_delivery` ≠ 交付）：版本有效 / 该版审核通过 / 所有 blocking Issue `verified` / 无运行中返修 / 无未完成 Turn。
+
+**返修机制**：supervisor 划 editable/frozen 范围，`scope-validator` 逐行校验，越界 `rejected` + 自动重发指令；issue 必须走到 `verified` 才能过门禁。
+
+## 三个操作面
+
+| 入口 | 定位 |
+|---|---|
+| **CLI `forge`** | 主入口，agent 友好。`forge case create/run/status/list/resume/stop` + `template/artifact/diff/gate`。默认 JSON 输出。 |
+| **Web UI** | 人操作台（Next.js）。泳道+箭头/diff/issue/门禁/敏感诊断折叠 + 创建跑 Case / waiting_human 恢复。 |
+| **Worker `npm run dev`** | 薄封装，一次性建+跑。 |
+
+三者复用同一个 **CaseRunner**（application 层）。
+
+## 两库模型
+
+| env | DB | 用途 |
+|---|---|---|
+| `production` | `data/production.db` | 正式生产 Case（默认） |
+| `test` | `data/test.db` | 测试 / 临时验证 |
+| `all` | 聚合两库 | 只读查看 |
+
+CLI `--env production|test|all`（写操作拒 `all`），Web topbar 下拉切换，`FORGE_ENV` 切默认。
+
+## 快速开始
+
+### 安装
 
 ```bash
 npm install
-```
-
-> **必须本机 `npm install`，不能从别处拷贝 `node_modules`**（坑 5）。仓库已带 `.npmrc`（`allow-scripts=true`），npm 11 默认拦 native 脚本，需要允许。安装后若 better-sqlite3 / esbuild 的 native 二进制缺失，补一次：
-
-```bash
+# 若 better-sqlite3 native 二进制缺失：
 npm rebuild better-sqlite3 esbuild
 ```
 
-环境要求：Node `>=20`（`engines` 写 `>=20`，实测 v24 可用），npm 11。
+需要 Node ≥ 20（实测 v24）、npm 11。
 
----
+### 跑 Fake Pi（不花钱，几秒）
+
+```bash
+npx forge case create --template songwriting --db ./data/song.db
+npx forge case run <case_id> --wait --db ./data/song.db
+# 末行 JSON: success:true + final_artifact + gate.status:pass
+```
+
+### 换场景（证配置驱动）
+
+```bash
+npx forge case create --template copywriting --db ./data/copy.db
+npx forge case run <id> --wait --db ./data/copy.db
+```
+
+### 真实 Pi
+
+```bash
+DEEPSEEK_API_KEY=sk-xxxx npx forge case run <id> --wait --mode real --db ./data/real.db
+```
+
+### Web 操作台
+
+```bash
+cd apps/web && npm run build && npm run start   # http://localhost:3000
+# topbar 右侧下拉切 生产/测试/全部
+```
 
 ## 环境变量
 
-复制 `.env.example` 为 `.env`（worker 不自动加载 `.env`，以下变量直接在命令前缀里传或 `export`）：
-
 | 变量 | 必需 | 默认 | 说明 |
 |---|---|---|---|
-| `PI_MODE` | 是 | `fake` | `fake` 用脚本驱动；`real` 接真实 Pi + DeepSeek 模型 |
-| `DB_PATH` | 否 | `data/production.db` | SQLite 文件路径（显式覆盖，优先级最高；自动创建父目录）。不设时按两库模型：`FORGE_ENV=test` -> `data/test.db`，否则 `data/production.db` |
-| `FORGE_ENV` | 否 | `production` | 数据库环境选择（`production` / `test`），与 CLI `--env`、Web env 选择器共用同一配置 |
-| `SCENARIO_PATH` | 是 | `./scenarios/songwriting/scenario.yaml` | 场景配置 YAML |
-| `DEEPSEEK_API_KEY` | `PI_MODE=real` 时必需 | — | DeepSeek API Key（铁律 6：只走环境变量，不进日志/DB/前端） |
-| `PI_MODEL_ID` | 否 | `deepseek-v4-flash` | 模型 ID（`deepseek-v4-flash` 或 `deepseek-v4-pro`） |
-| `PI_SESSION_DIR` | 否 | `./data/pi-sessions` | persistent Pi Session 文件持久化目录 |
-| `FORGE_INPUT` | 否 | - | 新 Case 的输入 payload（JSON 字符串），形状对应当前场景的 `input_fields` |
-| `FORGE_INPUT_FILE` | 否 | - | 新 Case 输入 payload 的 JSON 文件路径（多行内容推荐用这个） |
-| `MAX_TURNS` | 否 | `20` | 测试钩子：限制本轮执行的 Turn 数（模拟"跑到一半退出"，用于崩溃恢复测试） |
+| `PI_MODE` | 是 | `fake` | `fake` / `real` |
+| `DB_PATH` | 否 | `data/production.db` | 显式覆盖库路径（优先级高于 `--env`） |
+| `FORGE_ENV` | 否 | `production` | `production` / `test` |
+| `SCENARIO_PATH` | 是 | `./scenarios/songwriting/scenario.yaml` | 场景 YAML |
+| `DEEPSEEK_API_KEY` | `real` 时必需 | - | 只走环境变量，不进日志/DB/前端（铁律 6） |
+| `PI_MODEL_ID` | 否 | `deepseek-v4-flash` | `deepseek-v4-flash` / `deepseek-v4-pro` |
+| `FORGE_INPUT` | 否 | - | 新 Case 输入 JSON；不设则读 `<scenario>/input.example.json` |
+| `MAX_TURNS` | 否 | `20` | 测试钩子：限制 Turn 数 |
 
-> 若 `FORGE_INPUT` / `FORGE_INPUT_FILE` 都未设置，worker 会读 `<scenario 目录>/input.example.json` 作为示例输入；都没有则 fail loud。每个场景自带一份 `input.example.json`（songwriting 歌词、copywriting 产品信息）。
-
----
-
-## 启动 Worker
-
-### Fake Pi 场景（默认歌词）
+## 命令速查
 
 ```bash
-PI_MODE=fake DB_PATH=./data/song.db SCENARIO_PATH=./scenarios/songwriting/scenario.yaml npm run dev
+# 检查与测试
+npm run check            # tsc --noEmit，0 错误
+npm run test             # vitest，364 passed
+
+# CLI（主入口）
+npx forge case create --template songwriting --env production
+npx forge case run <id> --wait --env production
+npx forge case list --env all                    # 聚合两库
+npx forge case status <id> --env production
+npx forge case resume <id> --answer '...' --env test   # 恢复 waiting_human
+npx forge case stop <id> --env production
+npx forge template list / show <name> / validate <name>
+npx forge artifact get <case_id> / diff <case_id> / gate <case_id>
+
+# 崩溃恢复测试
+node scripts/crash-recovery-e2e.cjs                        # Fake Pi 8/8
+DEEPSEEK_API_KEY=sk-xxxx node scripts/crash-recovery-realpi-e2e.cjs   # 真实 kill-9
+
+# Skill 装配验证（零 token）
+npx tsx scripts/skill-verify-probe.ts
 ```
 
-跑完后 `./data/song.db` 里会有一个 `approved` 的 Case：7 Turn、v1 superseded / v2 delivered、blocking Issue `created→repairing→claimed_fixed→verified`、门禁 5 项全 pass。
+## 场景（配置驱动，零代码）
 
-### 第二场景（证伪硬编码）
+| 场景 | Agent | 产物 |
+|---|---|---|
+| songwriting | supervisor/generator/reviewer | lyrics |
+| copywriting | writer/qc | copy |
+| zhihu-story-outline | outline-architect/outline-auditor | 大纲 |
+| zhihu-chapter-packet | packet-compiler/packet-auditor | 执行包 |
+| zhihu-chapter-draft | chapter-writer/chapter-auditor | 单章正文 |
+| zhihu-story-final | manuscript-assembler | 终稿 |
+| zhihu-story-ledger | ledger-updater | 账本 |
 
-```bash
-SCENARIO_PATH=./scenarios/copywriting/scenario.yaml DB_PATH=./data/copy.db npm run dev
+故事流水线编排器（`orchestrators/story-pipeline/`）在 Forge 平台之上编排多 Case 链：故事输入 → 大纲 → 执行包 → 单章正文 ×N → 终稿 + 账本。
+
+## 项目结构
+
+```
+contracts/   数据契约 + 端口接口
+domain/      纯状态机 + 门禁 + 越界校验（纯单测）
+application/ CaseRunner + Turn/Tool/Context/Recovery 编排
+adapters/    SQLite + Fake Pi + Real Pi + 路径/两库配置
+apps/worker  薄封装入口（npm run dev）
+apps/cli     forge CLI（主入口）
+apps/web     Next.js 操作台
+scenarios/   场景配置（YAML + 提示词 + skills + Fake Pi 脚本）
+orchestrators/story-pipeline/  故事多 Case 编排器
+scripts/     e2e 测试 + 探针 + 调试工具
+docs/archive/  已完成的过程文档（历史归档）
 ```
 
-不修改任何平台源代码，只换 YAML，Agent 变成 writer/qc、产物类型变成 copy。
+## 核心概念
 
-### 真实 Pi 场景
+| 概念 | 含义 |
+|---|---|
+| **Case** | 一次生产任务。状态：running/waiting_review/repairing/waiting_human/approved/failed/stopped |
+| **Turn** | 一个 Agent 一轮。事务化原子提交（queued→running→completed），崩溃回滚不残留 |
+| **Issue** | 审核挑出的问题。`open→repairing→claimed_fixed→verified`（claimed_fixed 不关门禁） |
+| **返修指令** | editable/frozen 行级范围。越界版本 `rejected`，单活跃约束 |
+| **产物版本** | append 不覆盖。v1 superseded / v2 delivered |
+| **交付门禁** | 5 项独立核对，全绿才 approved |
 
-```bash
-PI_MODE=real DEEPSEEK_API_KEY=sk-xxxx PI_MODEL_ID=deepseek-v4-flash \
-  DB_PATH=./data/real.db SCENARIO_PATH=./scenarios/songwriting/scenario.yaml npm run dev
-```
+## 六条铁律
 
-> deepseek 是推理模型，会返回 `thinking` block。adapter 已做空响应重试（最多 3 次）。真实 Pi 全链路较慢（每个 Turn 一次真实 API 调用）。
+详见 `AGENTS.md`：①不写死业务 ②模型不碰工程数据 ③交付是系统决定 ④一切追加不覆盖 ⑤单向依赖 ⑥不泄密。
 
----
+## 崩溃恢复
 
-## CLI 操作系统（Round 2 新增）
-
-```bash
-# 查看帮助
-npx forge --help
-
-# Fake Pi 全链路
-npx forge case create --template songwriting --input '{"reference_lyrics":"...","fixed_phrase":"..."}' --db ./data/cli.db
-npx forge case run <case_id> --wait --db ./data/cli.db
-
-# 真实 Pi
-DEEPSEEK_API_KEY=sk-xxxx npx forge case run <case_id> --wait --mode real --db ./data/cli.db
-```
-
-完整命令见 `使用说明.md` 第 11 章。
-
----
-
-## 启动 Web 回放页
-
-```bash
-cd apps/web && DB_PATH=<绝对路径到 *.db> npx next dev -p 3137
-# 浏览器打开 http://localhost:3137
-```
-
-页面只读连接 SQLite，不调 Pi。功能：Agent 泳道 + 路由箭头、产物版本行级 diff（editable/frozen 标记）、Issue 生命周期、交付门禁逐项结果、Turn 三层折叠（含"敏感诊断·默认折叠"的模型实际输入）。轮询刷新（非 SSE）。
-
----
-
-## 测试
-
-```bash
-npm run check             # tsc --noEmit，0 错误
-npm run test              # vitest 单元 + 集成（78 passed）
-npm run test:integration  # 真实 PG 配置（本项目用 SQLite，可能为空）
-npm run test:e2e          # 端到端（若配置）
-```
-
-### 崩溃恢复端到端测试
-
-Fake Pi（进程级 kill + 重启，非内存模拟）：
-
-```bash
-node scripts/crash-recovery-e2e.cjs
-```
-
-真实 Pi kill + 重启 + persistent session 历史续跑断言：
-
-```bash
-DEEPSEEK_API_KEY=sk-xxxx node scripts/crash-recovery-realpi-e2e.cjs
-```
-
----
-
-## 场景配置
-
-新场景只写 YAML + 提示词 + Fake Pi 脚本，不碰平台代码（支柱四）：
-
-- `scenarios/songwriting/`：supervisor/generator/reviewer，产物 lyrics
-- `scenarios/copywriting/`：writer/qc，产物 copy
-
-每个场景含 `scenario.yaml`（agents/routes/context_rules/artifact_types/delivery）、`prompts/*.md`、`fake-pi-script.json`。
-
----
-
-## 关键约束（摘要）
-
-详见 `AGENTS.md`（六条铁律）与 `CLAUDE.md`（坑 1-13）。最重要的几条：
-
-1. **不把业务写死进平台**：平台代码零业务分支，新场景只写 YAML。
-2. **模型不碰工程数据**：模型只调工具，系统补齐 ID/版本/时间戳/路由。
-3. **交付是系统的决定**：`approve_delivery` 不等于交付，系统独立核对 5 项门禁；`claimed_fixed` 不算关闭，只有 `verified` 算。
-4. **一切追加，绝不覆盖**：产物版本追加不覆盖，Issue 状态以事件追加。
-5. **架构单向依赖**：`contracts → domain → application → adapters → apps`。
-6. **不泄密**：API Key 只走环境变量，不进日志/DB/前端；thinking 默认折叠。
-
-> **不要读旧仓库代码**：父目录的旧 TS monorepo 和 `pi-pipline-main` Python 项目是失败品，只保留"分层约定"思路，不复用一行实现。`docs/HANDOFF.md` 已过时，不要依据它判断当前状态。
+- Turn 事务化（崩溃回滚不残留 running Turn）。
+- persistent session 文件持久化（`.jsonl`），跨进程恢复完整对话历史。
+- `forge case run <id>` 对非终态 Case 续跑（recoverCase → 清孤儿 → decideResumeAgent 程序化路由）。
+- 真实 kill-9 + 重启验证过（persistent session `.jsonl` 跨进程历史续跑）。
