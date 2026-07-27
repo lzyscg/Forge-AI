@@ -34,6 +34,7 @@ export interface TurnExecutionInput {
   systemPrompt: string;
   userMessage: string;
   tools: PiToolDefinition[];
+  templateBundleSha256?: string | null;
 }
 
 export interface TurnExecutionResult {
@@ -168,6 +169,7 @@ export class TurnExecutor {
           agentKey: input.agentKey,
           messageId: outputMessageId,
           scenarioConfig: input.scenarioConfig,
+          templateBundleSha256: input.templateBundleSha256 ?? null,
         };
 
         const toolResult = this.toolExecutor.execute(toolName as ToolName, args, ctx);
@@ -233,6 +235,7 @@ export class TurnExecutor {
             agentKey: input.agentKey,
             messageId: outputMessageId,
             scenarioConfig: input.scenarioConfig,
+            templateBundleSha256: input.templateBundleSha256 ?? null,
           };
 
           const toolResult = this.toolExecutor.execute(toolName, args, ctx);

@@ -12,7 +12,7 @@ import { createFileLogger, stderrLogger } from '../logger.js';
 import {
   resolveReadDbPaths, resolveWriteDbPath, findCaseInfra,
   resolveMode, resolveScenarioPath, resolveInputPayload,
-  initInfra, createPiAdapter, TOOL_DEFINITIONS,
+  resolveScenarioBundleSha256, initInfra, createPiAdapter, TOOL_DEFINITIONS,
 } from '../setup.js';
 
 /** 所有已知状态（用于 case list 全量查询） */
@@ -31,6 +31,10 @@ export function registerCaseCommand(program: Command): void {
     .option('--env <production|test|all>', '数据库环境（写操作不可用 all）')
     .option('--mode <mode>', 'Pi 模式 (fake|real)')
     .option('--title <title>', 'Case 标题')
+    .option('--run-id <id>', '外部编排运行 ID')
+    .option('--story-id <id>', '外部故事 ID')
+    .option('--stage-key <key>', '外部阶段 key')
+    .option('--chapter-id <id>', '外部章节 ID')
     .option('--human', '人类可读格式输出')
     .action((opts) => {
       try {
@@ -40,6 +44,7 @@ export function registerCaseCommand(program: Command): void {
         const { repo, clock, idGen, configLoader } = initInfra(dbPath);
 
         const scenarioConfig = configLoader.loadScenario(scenarioPath);
+        const templateBundleSha256 = resolveScenarioBundleSha256(scenarioPath, scenarioConfig);
         const pi = createPiAdapter(mode, scenarioPath, scenarioConfig, stderrLogger);
 
         const runner = new CaseRunner({
@@ -50,11 +55,21 @@ export function registerCaseCommand(program: Command): void {
           toolDefinitions: TOOL_DEFINITIONS,
           logger: stderrLogger,
           artifactValidator: new ScriptArtifactValidator(dirname(scenarioPath)),
+          templateBundleSha256,
         });
 
         const inputPayload = resolveInputPayload(scenarioPath, scenarioConfig, opts.input);
         const title = opts.title ?? `${scenarioConfig.scenario.name} - ${new Date().toISOString().slice(0, 10)}`;
-        const caseId = runner.createCase({ title, inputPayload });
+        const caseId = runner.createCase({
+          title,
+          inputPayload,
+          runBinding: {
+            run_id: opts.runId ?? null,
+            story_id: opts.storyId ?? null,
+            stage_key: opts.stageKey ?? null,
+            chapter_id: opts.chapterId ?? null,
+          },
+        });
 
         writeFirstLine(caseId);
         repo.close();
@@ -105,6 +120,7 @@ export function registerCaseCommand(program: Command): void {
           // 如果文件不存在，使用 snapshot
           scenarioConfig = scenarioSnapshot;
         }
+        const templateBundleSha256 = resolveScenarioBundleSha256(scenarioPath, scenarioConfig);
 
         const pi = createPiAdapter(mode, scenarioPath, scenarioConfig, logger);
         const maxTurns = parseInt(opts.maxTurns, 10);
@@ -117,6 +133,7 @@ export function registerCaseCommand(program: Command): void {
           toolDefinitions: TOOL_DEFINITIONS,
           logger,
           artifactValidator: new ScriptArtifactValidator(dirname(scenarioPath)),
+          templateBundleSha256,
           maxTurns,
         });
 
@@ -163,12 +180,7 @@ export function registerCaseCommand(program: Command): void {
 
         const scenarioSnapshot = JSON.parse(caseRecord.scenario_snapshot as string);
         const scenarioPath = resolveScenarioPath(scenarioSnapshot.scenario?.id ?? 'songwriting');
-        let scenarioConfig;
-        try {
-          scenarioConfig = configLoader.loadScenario(scenarioPath);
-        } catch {
-          scenarioConfig = scenarioSnapshot;
-        }
+        const scenarioConfig = scenarioSnapshot;
 
         // 构造一个轻量 runner 只为调 buildResultJson
         const fakePi = new FakePiAdapter();
@@ -295,6 +307,7 @@ export function registerCaseCommand(program: Command): void {
         } catch {
           scenarioConfig = scenarioSnapshot;
         }
+        const templateBundleSha256 = resolveScenarioBundleSha256(scenarioPath, scenarioConfig);
 
         const pi = createPiAdapter(mode, scenarioPath, scenarioConfig, logger);
 
@@ -306,6 +319,7 @@ export function registerCaseCommand(program: Command): void {
           toolDefinitions: TOOL_DEFINITIONS,
           logger,
           artifactValidator: new ScriptArtifactValidator(dirname(scenarioPath)),
+          templateBundleSha256,
         });
 
         runner.assertNoConcurrentCase(id); // 先检查并发

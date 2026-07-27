@@ -16,6 +16,7 @@ import {
   UuidGenerator,
   FileConfigLoader,
   ScriptArtifactValidator,
+  computeScenarioBundleSha256,
   resolveSingleDbPath,
   defaultDbEnv,
 } from '@forge-ai/adapters';
@@ -189,6 +190,10 @@ async function main() {
 
   // 加载场景配置
   const scenarioConfig = configLoader.loadScenario(resolve(scenarioPath));
+  const templateBundleSha256 = computeScenarioBundleSha256(
+    resolve(scenarioPath),
+    scenarioConfig,
+  );
   console.log(`  场景: ${scenarioConfig.scenario.name} (v${scenarioConfig.scenario.version})`);
 
   // 选择 Pi adapter
@@ -235,6 +240,7 @@ async function main() {
     toolDefinitions: TOOL_DEFINITIONS,
     logger: consoleLogger,
     artifactValidator: new ScriptArtifactValidator(dirname(resolve(scenarioPath))),
+    templateBundleSha256,
     maxTurns: parseInt(process.env.MAX_TURNS ?? '20', 10),
   });
 

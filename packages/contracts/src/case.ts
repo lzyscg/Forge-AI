@@ -13,13 +13,27 @@ export type CaseStatus =
   | 'stopped'
   | 'failed';
 
+export interface CaseRunBinding {
+  run_id: string | null;
+  story_id: string | null;
+  stage_key: string | null;
+  chapter_id: string | null;
+}
+
 export interface CaseRecord {
   case_id: string;
   title: string;
   status: CaseStatus;
   current_stage: string;
+  scenario_id: string | null;
   scenario_snapshot: string; // 整份配置快照 JSON
   input_payload: string; // 用户输入 JSON
+  scenario_snapshot_sha256: string | null;
+  input_payload_sha256: string | null;
+  run_id: string | null;
+  story_id: string | null;
+  stage_key: string | null;
+  chapter_id: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;

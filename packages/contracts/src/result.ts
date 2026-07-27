@@ -31,7 +31,26 @@ export interface ResultGateCheck {
 
 export interface ResultGate {
   status: 'pass' | 'fail';
+  artifact_version_id: string;
   checks: ResultGateCheck[];
+}
+
+export interface ResultCaseIdentity {
+  db_instance_id: string;
+  scenario_id: string;
+  scenario_snapshot_sha256: string;
+  input_payload_sha256: string;
+  run_binding: {
+    run_id: string | null;
+    story_id: string | null;
+    stage_key: string | null;
+    chapter_id: string | null;
+  };
+}
+
+export interface ResultExecutionIdentity {
+  template_bundle_sha256: string;
+  artifact_version_id: string;
 }
 
 export interface ResultDiff {
@@ -47,6 +66,8 @@ export interface ResultJson {
   status: string;
   success: boolean;
   final_artifact: ResultArtifact | null;
+  case_identity: ResultCaseIdentity | null;
+  execution_identity: ResultExecutionIdentity | null;
   turns: { count: number; items: ResultTurnItem[] };
   issues: ResultIssue[];
   gate: ResultGate | null;

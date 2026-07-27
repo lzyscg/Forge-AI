@@ -46,6 +46,7 @@ export interface ToolExecutionContext {
   agentKey: string;
   messageId: string;
   scenarioConfig: ScenarioConfig;
+  templateBundleSha256?: string | null;
 }
 
 export class ToolExecutor {
@@ -192,6 +193,7 @@ export class ToolExecutor {
           parent_version_id: parentVersion.artifact_version_id,
           diff,
           content_hash: contentHash,
+          template_bundle_sha256: ctx.templateBundleSha256 ?? null,
           status: 'rejected',
           approved_at: null,
           created_at: this.clock.now(),
@@ -274,6 +276,7 @@ export class ToolExecutor {
       parent_version_id: parentVersion?.artifact_version_id ?? null,
       diff,
       content_hash: contentHash,
+      template_bundle_sha256: ctx.templateBundleSha256 ?? null,
       status,
       approved_at: null,
       created_at: this.clock.now(),
@@ -694,6 +697,7 @@ export class ToolExecutor {
       gate_result_id: finalGateResultId,
       case_id: caseId,
       artifact_version_id: latestVersion.artifact_version_id,
+      template_bundle_sha256: latestVersion.template_bundle_sha256 ?? null,
       status: gateResult.passed ? 'pass' : 'fail',
       checks: JSON.stringify(gateResult.checks),
       blocking_issue_ids: JSON.stringify(gateResult.blockingIssueIds),
@@ -726,6 +730,7 @@ export class ToolExecutor {
             gate_result_id: finalGateResultId,
             case_id: caseId,
             artifact_version_id: latestVersion.artifact_version_id,
+            template_bundle_sha256: latestVersion.template_bundle_sha256 ?? null,
             status: gateResult.passed ? 'pass' : 'fail',
             checks: JSON.stringify(gateResult.checks),
             blocking_issue_ids: JSON.stringify(gateResult.blockingIssueIds),

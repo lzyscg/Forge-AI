@@ -81,6 +81,7 @@ export interface RepositoryPort {
   runInTransaction<T>(fn: () => T): T;
 
   // Cases
+  getDbInstanceId(): string;
   insertCase(record: Record<string, unknown>): void;
   updateCase(caseId: string, fields: Record<string, unknown>): void;
   getCase(caseId: string): Record<string, unknown> | null;

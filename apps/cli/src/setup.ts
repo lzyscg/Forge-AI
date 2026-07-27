@@ -5,7 +5,15 @@ import { config } from 'dotenv';
 import { resolve, dirname } from 'node:path';
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { getPackageRoot, resolveFromRoot, resolveDbPaths, resolveSingleDbPath, defaultDbEnv, type DbEnv } from '@forge-ai/adapters';
-import { SqliteRepository, FakePiAdapter, RealPiAdapter, SystemClock, UuidGenerator, FileConfigLoader } from '@forge-ai/adapters';
+import {
+  SqliteRepository,
+  FakePiAdapter,
+  RealPiAdapter,
+  SystemClock,
+  UuidGenerator,
+  FileConfigLoader,
+  computeScenarioBundleSha256,
+} from '@forge-ai/adapters';
 import type { FakePiScript } from '@forge-ai/adapters';
 import type { PiPort, PiToolDefinition, ScenarioConfig } from '@forge-ai/contracts';
 import type { Logger } from '@forge-ai/application';
@@ -172,6 +180,13 @@ export function resolveScenarioPath(templateOption: string): string {
     return resolve(templateOption);
   }
   return resolveFromRoot('scenarios', templateOption, 'scenario.yaml');
+}
+
+export function resolveScenarioBundleSha256(
+  scenarioPath: string,
+  scenarioConfig: ScenarioConfig,
+): string {
+  return computeScenarioBundleSha256(scenarioPath, scenarioConfig);
 }
 
 /**
