@@ -3,6 +3,7 @@ import {
   appendManifestEvent,
   type PipelineManifestV21,
   type ReplacementRecord,
+  type StageAttemptV21,
   type StageRecordV21,
   type TemplateIdentity,
 } from './manifest.js';
@@ -195,6 +196,51 @@ function candidateMatchesReplacement(
     );
 }
 
+function requireMatchingAttempt(
+  manifest: PipelineManifestV21,
+  replacement: ReplacementRecord,
+  candidate: StageRecordV21,
+): StageAttemptV21 {
+  if (replacement.attempt_id === null) {
+    throw new Error('replacement candidate has no bound Attempt');
+  }
+  const attempt = manifest.attempts.find(
+    (item) => item.attempt_id === replacement.attempt_id,
+  );
+  if (!attempt) throw new Error('replacement attempt is missing');
+  if (candidate.case_id !== attempt.case_id) {
+    throw new Error('candidate Case does not match replacement Attempt');
+  }
+  if (
+    attempt.stage_key !== replacement.stage_key
+    || attempt.stage !== candidate.stage
+    || attempt.chapter_id !== candidate.chapter_id
+    || attempt.template !== candidate.template
+    || attempt.input_sha256 !== replacement.expected_input_sha256
+    || attempt.input_sha256 !== candidate.input_sha256
+    || !sameTemplateIdentity(
+      attempt.template_identity,
+      replacement.expected_template_identity,
+    )
+    || !sameTemplateIdentity(
+      attempt.template_identity,
+      candidate.template_identity,
+    )
+    || !sameOrderedValues(
+      attempt.parent_record_ids,
+      replacement.expected_parent_record_ids,
+    )
+    || !sameOrderedValues(
+      attempt.parent_record_ids,
+      candidate.parent_record_ids,
+    )
+    || attempt.expected_artifact_type !== candidate.artifact_type
+  ) {
+    throw new Error('replacement Attempt identity does not match');
+  }
+  return attempt;
+}
+
 export function prepareReplacementCandidate(
   manifest: PipelineManifestV21,
   replacementId: string,
@@ -212,6 +258,7 @@ export function prepareReplacementCandidate(
   if (!candidateMatchesReplacement(replacement, candidate)) {
     throw new Error('replacement candidate identity does not match');
   }
+  requireMatchingAttempt(manifest, replacement, candidate);
   if (manifest.stages.some(
     (record) => record.record_id === candidate.record_id,
   )) {
@@ -254,6 +301,11 @@ export function commitReplacement(
     if (!replacement.candidate_record) {
       throw new Error('committed replacement has no candidate record');
     }
+    requireMatchingAttempt(
+      manifest,
+      replacement,
+      replacement.candidate_record,
+    );
     return replacement.candidate_record;
   }
   if (replacement.status !== 'pending') {
@@ -266,6 +318,7 @@ export function commitReplacement(
   if (!candidateMatchesReplacement(replacement, candidate)) {
     throw new Error('replacement candidate identity does not match');
   }
+  const attempt = requireMatchingAttempt(manifest, replacement, candidate);
   const oldRecord = activeRecord(manifest, replacement.stage_key);
   if (!oldRecord || oldRecord.record_id !== replacement.old_record_id) {
     throw new Error('replacement old record is no longer active');
@@ -287,13 +340,7 @@ export function commitReplacement(
     if (!record) throw new Error(`replacement descendant is missing: ${recordId}`);
     return record;
   });
-  const attempt = manifest.attempts.find(
-    (item) => item.attempt_id === replacement.attempt_id,
-  );
-  if (manifest.attempts.length > 0 && !attempt) {
-    throw new Error('replacement attempt is missing');
-  }
-  const beforeOutcome = attempt?.outcome ?? 'running';
+  const beforeOutcome = attempt.outcome;
   for (const record of affectedRecords) {
     manifest.invalidations.push({
       invalidation_id: `inv-${manifest.invalidations.length + 1}`,
@@ -323,14 +370,12 @@ export function commitReplacement(
     }
   }
   manifest.stages.push(candidate);
-  if (attempt) {
-    attempt.outcome = 'delivered';
-    attempt.raw_artifact_path = candidate.raw_artifact_path;
-    attempt.validation_report_path = candidate.validation_report_path;
-    attempt.runner_credential_path = null;
-    attempt.updated_at = at;
-    attempt.detail = null;
-  }
+  attempt.outcome = 'delivered';
+  attempt.raw_artifact_path = candidate.raw_artifact_path;
+  attempt.validation_report_path = candidate.validation_report_path;
+  attempt.runner_credential_path = null;
+  attempt.updated_at = at;
+  attempt.detail = null;
   replacement.status = 'committed';
   appendManifestEvent(manifest, {
     at,

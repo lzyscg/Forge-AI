@@ -514,8 +514,56 @@ export function persistReplacementCancellation(
   at = new Date().toISOString(),
 ): PipelineManifest {
   return persistReplacementMutation(manifestPath, (manifest) => {
+    const replacement = manifest.replacements.find(
+      (item) => item.replacement_id === replacementId,
+    );
+    const attempt = replacement?.attempt_id
+      ? manifest.attempts.find(
+          (item) => item.attempt_id === replacement.attempt_id,
+        )
+      : null;
+    if (replacement?.status === 'pending' && attempt) {
+      const beforeOutcome = attempt.outcome;
+      attempt.outcome = 'failed';
+      attempt.updated_at = at;
+      attempt.detail = reason;
+      attempt.runner_credential_path = null;
+      appendAttemptEvent(
+        manifest,
+        'stage_failed',
+        attempt,
+        beforeOutcome,
+        'failed',
+        reason,
+      );
+    }
     cancelReplacement(manifest, replacementId, reason, at);
   });
+}
+
+function replacementCredentialPath(
+  manifestPath: string,
+  manifest: PipelineManifest,
+  replacementId: string,
+): string | null {
+  const replacement = manifest.replacements.find(
+    (item) => item.replacement_id === replacementId,
+  );
+  if (!replacement?.attempt_id) return null;
+  const attempt = manifest.attempts.find(
+    (item) => item.attempt_id === replacement.attempt_id,
+  );
+  if (!attempt) return null;
+  const relativePath = attempt.runner_credential_path
+    ?? join('credentials', `${sha256(attempt.attempt_id)}.runner-token`);
+  const runDir = dirname(manifestPath);
+  const absolutePath = resolve(runDir, relativePath);
+  ensureInsideRunDir(runDir, absolutePath);
+  return absolutePath;
+}
+
+function removeReplacementCredential(path: string | null): void {
+  if (path !== null) rmSync(path, { force: true });
 }
 
 export function persistReplacementCommit(
@@ -525,28 +573,52 @@ export function persistReplacementCommit(
   at = new Date().toISOString(),
 ): PipelineManifest {
   const latest = loadManifest(manifestPath);
+  const credentialPath = replacementCredentialPath(
+    manifestPath,
+    latest,
+    replacementId,
+  );
   const existing = latest.replacements.find(
     (replacement) => replacement.replacement_id === replacementId,
   );
-  if (existing?.status === 'committed') return latest;
+  if (existing?.status === 'committed') {
+    removeReplacementCredential(credentialPath);
+    return latest;
+  }
   try {
-    return saveManifestCas(manifestPath, expectedRevision, (manifest) => {
-      commitReplacement(manifest, replacementId, at);
-    });
+    const committed = saveManifestCas(
+      manifestPath,
+      expectedRevision,
+      (manifest) => {
+        commitReplacement(manifest, replacementId, at);
+      },
+    );
+    removeReplacementCredential(credentialPath);
+    return committed;
   } catch (error) {
     const afterFailure = loadManifest(manifestPath);
     const replacement = afterFailure.replacements.find(
       (item) => item.replacement_id === replacementId,
     );
-    if (replacement?.status === 'committed') return afterFailure;
+    if (replacement?.status === 'committed') {
+      removeReplacementCredential(credentialPath);
+      return afterFailure;
+    }
     if (replacement?.status === 'pending') {
       try {
-        persistReplacementCancellation(
+        const cancelled = persistReplacementCancellation(
           manifestPath,
           replacementId,
           'replacement commit precondition failed',
           at,
         );
+        const cancelledReplacement = cancelled.replacements.find(
+          (item) => item.replacement_id === replacementId,
+        );
+        if (cancelledReplacement?.status !== 'cancelled') {
+          throw new Error('replacement cancellation did not commit');
+        }
+        removeReplacementCredential(credentialPath);
       } catch (cancellationError) {
         throw new AggregateError(
           [error, cancellationError],
@@ -1132,14 +1204,6 @@ async function executeStageUnlocked(
       record,
     );
     saveManifest(options.runDir, manifest);
-    if (attempt.runner_credential_path !== null) {
-      const credentialPath = resolve(
-        options.runDir,
-        attempt.runner_credential_path,
-      );
-      ensureInsideRunDir(options.runDir, credentialPath);
-      rmSync(credentialPath, { force: true });
-    }
     const committed = persistReplacementCommit(
       join(options.runDir, 'manifest.json'),
       pendingReplacement.replacement_id,
@@ -1779,14 +1843,6 @@ export async function reconcileRun(
             );
             if (manifest.events.length > beforeEvents) {
               saveManifest(options.runDir, manifest);
-            }
-            if (attempt.runner_credential_path !== null) {
-              const credentialPath = resolve(
-                options.runDir,
-                attempt.runner_credential_path,
-              );
-              ensureInsideRunDir(options.runDir, credentialPath);
-              rmSync(credentialPath, { force: true });
             }
             Object.assign(
               manifest,

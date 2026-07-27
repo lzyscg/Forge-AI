@@ -325,6 +325,22 @@ describe('replacement manifest invariants', () => {
       root_record_id: candidate.record_id,
       invalidated_at: '2026-07-27T00:00:03.000Z',
     });
+    manifest.attempts.push({
+      ...runningAttempt(),
+      attempt_id: 'attempt-2',
+      stage_key: candidate.stage_key,
+      stage: candidate.stage,
+      chapter_id: candidate.chapter_id,
+      template: candidate.template,
+      expected_artifact_type: candidate.artifact_type,
+      case_id: candidate.case_id,
+      input_sha256: candidate.input_sha256,
+      parent_record_ids: [...candidate.parent_record_ids],
+      template_identity: candidate.template_identity,
+      outcome: 'delivered',
+      raw_artifact_path: candidate.raw_artifact_path,
+      validation_report_path: candidate.validation_report_path,
+    });
     manifest.replacements.push({
       replacement_id: 'replacement-1',
       stage_key: old.stage_key,
@@ -361,6 +377,22 @@ describe('replacement manifest invariants', () => {
       root_record_id: candidate.record_id,
       invalidated_at: '2026-07-27T00:00:03.000Z',
     });
+    manifest.attempts.push({
+      ...runningAttempt(),
+      attempt_id: 'attempt-2',
+      stage_key: candidate.stage_key,
+      stage: candidate.stage,
+      chapter_id: candidate.chapter_id,
+      template: candidate.template,
+      expected_artifact_type: candidate.artifact_type,
+      case_id: candidate.case_id,
+      input_sha256: candidate.input_sha256,
+      parent_record_ids: [...candidate.parent_record_ids],
+      template_identity: candidate.template_identity,
+      outcome: 'delivered',
+      raw_artifact_path: candidate.raw_artifact_path,
+      validation_report_path: candidate.validation_report_path,
+    });
     manifest.replacements.push({
       replacement_id: 'replacement-1',
       stage_key: old.stage_key,
@@ -376,6 +408,58 @@ describe('replacement manifest invariants', () => {
 
     expect(() => validateManifestChain(manifest)).toThrow(
       'committed replacement old record is still active',
+    );
+  });
+
+  it('rejects a corrupt committed replacement whose candidate Case differs from its Attempt', () => {
+    const manifest = emptyManifest();
+    const old = deliveredRecord();
+    const candidate = {
+      ...deliveredRecord('stage-1-v2'),
+      revision: 2,
+      case_id: 'case-B',
+      input_sha256: 'new-input',
+    };
+    manifest.stages.push(old, candidate);
+    manifest.invalidations.push({
+      invalidation_id: 'inv-old',
+      record_id: old.record_id,
+      stage_key: old.stage_key,
+      reason: 'replacement committed',
+      root_record_id: old.record_id,
+      invalidated_at: '2026-07-27T00:00:03.000Z',
+    });
+    manifest.attempts.push({
+      ...runningAttempt(),
+      attempt_id: 'attempt-2',
+      stage_key: candidate.stage_key,
+      stage: candidate.stage,
+      chapter_id: candidate.chapter_id,
+      template: candidate.template,
+      expected_artifact_type: candidate.artifact_type,
+      case_id: 'case-A',
+      input_sha256: candidate.input_sha256,
+      parent_record_ids: [...candidate.parent_record_ids],
+      template_identity: candidate.template_identity,
+      outcome: 'delivered',
+      raw_artifact_path: candidate.raw_artifact_path,
+      validation_report_path: candidate.validation_report_path,
+    });
+    manifest.replacements.push({
+      replacement_id: 'replacement-1',
+      stage_key: old.stage_key,
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      attempt_id: 'attempt-2',
+      status: 'committed',
+      candidate_record: candidate,
+      reason: 'input changed',
+    });
+
+    expect(() => validateManifestChain(manifest)).toThrow(
+      'replacement candidate does not match its Attempt',
     );
   });
 });

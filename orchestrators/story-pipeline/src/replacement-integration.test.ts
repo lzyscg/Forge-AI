@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdtempSync,
   rmSync,
 } from 'node:fs';
@@ -16,8 +17,10 @@ import {
   appendManifestEvent,
   initializeManifest,
   loadManifest,
+  persistRunnerCredential,
   saveManifestCas,
   type PipelineManifestV21,
+  type StageAttemptV21,
   type StageRecordV21,
   type TemplateIdentity,
 } from './manifest.js';
@@ -69,10 +72,24 @@ function record(
   };
 }
 
-function manifestPathWith(stages: StageRecordV21[]): string {
+function manifestPathWith(
+  stages: StageRecordV21[],
+  attempts: StageAttemptV21[] = [],
+  withCredentials = false,
+): string {
   const runDirectory = mkdtempSync(join(tmpdir(), 'forge-replacement-'));
   temporaryDirectories.push(runDirectory);
   const manifestPath = join(runDirectory, 'manifest.json');
+  if (withCredentials) {
+    for (const attempt of attempts) {
+      persistRunnerCredential(
+        runDirectory,
+        attempt,
+        `runner-token-${attempt.attempt_id}`,
+        { platform: 'linux' },
+      );
+    }
+  }
   initializeManifest(manifestPath, (): PipelineManifestV21 => ({
     schema_version: '2.1',
     revision: 0,
@@ -86,7 +103,7 @@ function manifestPathWith(stages: StageRecordV21[]): string {
     boundary_map_sha256: 'boundaries',
     created_at: '2026-01-01T00:00:00.000Z',
     updated_at: '2026-01-01T00:00:00.000Z',
-    attempts: [],
+    attempts,
     stages,
     invalidations: [],
     reinstatements: [],
@@ -97,10 +114,40 @@ function manifestPathWith(stages: StageRecordV21[]): string {
   return manifestPath;
 }
 
+function attemptFor(candidate: StageRecordV21): StageAttemptV21 {
+  return {
+    attempt_id: `${candidate.stage_key}-a2`,
+    stage_key: candidate.stage_key,
+    stage: candidate.stage,
+    chapter_id: candidate.chapter_id,
+    template: candidate.template,
+    expected_artifact_type: candidate.artifact_type,
+    expected_scenario_snapshot_sha256: 'scenario-v1',
+    case_id: candidate.case_id,
+    input_sha256: candidate.input_sha256,
+    parent_record_ids: [...candidate.parent_record_ids],
+    template_identity: candidate.template_identity,
+    runner_token_sha256: null,
+    runner_credential_path: null,
+    outcome: 'running',
+    input_path: candidate.input_path,
+    raw_artifact_path: null,
+    validation_report_path: null,
+    started_at: '2026-01-02T00:00:00.000Z',
+    updated_at: '2026-01-02T00:00:00.000Z',
+    detail: null,
+  };
+}
+
 describe('replacement Manifest CAS integration', () => {
   it('reuses the same pending replacement and attempt after restart', () => {
     const old = record('outline-v1', 'outline');
-    const path = manifestPathWith([old]);
+    const candidate = {
+      ...record('outline-v2', 'outline'),
+      input_sha256: 'outline-v2-input',
+    };
+    const attempt = attemptFor(candidate);
+    const path = manifestPathWith([old], [attempt]);
     const input = {
       stage_key: 'outline',
       old_record_id: old.record_id,
@@ -114,7 +161,7 @@ describe('replacement Manifest CAS integration', () => {
     const bound = persistReplacementAttempt(
       path,
       replacement.replacement_id,
-      'outline-a2',
+      attempt.attempt_id,
     );
     const restartRevision = bound.revision;
 
@@ -122,13 +169,13 @@ describe('replacement Manifest CAS integration', () => {
     const resumed = persistReplacementAttempt(
       path,
       replacement.replacement_id,
-      'outline-a2',
+      attempt.attempt_id,
     );
 
     expect(resumedPending.replacements[0]!.replacement_id).toBe(
       replacement.replacement_id,
     );
-    expect(resumed.replacements[0]!.attempt_id).toBe('outline-a2');
+    expect(resumed.replacements[0]!.attempt_id).toBe(attempt.attempt_id);
     expect(resumed.replacements).toHaveLength(1);
     expect(resumed.revision).toBe(restartRevision);
   });
@@ -165,7 +212,8 @@ describe('replacement Manifest CAS integration', () => {
       ...record('outline-v2', 'outline'),
       input_sha256: 'outline-v2-input',
     };
-    const path = manifestPathWith([old, child]);
+    const attempt = attemptFor(candidate);
+    const path = manifestPathWith([old, child], [attempt]);
     const pending = persistPendingReplacement(path, {
       stage_key: 'outline',
       old_record_id: old.record_id,
@@ -175,11 +223,11 @@ describe('replacement Manifest CAS integration', () => {
       reason: 'input changed',
     });
     const replacementId = pending.replacements[0]!.replacement_id;
-    persistReplacementAttempt(path, replacementId, 'outline-a2');
+    persistReplacementAttempt(path, replacementId, attempt.attempt_id);
     const prepared = persistReplacementCandidate(
       path,
       replacementId,
-      'outline-a2',
+      attempt.attempt_id,
       candidate,
     );
     const beforeCommitRevision = prepared.revision;
@@ -206,7 +254,8 @@ describe('replacement Manifest CAS integration', () => {
       ...record('outline-v2', 'outline'),
       input_sha256: 'outline-v2-input',
     };
-    const path = manifestPathWith([old]);
+    const attempt = attemptFor(candidate);
+    const path = manifestPathWith([old], [attempt]);
     const pending = persistPendingReplacement(path, {
       stage_key: 'outline',
       old_record_id: old.record_id,
@@ -216,11 +265,11 @@ describe('replacement Manifest CAS integration', () => {
       reason: 'input changed',
     });
     const replacementId = pending.replacements[0]!.replacement_id;
-    persistReplacementAttempt(path, replacementId, 'outline-a2');
+    persistReplacementAttempt(path, replacementId, attempt.attempt_id);
     const prepared = persistReplacementCandidate(
       path,
       replacementId,
-      'outline-a2',
+      attempt.attempt_id,
       candidate,
     );
     saveManifestCas(path, prepared.revision, (manifest) => {
@@ -249,6 +298,77 @@ describe('replacement Manifest CAS integration', () => {
 
     const saved = loadManifest(path);
     expect(saved.replacements[0]!.status).toBe('cancelled');
+    expect(saved.stages).toEqual([old]);
+    expect(saved.invalidations).toEqual([]);
+  });
+
+  it('terminalizes the bound Attempt before deleting credentials on CAS conflict', () => {
+    const old = record('outline-v1', 'outline');
+    const candidate = {
+      ...record('outline-v2', 'outline'),
+      input_sha256: 'outline-v2-input',
+    };
+    const attempt = attemptFor(candidate);
+    const path = manifestPathWith([old], [attempt], true);
+    const credentialPath = join(
+      path,
+      '..',
+      attempt.runner_credential_path!,
+    );
+    expect(existsSync(credentialPath)).toBe(true);
+    const pending = persistPendingReplacement(path, {
+      stage_key: 'outline',
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      reason: 'input changed',
+    });
+    const replacementId = pending.replacements[0]!.replacement_id;
+    persistReplacementAttempt(path, replacementId, attempt.attempt_id);
+    const prepared = persistReplacementCandidate(
+      path,
+      replacementId,
+      attempt.attempt_id,
+      candidate,
+    );
+    saveManifestCas(path, prepared.revision, (manifest) => {
+      appendManifestEvent(manifest, {
+        at: '2026-01-02T03:00:00.000Z',
+        type: 'concurrent_audit',
+        stage_key: 'manifest',
+        attempt_id: null,
+        before_outcome: null,
+        after_outcome: null,
+        case_id: null,
+        artifact_id: null,
+        artifact_version: null,
+        version_id: null,
+        record_id: null,
+        reason: 'concurrent writer',
+        actor: 'story-pipeline',
+      });
+    });
+
+    expect(() => persistReplacementCommit(
+      path,
+      replacementId,
+      prepared.revision,
+    )).toThrow('manifest revision conflict');
+
+    const saved = loadManifest(path);
+    const savedAttempt = saved.attempts[0]!;
+    expect(saved.replacements[0]!.status).toBe('cancelled');
+    expect(savedAttempt.outcome).toBe('failed');
+    expect(savedAttempt.detail).toBe('replacement commit precondition failed');
+    expect(savedAttempt.runner_credential_path).toBeNull();
+    expect(saved.events).toContainEqual(expect.objectContaining({
+      type: 'stage_failed',
+      attempt_id: attempt.attempt_id,
+      before_outcome: 'running',
+      after_outcome: 'failed',
+    }));
+    expect(existsSync(credentialPath)).toBe(false);
     expect(saved.stages).toEqual([old]);
     expect(saved.invalidations).toEqual([]);
   });

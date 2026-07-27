@@ -388,6 +388,46 @@ export function validateManifestChain(manifest: PipelineManifestV21): void {
         );
       }
     }
+    const attempt = replacement.attempt_id === null
+      ? null
+      : manifest.attempts.find(
+          (item) => item.attempt_id === replacement.attempt_id,
+        );
+    if (replacement.attempt_id !== null && !attempt) {
+      throw new Error('replacement attempt is missing');
+    }
+    if (
+      attempt
+      && (
+        attempt.stage_key !== replacement.stage_key
+        || attempt.input_sha256 !== replacement.expected_input_sha256
+        || canonicalJson(attempt.template_identity)
+          !== canonicalJson(replacement.expected_template_identity)
+        || canonicalJson(attempt.parent_record_ids)
+          !== canonicalJson(replacement.expected_parent_record_ids)
+      )
+    ) {
+      throw new Error('replacement Attempt identity does not match');
+    }
+    if (
+      attempt
+      && candidate
+      && (
+        candidate.case_id !== attempt.case_id
+        || candidate.stage_key !== attempt.stage_key
+        || candidate.stage !== attempt.stage
+        || candidate.chapter_id !== attempt.chapter_id
+        || candidate.template !== attempt.template
+        || candidate.input_sha256 !== attempt.input_sha256
+        || canonicalJson(candidate.template_identity)
+          !== canonicalJson(attempt.template_identity)
+        || canonicalJson(candidate.parent_record_ids)
+          !== canonicalJson(attempt.parent_record_ids)
+        || candidate.artifact_type !== attempt.expected_artifact_type
+      )
+    ) {
+      throw new Error('replacement candidate does not match its Attempt');
+    }
     if (replacement.status === 'pending') {
       if (pendingReplacementStages.has(replacement.stage_key)) {
         throw new Error(
@@ -425,6 +465,22 @@ export function validateManifestChain(manifest: PipelineManifestV21): void {
       )) {
         throw new Error('committed replacement descendant is still active');
       }
+      if (
+        attempt?.outcome !== 'delivered'
+        || attempt.runner_credential_path !== null
+        || attempt.raw_artifact_path !== candidate.raw_artifact_path
+        || attempt.validation_report_path
+          !== candidate.validation_report_path
+      ) {
+        throw new Error('committed replacement Attempt is inconsistent');
+      }
+    }
+    if (
+      replacement.status === 'cancelled'
+      && attempt
+      && !['failed', 'validation_failed'].includes(attempt.outcome)
+    ) {
+      throw new Error('cancelled replacement Attempt is not terminal');
     }
   }
 

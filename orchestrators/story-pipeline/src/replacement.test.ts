@@ -1,3 +1,5 @@
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   activeForConsumption,
@@ -11,6 +13,7 @@ import {
 import type {
   PipelineManifestV21,
   StageRecordV21,
+  StageAttemptV21,
   TemplateIdentity,
 } from './manifest.js';
 
@@ -77,6 +80,50 @@ function manifestWithStages(stages: StageRecordV21[]): PipelineManifestV21 {
   };
 }
 
+function attemptFor(
+  candidate: StageRecordV21,
+  attemptId = `${candidate.stage_key}-a2`,
+): StageAttemptV21 {
+  return {
+    attempt_id: attemptId,
+    stage_key: candidate.stage_key,
+    stage: candidate.stage,
+    chapter_id: candidate.chapter_id,
+    template: candidate.template,
+    expected_artifact_type: candidate.artifact_type,
+    expected_scenario_snapshot_sha256: 'scenario-v1',
+    case_id: candidate.case_id,
+    input_sha256: candidate.input_sha256,
+    parent_record_ids: [...candidate.parent_record_ids],
+    template_identity: candidate.template_identity,
+    runner_token_sha256: null,
+    runner_credential_path: null,
+    outcome: 'running',
+    input_path: candidate.input_path,
+    raw_artifact_path: null,
+    validation_report_path: null,
+    started_at: '2026-01-02T00:00:00.000Z',
+    updated_at: '2026-01-02T00:00:00.000Z',
+    detail: null,
+  };
+}
+
+describe('tracked replacement dependencies', () => {
+  it('tracks every local source module required by a clean checkout', () => {
+    const result = spawnSync('git', [
+      'ls-files',
+      '--error-unmatch',
+      'orchestrators/story-pipeline/src/invalidation.ts',
+    ], {
+      cwd: resolve(import.meta.dirname, '..', '..', '..'),
+      encoding: 'utf8',
+      shell: false,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+  });
+});
+
 describe('two-phase replacement state machine', () => {
   it('keeps old evidence valid while pending but blocks it from new consumption', () => {
     const old = stageRecord('outline-v1', 'outline');
@@ -103,6 +150,8 @@ describe('two-phase replacement state machine', () => {
     const child = stageRecord('packet-v1', 'packet', [old.record_id]);
     const candidate = stageRecord('outline-v2', 'outline');
     const manifest = manifestWithStages([old, child]);
+    const attempt = attemptFor(candidate);
+    manifest.attempts.push(attempt);
     const replacement = beginReplacement(manifest, {
       stage_key: 'outline',
       old_record_id: old.record_id,
@@ -112,7 +161,7 @@ describe('two-phase replacement state machine', () => {
       reason: 'input changed',
       at: '2026-01-02T00:00:00.000Z',
     });
-    replacement.attempt_id = 'outline-a2';
+    replacement.attempt_id = attempt.attempt_id;
     replacement.candidate_record = candidate;
 
     commitReplacement(
@@ -212,6 +261,7 @@ describe('two-phase replacement state machine', () => {
     const old = stageRecord('outline-v1', 'outline');
     const candidate = stageRecord('outline-v2', 'outline');
     const manifest = manifestWithStages([old]);
+    manifest.attempts.push(attemptFor(candidate));
     const replacement = beginReplacement(manifest, {
       stage_key: 'outline',
       old_record_id: old.record_id,
@@ -273,6 +323,7 @@ describe('two-phase replacement state machine', () => {
     const old = stageRecord('outline-v1', 'outline');
     const candidate = stageRecord('outline-v2', 'outline');
     const manifest = manifestWithStages([old]);
+    manifest.attempts.push(attemptFor(candidate));
     const replacement = beginReplacement(manifest, {
       stage_key: 'outline',
       old_record_id: old.record_id,
@@ -314,5 +365,126 @@ describe('two-phase replacement state machine', () => {
     const cancelledEventCount = otherManifest.events.length;
     cancelReplacement(otherManifest, cancelled.replacement_id, 'stopped');
     expect(otherManifest.events).toHaveLength(cancelledEventCount);
+  });
+
+  it('rejects a candidate from a different Case than the bound Attempt without mutation', () => {
+    const old = stageRecord('outline-v1', 'outline');
+    const candidate = stageRecord('outline-v2', 'outline');
+    const manifest = manifestWithStages([old]);
+    const attempt = {
+      ...attemptFor(candidate),
+      case_id: 'case-A',
+    };
+    manifest.attempts.push(attempt);
+    const replacement = beginReplacement(manifest, {
+      stage_key: 'outline',
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      reason: 'input changed',
+    });
+    bindReplacementAttempt(
+      manifest,
+      replacement.replacement_id,
+      attempt.attempt_id,
+    );
+    const before = structuredClone(manifest);
+
+    expect(() => prepareReplacementCandidate(
+      manifest,
+      replacement.replacement_id,
+      attempt.attempt_id,
+      candidate,
+    )).toThrow('candidate Case does not match replacement Attempt');
+    expect(manifest).toEqual(before);
+  });
+
+  it.each([
+    {
+      name: 'input',
+      corrupt: (attempt: StageAttemptV21) => {
+        attempt.input_sha256 = 'wrong-input';
+      },
+    },
+    {
+      name: 'template',
+      corrupt: (attempt: StageAttemptV21) => {
+        attempt.template_identity = {
+          ...attempt.template_identity,
+          content_sha256: 'wrong-template',
+        };
+      },
+    },
+    {
+      name: 'ordered parents',
+      corrupt: (attempt: StageAttemptV21) => {
+        attempt.parent_record_ids = ['wrong-parent'];
+      },
+    },
+  ])('rejects bound Attempt $name mismatch without mutation', ({ corrupt }) => {
+    const parent = stageRecord('source-v1', 'source');
+    const old = stageRecord('outline-v1', 'outline', [parent.record_id]);
+    const candidate = stageRecord(
+      'outline-v2',
+      'outline',
+      [parent.record_id],
+    );
+    const manifest = manifestWithStages([parent, old]);
+    const attempt = attemptFor(candidate);
+    corrupt(attempt);
+    manifest.attempts.push(attempt);
+    const replacement = beginReplacement(manifest, {
+      stage_key: 'outline',
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: candidate.parent_record_ids,
+      reason: 'identity changed',
+    });
+    bindReplacementAttempt(
+      manifest,
+      replacement.replacement_id,
+      attempt.attempt_id,
+    );
+    const before = structuredClone(manifest);
+
+    expect(() => prepareReplacementCandidate(
+      manifest,
+      replacement.replacement_id,
+      attempt.attempt_id,
+      candidate,
+    )).toThrow('replacement Attempt identity does not match');
+    expect(manifest).toEqual(before);
+  });
+
+  it('revalidates the Attempt identity at commit without mutation', () => {
+    const old = stageRecord('outline-v1', 'outline');
+    const candidate = stageRecord('outline-v2', 'outline');
+    const manifest = manifestWithStages([old]);
+    const attempt = attemptFor(candidate);
+    manifest.attempts.push(attempt);
+    const replacement = beginReplacement(manifest, {
+      stage_key: 'outline',
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      reason: 'input changed',
+    });
+    bindReplacementAttempt(
+      manifest,
+      replacement.replacement_id,
+      attempt.attempt_id,
+    );
+    replacement.candidate_record = candidate;
+    attempt.case_id = 'corrupt-case';
+    const before = structuredClone(manifest);
+
+    expect(() => commitReplacement(
+      manifest,
+      replacement.replacement_id,
+    )).toThrow('candidate Case does not match replacement Attempt');
+    expect(manifest).toEqual(before);
   });
 });
