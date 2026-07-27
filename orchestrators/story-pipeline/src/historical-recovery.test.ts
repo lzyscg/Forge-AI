@@ -8,9 +8,15 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { ForgeCaseSnapshot } from './forge-client.js';
+import type {
+  CreateCaseRequest,
+  ForgeCaseSnapshot,
+  ForgeClient,
+  RunCaseRequest,
+} from './forge-client.js';
 import {
   appendManifestEvent,
+  loadManifest,
   type PipelineManifestV21,
   type StageAttemptV21,
   type StageRecordV21,
@@ -18,6 +24,7 @@ import {
 import { sha256 } from './hash.js';
 import { recoverLegacyHistory } from './historical-recovery.js';
 import type { ValidationResult } from './quality.js';
+import { historicalRecoveryAttempt, reconcileRun } from './index.js';
 
 const roots: string[] = [];
 
@@ -172,9 +179,11 @@ function fixture() {
   const inputs = [
     ['inputs/outline.json', outlineInput],
     ['inputs/packet.json', packetInput],
+    ['inputs/packet-failed.json', {}],
     ['inputs/draft-a4.json', draftInput],
     ['inputs/draft-a5.json', draftInput],
     ['inputs/draft-a6.json', draftInput],
+    ['inputs/draft-a2.json', draftInput],
   ] as const;
   for (const [relativePath, input] of inputs) {
     const path = join(runDir, relativePath);
@@ -192,9 +201,18 @@ function fixture() {
     'packet-a1', 'packet-b001', 'case-packet', packetInputSha,
     'inputs/packet.json', 'packet-template', 'delivered',
   );
+  const failedPacketAttempt = attempt(
+    'packet-a0', 'packet-b001', 'case-packet-failed',
+    sha256(JSON.stringify({})), 'inputs/packet-failed.json',
+    'packet-template-old', 'validation_failed',
+  );
   const draftA4 = attempt(
     'draft-a4', 'draft-b001', 'case-draft-a4', draftInputSha,
     'inputs/draft-a4.json', 'draft-template-a4', 'running',
+  );
+  const draftA2 = attempt(
+    'draft-a2', 'draft-b001', 'case-draft-a2', draftInputSha,
+    'inputs/draft-a2.json', 'draft-template-a2', 'blocked',
   );
   const draftA5 = attempt(
     'draft-a5', 'draft-b001', 'case-draft-a5', draftInputSha,
@@ -255,7 +273,15 @@ function fixture() {
     boundary_map_sha256: 'boundaries',
     created_at: '2026-07-26T00:00:00.000Z',
     updated_at: '2026-07-26T00:00:00.000Z',
-    attempts: [outlineAttempt, packetAttempt, draftA4, draftA5, draftA6],
+    attempts: [
+      outlineAttempt,
+      failedPacketAttempt,
+      packetAttempt,
+      draftA2,
+      draftA4,
+      draftA5,
+      draftA6,
+    ],
     stages: [outlineRecord, packetRecord],
     invalidations: [
       {
@@ -301,6 +327,10 @@ function fixture() {
     [outlineAttempt.case_id, snapshot(outlineAttempt, outlineContent)],
     [packetAttempt.case_id, snapshot(packetAttempt, packetContent)],
     [draftA4.case_id, snapshot(draftA4, draftContent)],
+    [draftA2.case_id, {
+      ...snapshot(draftA2, null, 'stopped'),
+      status: 'waiting_human',
+    }],
     [draftA5.case_id, snapshot(draftA5, draftContent)],
     [draftA6.case_id, snapshot(draftA6, null, 'stopped')],
   ]);
@@ -332,6 +362,18 @@ function fixture() {
 }
 
 describe('append-only historical recovery', () => {
+  it('selects the Attempt bound to the delivered historical Stage Record', () => {
+    const state = fixture();
+
+    expect(historicalRecoveryAttempt(
+      {
+        chapters: [{ id: 'B001' }],
+      } as never,
+      state.manifest,
+      'packet-b001',
+    ).attempt_id).toBe('packet-a1');
+  });
+
   it('dry-runs reinstatement and reports approved candidate ambiguity without writes', () => {
     const state = fixture();
     const before = JSON.stringify(state.manifest);
@@ -355,6 +397,7 @@ describe('append-only historical recovery', () => {
       'attestation_required',
       'reinstate',
       'reinstate',
+      'close',
       'close',
       'ambiguous',
     ]);
@@ -457,5 +500,87 @@ describe('append-only historical recovery', () => {
       },
     })).toThrow('legacy Case input evidence does not match');
     expect(JSON.stringify(state.manifest)).toBe(before);
+  });
+
+  it('reconcileRun commits the attested recovery once without creating or running a Case', async () => {
+    const state = fixture();
+    const config = {
+      run_id: state.manifest.run_id,
+      story_id: state.manifest.story_id,
+      title: state.manifest.title,
+      mode: 'imitation',
+      source_file: 'source.md',
+      requirements: 'fixture',
+      chapters: [{ id: 'B001', label: 'B001' }],
+    };
+    const configText = `${JSON.stringify(config, null, 2)}\n`;
+    const configPath = join(state.runDir, 'config.json');
+    writeFileSync(configPath, configText, 'utf8');
+    state.manifest.config_sha256 = sha256(configText);
+    writeFileSync(
+      join(state.runDir, 'manifest.json'),
+      `${JSON.stringify(state.manifest, null, 2)}\n`,
+      'utf8',
+    );
+    let mutations = 0;
+    const forge: ForgeClient = {
+      createCase: async (_request: CreateCaseRequest) => {
+        mutations += 1;
+        throw new Error('createCase must not be called');
+      },
+      runCase: async (_caseId: string, _request: RunCaseRequest) => {
+        mutations += 1;
+        throw new Error('runCase must not be called');
+      },
+      getCaseStatus: async (caseId: string) => {
+        const found = state.snapshots.get(caseId);
+        if (!found) throw new Error(`missing fixture Case ${caseId}`);
+        return structuredClone(found);
+      },
+      abortCase: async () => {
+        mutations += 1;
+        throw new Error('abortCase must not be called');
+      },
+    };
+    const options = {
+      command: 'reconcile' as const,
+      configPath,
+      runDir: state.runDir,
+      dbPath: join(state.runDir, 'forge.db'),
+      dryRun: false,
+      adoptCase: 'case-draft-a5',
+      attestTemplateCompatibility: true,
+      attestLegacyCaseBindings: ['case-draft-a5:draft-b001'],
+      attestationReason:
+        'operator compared immutable DB input and file evidence',
+    };
+    const validators = {
+      outline: state.validate,
+      'packet-b001': state.validate,
+      'draft-b001': state.validate,
+    };
+
+    const first = await reconcileRun(
+      options,
+      forge,
+      new AbortController().signal,
+      validators,
+    );
+    const afterFirst = loadManifest(join(state.runDir, 'manifest.json'));
+    const second = await reconcileRun(
+      options,
+      forge,
+      new AbortController().signal,
+      validators,
+    );
+    const afterSecond = loadManifest(join(state.runDir, 'manifest.json'));
+
+    expect(first.next_stage).toBe('ledger-b001');
+    expect(first.actions.length).toBeGreaterThan(0);
+    expect(afterFirst.revision).toBe(1);
+    expect(second.actions).toEqual([]);
+    expect(second.next_stage).toBe('ledger-b001');
+    expect(afterSecond.revision).toBe(1);
+    expect(mutations).toBe(0);
   });
 });

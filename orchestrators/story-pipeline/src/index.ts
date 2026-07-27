@@ -67,6 +67,10 @@ import {
   compareTemplateIdentity,
   identifyTemplateDirectory,
 } from './template-hash.js';
+import {
+  recoverLegacyHistory,
+  type HistoricalRecoveryAction,
+} from './historical-recovery.js';
 
 type PipelineMode = 'imitation';
 type PiMode = 'fake' | 'real';
@@ -117,7 +121,9 @@ export interface ReconcileOptions {
 }
 
 export interface ReconcileRunResult {
-  actions: ReconciliationAction[];
+  actions: Array<ReconciliationAction | HistoricalRecoveryAction>;
+  ambiguous: Array<{ stage_key: string; candidates: string[] }>;
+  next_stage: string | null;
 }
 
 type CliOptions = RunOptions | InvalidateOptions | ReconcileOptions;
@@ -1601,6 +1607,96 @@ export function recoveryValidatorFromEvidence(
   throw new Error(`no recovery validator for stage ${attempt.stage}`);
 }
 
+export function historicalRecoveryAttempt(
+  config: PipelineConfig,
+  manifest: PipelineManifest,
+  stageKey: string,
+): StageAttempt {
+  const deliveredRecord = manifest.stages.find(
+    (record) => record.stage_key === stageKey,
+  );
+  const historical = deliveredRecord
+    ? manifest.attempts.find((attempt) =>
+        attempt.stage_key === stageKey
+        && attempt.case_id === deliveredRecord.case_id
+        && attempt.input_sha256 === deliveredRecord.input_sha256
+      )
+    : [...manifest.attempts].reverse().find((attempt) =>
+        attempt.stage_key === stageKey
+        && ['running', 'interrupted', 'blocked'].includes(attempt.outcome)
+      );
+  if (!historical) {
+    throw new Error(`historical recovery Attempt is missing: ${stageKey}`);
+  }
+  if (stageKey === 'outline') {
+    return {
+      ...historical,
+      stage: 'outline',
+      chapter_id: null,
+      template: 'zhihu-story-outline',
+      expected_artifact_type: 'blueprint_bundle',
+      parent_record_ids: [],
+    };
+  }
+  for (const chapter of config.chapters) {
+    const chapterKey = chapter.id.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+    if (stageKey === `packet-${chapterKey}`) {
+      const outline = manifest.stages.find(
+        (record) => record.stage_key === 'outline',
+      );
+      if (!outline) throw new Error('historical outline evidence is missing');
+      return {
+        ...historical,
+        stage: 'chapter_packet',
+        chapter_id: chapter.id,
+        template: 'zhihu-chapter-packet',
+        expected_artifact_type: 'chapter_packet',
+        parent_record_ids: [outline.record_id],
+      };
+    }
+    if (stageKey === `draft-${chapterKey}`) {
+      const packet = manifest.stages.find(
+        (record) => record.stage_key === `packet-${chapterKey}`,
+      );
+      if (!packet) throw new Error('historical packet evidence is missing');
+      return {
+        ...historical,
+        stage: 'chapter_draft',
+        chapter_id: chapter.id,
+        template: 'zhihu-chapter-draft',
+        expected_artifact_type: 'chapter_draft',
+        parent_record_ids: [packet.record_id],
+      };
+    }
+  }
+  throw new Error(`unsupported historical recovery stage: ${stageKey}`);
+}
+
+function historicalRecoveryValidators(
+  config: PipelineConfig,
+  manifest: PipelineManifest,
+  runDir: string,
+  provided: Record<string, (rawContent: string) => ValidationResult>,
+): Record<string, (rawContent: string) => ValidationResult> {
+  const result = { ...provided };
+  const stageKeys = [
+    'outline',
+    ...config.chapters.flatMap((chapter) => {
+      const key = chapter.id.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+      return [`packet-${key}`, `draft-${key}`];
+    }),
+  ];
+  for (const stageKey of stageKeys) {
+    result[stageKey] ??= recoveryValidatorFromEvidence(
+      config,
+      manifest,
+      historicalRecoveryAttempt(config, manifest, stageKey),
+      runDir,
+    );
+  }
+  return result;
+}
+
 export async function reconcileRun(
   options: ReconcileOptions,
   forgeClient: ForgeClient,
@@ -1624,6 +1720,93 @@ export async function reconcileRun(
   }
   if (!options.dryRun) {
     cleanupTerminalReplacementCredentials(manifestPath, initialManifest);
+  }
+  const invalidatedRecordIds = new Set(
+    initialManifest.invalidations.map((item) => item.record_id),
+  );
+  const pendingLegacyReinstatement = initialManifest.stages.some((record) =>
+    invalidatedRecordIds.has(record.record_id)
+    && record.template_identity.algorithm === 'legacy-unversioned-v1'
+    && !initialManifest.reinstatements.some(
+      (item) => item.old_record_id === record.record_id,
+    )
+  );
+  if (
+    pendingLegacyReinstatement
+    || initialManifest.reinstatements.length > 0
+  ) {
+    const caseIds = new Set<string>();
+    if (pendingLegacyReinstatement) {
+      for (const record of initialManifest.stages) {
+        if (invalidatedRecordIds.has(record.record_id)) {
+          caseIds.add(record.case_id);
+        }
+      }
+      for (const attempt of initialManifest.attempts) {
+        if (['running', 'interrupted', 'blocked'].includes(attempt.outcome)) {
+          caseIds.add(attempt.case_id);
+        }
+      }
+    }
+    const snapshots = new Map<string, ForgeCaseSnapshot>();
+    for (const caseId of caseIds) {
+      snapshots.set(
+        caseId,
+        await forgeClient.getCaseStatus(caseId, options.dbPath),
+      );
+    }
+    const historical = recoverLegacyHistory({
+      run_dir: options.runDir,
+      manifest: initialManifest,
+      chapter_ids: config.chapters.map((chapter) => chapter.id),
+      snapshots,
+      apply: !options.dryRun,
+      adopt_case: options.adoptCase,
+      attest_template_compatibility:
+        options.attestTemplateCompatibility,
+      legacy_case_bindings: options.attestLegacyCaseBindings,
+      attestation_reason: options.attestationReason,
+      validators: pendingLegacyReinstatement
+        ? historicalRecoveryValidators(
+            config,
+            initialManifest,
+            options.runDir,
+            validators,
+          )
+        : validators,
+    });
+    if (historical.applicable) {
+      if (!options.dryRun && historical.ambiguous.length > 0) {
+        const conflict = historical.ambiguous[0]!;
+        throw new Error(
+          `stage ${conflict.stage_key} is ambiguous: `
+          + conflict.candidates.join(', '),
+        );
+      }
+      if (
+        !options.dryRun
+        && historical.manifest.events.length
+          > initialManifest.events.length
+      ) {
+        const intended = structuredClone(historical.manifest);
+        initialManifest = saveManifestCas(
+          manifestPath,
+          initialManifest.revision,
+          (latest) => {
+            const revision = latest.revision;
+            const previousManifestHash = latest.previous_manifest_sha256;
+            Object.assign(latest, intended);
+            latest.revision = revision;
+            latest.previous_manifest_sha256 = previousManifestHash;
+          },
+        );
+      }
+      return {
+        actions: historical.actions,
+        ambiguous: historical.ambiguous,
+        next_stage: historical.next_stage,
+      };
+    }
   }
   if (
     !options.dryRun
@@ -1951,7 +2134,21 @@ export async function reconcileRun(
       stageLock?.release();
     }
   }
-  return { actions };
+  return {
+    actions,
+    ambiguous: actions
+      .filter(
+        (action): action is Extract<
+          ReconciliationAction,
+          { action: 'ambiguous' }
+        > => action.action === 'ambiguous',
+      )
+      .map((action) => ({
+        stage_key: action.stage_key,
+        candidates: action.candidates,
+      })),
+    next_stage: null,
+  };
 }
 
 async function runReconcile(
@@ -1964,6 +2161,8 @@ async function runReconcile(
     success: true,
     dry_run: options.dryRun,
     actions: result.actions,
+    ambiguous: result.ambiguous,
+    next_stage: result.next_stage,
   })}\n`);
 }
 

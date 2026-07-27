@@ -603,6 +603,13 @@ export function recoverLegacyHistory(
       );
       recoveryInput(options.run_dir, candidate);
       draftApproved.push(candidate);
+    } else if (candidate.stage_key === draftStageKey) {
+      closeActions.push({
+        action: 'close',
+        attempt_id: candidate.attempt_id,
+        outcome: 'interrupted',
+        reason: `Forge case is not an approved historical recovery candidate: ${snapshot.status}`,
+      });
     }
   }
   actions.push(...closeActions);
@@ -653,7 +660,9 @@ export function recoverLegacyHistory(
     candidate.detail = action.reason;
     appendManifestEvent(working, {
       at: now,
-      type: 'stage_failed',
+      type: action.outcome === 'failed'
+        ? 'stage_failed'
+        : 'stage_interrupted',
       stage_key: candidate.stage_key,
       attempt_id: candidate.attempt_id,
       before_outcome: before,
