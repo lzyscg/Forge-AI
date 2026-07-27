@@ -4,6 +4,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -15,6 +16,7 @@ import {
 } from 'node:fs';
 import { hostname as operatingSystemHostname } from 'node:os';
 import {
+  basename,
   dirname,
   isAbsolute,
   join,
@@ -34,6 +36,23 @@ export interface ProcessInspector {
   inspect(pid: number): ProcessIdentity | null;
 }
 
+export interface StageLockFileStat {
+  isSymbolicLink(): boolean;
+}
+
+export interface StageLockFsOps {
+  exists(path: string): boolean;
+  lstat(path: string): StageLockFileStat;
+  mkdir(path: string): void;
+  readFile(path: string): Buffer;
+  realpath(path: string): string;
+  rename(from: string, to: string): void;
+  remove(path: string): void;
+  writeFile(path: string, content: string): void;
+  fsyncFile(path: string): void;
+  link(existingPath: string, newPath: string): void;
+}
+
 export interface AcquireStageLockOptions {
   run_dir: string;
   run_id: string;
@@ -42,6 +61,7 @@ export interface AcquireStageLockOptions {
   nonce?: string;
   hostname?: string;
   process_inspector?: ProcessInspector;
+  fs_ops?: Partial<StageLockFsOps>;
 }
 
 export interface StageLock {
@@ -57,6 +77,35 @@ interface StageLockPayload {
   owner_token_sha256: string;
 }
 
+const defaultFsOps: StageLockFsOps = {
+  exists: existsSync,
+  lstat: lstatSync,
+  mkdir: (path) => mkdirSync(path),
+  readFile: readFileSync,
+  realpath: realpathSync,
+  rename: renameSync,
+  remove: (path) => rmSync(path),
+  writeFile: (path, content) => writeFileSync(path, content, {
+    encoding: 'utf8',
+    flag: 'wx',
+    mode: 0o600,
+  }),
+  fsyncFile: (path) => {
+    const descriptor = openSync(path, 'r+');
+    try {
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+  },
+  link: linkSync,
+};
+
+function waitBriefly(): void {
+  const state = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(state, 0, 0, 5);
+}
+
 function ensureLexicallyInside(runDirectory: string, target: string): void {
   const pathFromRun = relative(runDirectory, target);
   if (
@@ -68,10 +117,14 @@ function ensureLexicallyInside(runDirectory: string, target: string): void {
   }
 }
 
-function ensureSafeExistingPath(runDirectory: string, target: string): void {
+function ensureSafeExistingPath(
+  runDirectory: string,
+  target: string,
+  fsOps: StageLockFsOps,
+): void {
   ensureLexicallyInside(runDirectory, target);
-  const canonicalRun = realpathSync(runDirectory);
-  const canonicalTarget = realpathSync(target);
+  const canonicalRun = fsOps.realpath(runDirectory);
+  const canonicalTarget = fsOps.realpath(target);
   const pathFromRun = relative(canonicalRun, canonicalTarget);
   if (
     pathFromRun === '..'
@@ -80,45 +133,62 @@ function ensureSafeExistingPath(runDirectory: string, target: string): void {
   ) {
     throw new Error('stage lock path resolves outside the run directory');
   }
-  if (lstatSync(target).isSymbolicLink()) {
+  if (fsOps.lstat(target).isSymbolicLink()) {
     throw new Error('stage lock path contains a symbolic link or reparse point');
   }
 }
 
-function ensureSafeDirectory(runDirectory: string, target: string): void {
-  ensureSafeExistingPath(runDirectory, runDirectory);
+function ensureSafeDirectory(
+  runDirectory: string,
+  target: string,
+  fsOps: StageLockFsOps,
+): void {
+  ensureSafeExistingPath(runDirectory, runDirectory, fsOps);
   ensureLexicallyInside(runDirectory, target);
   const pathFromRun = relative(runDirectory, target);
   let current = runDirectory;
   for (const component of pathFromRun.split(/[\\/]/).filter(Boolean)) {
     current = join(current, component);
-    if (!existsSync(current)) mkdirSync(current);
-    ensureSafeExistingPath(runDirectory, current);
+    if (!fsOps.exists(current)) {
+      try {
+        fsOps.mkdir(current);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    }
+    ensureSafeExistingPath(runDirectory, current, fsOps);
   }
 }
 
-function ensureSafeLeafPath(runDirectory: string, target: string): void {
+function ensureSafeLeafPath(
+  runDirectory: string,
+  target: string,
+  fsOps: StageLockFsOps,
+): void {
   ensureLexicallyInside(runDirectory, target);
-  ensureSafeExistingPath(runDirectory, dirname(target));
-  if (existsSync(target)) ensureSafeExistingPath(runDirectory, target);
-}
-
-function writeExclusiveJson(path: string, value: unknown): void {
-  const descriptor = openSync(path, 'wx', 0o600);
-  try {
-    writeFileSync(
-      descriptor,
-      `${JSON.stringify(value, null, 2)}\n`,
-      'utf8',
-    );
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
+  ensureSafeExistingPath(runDirectory, dirname(target), fsOps);
+  if (fsOps.exists(target)) {
+    ensureSafeExistingPath(runDirectory, target, fsOps);
   }
 }
 
-function readLock(path: string): StageLockPayload {
-  const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<StageLockPayload>;
+function payloadMatches(
+  left: StageLockPayload,
+  right: StageLockPayload,
+): boolean {
+  return left.pid === right.pid
+    && left.process_started_at === right.process_started_at
+    && left.nonce === right.nonce
+    && left.owner_token_sha256 === right.owner_token_sha256;
+}
+
+function readLock(
+  path: string,
+  fsOps: StageLockFsOps,
+): StageLockPayload {
+  const parsed = JSON.parse(
+    fsOps.readFile(path).toString('utf8'),
+  ) as Partial<StageLockPayload>;
   if (
     !Number.isInteger(parsed.pid)
     || typeof parsed.process_started_at !== 'string'
@@ -131,6 +201,78 @@ function readLock(path: string): StageLockPayload {
   return parsed as StageLockPayload;
 }
 
+function removeWithRetry(path: string, fsOps: StageLockFsOps): void {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      fsOps.remove(path);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      lastError = error;
+      if (attempt < 2) waitBriefly();
+    }
+  }
+  throw lastError;
+}
+
+function removeOwnedPublishedPath(
+  path: string,
+  payload: StageLockPayload,
+  fsOps: StageLockFsOps,
+): void {
+  let current: StageLockPayload;
+  try {
+    current = readLock(path, fsOps);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (payloadMatches(current, payload)) removeWithRetry(path, fsOps);
+}
+
+function publishExclusiveJson(
+  runDirectory: string,
+  finalPath: string,
+  payload: StageLockPayload,
+  fsOps: StageLockFsOps,
+): void {
+  const temporaryPath = join(
+    dirname(finalPath),
+    `.${basename(finalPath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  ensureSafeLeafPath(runDirectory, temporaryPath, fsOps);
+  let published = false;
+  let primaryError: unknown;
+  try {
+    fsOps.writeFile(
+      temporaryPath,
+      `${JSON.stringify(payload, null, 2)}\n`,
+    );
+    fsOps.fsyncFile(temporaryPath);
+    ensureSafeLeafPath(runDirectory, temporaryPath, fsOps);
+    ensureSafeLeafPath(runDirectory, finalPath, fsOps);
+    fsOps.link(temporaryPath, finalPath);
+    published = true;
+  } catch (error) {
+    primaryError = error;
+    if (fsOps.exists(finalPath)) {
+      try {
+        removeOwnedPublishedPath(finalPath, payload, fsOps);
+      } catch {
+        // Preserve the publish failure; a future owner will fail closed.
+      }
+    }
+  }
+  try {
+    removeWithRetry(temporaryPath, fsOps);
+  } catch (cleanupError) {
+    if (primaryError === undefined) primaryError = cleanupError;
+  }
+  if (primaryError !== undefined) throw primaryError;
+  if (!published) throw new Error('stage lock publication did not complete');
+}
+
 function isLive(
   payload: StageLockPayload,
   inspector: ProcessInspector,
@@ -138,6 +280,105 @@ function isLive(
   const processIdentity = inspector.inspect(payload.pid);
   return processIdentity !== null
     && processIdentity.started_at === payload.process_started_at;
+}
+
+function auditPath(
+  staleDirectory: string,
+  lockName: string,
+  observed: StageLockPayload,
+  contenderNonce: string,
+  kind: 'lock' | 'reclaim',
+): string {
+  return join(
+    staleDirectory,
+    `${lockName}.${kind}.${sha256(
+      `${observed.pid}\0${observed.process_started_at}\0`
+      + `${observed.nonce}\0${observed.owner_token_sha256}\0`
+      + `${contenderNonce}\0${randomUUID()}`,
+    )}.stale`,
+  );
+}
+
+function releaseOwnedPath(
+  runDirectory: string,
+  path: string,
+  payload: StageLockPayload,
+  fsOps: StageLockFsOps,
+): boolean {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      ensureSafeLeafPath(runDirectory, path, fsOps);
+      const current = readLock(path, fsOps);
+      if (!payloadMatches(current, payload)) return true;
+      fsOps.remove(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      lastError = error;
+      if (attempt < 2) waitBriefly();
+    }
+  }
+  throw lastError;
+}
+
+function acquireReclaimGuard(
+  runDirectory: string,
+  guardPath: string,
+  guardPayload: StageLockPayload,
+  lockName: string,
+  staleDirectory: string,
+  inspector: ProcessInspector,
+  fsOps: StageLockFsOps,
+): StageLock | null {
+  try {
+    publishExclusiveJson(runDirectory, guardPath, guardPayload, fsOps);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    ensureSafeLeafPath(runDirectory, guardPath, fsOps);
+    let observed: StageLockPayload;
+    try {
+      observed = readLock(guardPath, fsOps);
+    } catch (readError) {
+      if ((readError as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw readError;
+    }
+    if (isLive(observed, inspector)) {
+      waitBriefly();
+      return null;
+    }
+    const staleGuardPath = auditPath(
+      staleDirectory,
+      lockName,
+      observed,
+      guardPayload.nonce,
+      'reclaim',
+    );
+    ensureSafeLeafPath(runDirectory, staleGuardPath, fsOps);
+    try {
+      fsOps.rename(guardPath, staleGuardPath);
+    } catch (renameError) {
+      if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw renameError;
+    }
+    ensureSafeLeafPath(runDirectory, staleGuardPath, fsOps);
+    return null;
+  }
+  let released = false;
+  return {
+    path: guardPath,
+    release: () => {
+      if (released) return;
+      if (releaseOwnedPath(
+        runDirectory,
+        guardPath,
+        guardPayload,
+        fsOps,
+      )) {
+        released = true;
+      }
+    },
+  };
 }
 
 function inspectWithPowerShell(pid: number): ProcessIdentity | null {
@@ -166,12 +407,7 @@ function inspectWithPowerShell(pid: number): ProcessIdentity | null {
 }
 
 function inspectWithPs(pid: number): ProcessIdentity | null {
-  const result = spawnSync('ps', [
-    '-o',
-    'lstart=',
-    '-p',
-    String(pid),
-  ], {
+  const result = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
     encoding: 'utf8',
     shell: false,
     timeout: 5_000,
@@ -215,6 +451,7 @@ export function acquireStageLock(
 ): StageLock {
   const runDirectory = resolve(options.run_dir);
   const inspector = options.process_inspector ?? createProcessInspector();
+  const fsOps: StageLockFsOps = { ...defaultFsOps, ...options.fs_ops };
   const current = inspector.current();
   const nonce = options.nonce ?? randomUUID();
   const ownerTokenSha256 = sha256(options.owner_token);
@@ -225,48 +462,83 @@ export function acquireStageLock(
     nonce,
     owner_token_sha256: ownerTokenSha256,
   };
+  const guardPayload: StageLockPayload = {
+    ...payload,
+    nonce: `${nonce}.reclaim.${randomUUID()}`,
+  };
   const stageLockDirectory = join(runDirectory, '.locks', 'stages');
-  ensureSafeDirectory(runDirectory, stageLockDirectory);
+  ensureSafeDirectory(runDirectory, stageLockDirectory, fsOps);
   const lockName = `${sha256(`${options.run_id}\0${options.stage_key}`)}.lock`;
   const lockPath = join(stageLockDirectory, lockName);
-  ensureSafeLeafPath(runDirectory, lockPath);
+  const guardPath = `${lockPath}.reclaim`;
+  const staleDirectory = join(stageLockDirectory, 'stale');
+  ensureSafeDirectory(runDirectory, staleDirectory, fsOps);
+  ensureSafeLeafPath(runDirectory, lockPath, fsOps);
+  ensureSafeLeafPath(runDirectory, guardPath, fsOps);
 
   for (;;) {
     try {
-      writeExclusiveJson(lockPath, payload);
+      publishExclusiveJson(runDirectory, lockPath, payload, fsOps);
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
 
-    ensureSafeLeafPath(runDirectory, lockPath);
-    let existing: StageLockPayload;
+    ensureSafeLeafPath(runDirectory, lockPath, fsOps);
+    let observed: StageLockPayload;
     try {
-      existing = readLock(lockPath);
+      observed = readLock(lockPath, fsOps);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
       throw error;
     }
-    if (isLive(existing, inspector)) {
+    if (isLive(observed, inspector)) {
       throw new Error('stage lock is held by a live process');
     }
 
-    const staleDirectory = join(stageLockDirectory, 'stale');
-    ensureSafeDirectory(runDirectory, staleDirectory);
-    const auditPath = join(
+    const guard = acquireReclaimGuard(
+      runDirectory,
+      guardPath,
+      guardPayload,
+      lockName,
       staleDirectory,
-      `${lockName}.${sha256(
-        `${existing.nonce}\0${nonce}\0${randomUUID()}`,
-      )}.stale`,
+      inspector,
+      fsOps,
     );
-    ensureSafeLeafPath(runDirectory, auditPath);
+    if (!guard) continue;
     try {
-      renameSync(lockPath, auditPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw error;
+      let currentLock: StageLockPayload;
+      try {
+        currentLock = readLock(lockPath, fsOps);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      if (!payloadMatches(currentLock, observed)) continue;
+      const staleLockPath = auditPath(
+        staleDirectory,
+        lockName,
+        observed,
+        nonce,
+        'lock',
+      );
+      ensureSafeLeafPath(runDirectory, staleLockPath, fsOps);
+      try {
+        fsOps.rename(lockPath, staleLockPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      ensureSafeLeafPath(runDirectory, staleLockPath, fsOps);
+      try {
+        publishExclusiveJson(runDirectory, lockPath, payload, fsOps);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    } finally {
+      guard.release();
     }
-    ensureSafeLeafPath(runDirectory, auditPath);
   }
 
   let released = false;
@@ -274,22 +546,9 @@ export function acquireStageLock(
     path: lockPath,
     release: () => {
       if (released) return;
-      released = true;
-      ensureSafeLeafPath(runDirectory, lockPath);
-      let currentPayload: StageLockPayload;
-      try {
-        currentPayload = readLock(lockPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-        throw error;
+      if (releaseOwnedPath(runDirectory, lockPath, payload, fsOps)) {
+        released = true;
       }
-      if (
-        currentPayload.nonce !== nonce
-        || currentPayload.owner_token_sha256 !== ownerTokenSha256
-      ) {
-        return;
-      }
-      rmSync(lockPath);
     },
   };
 }
