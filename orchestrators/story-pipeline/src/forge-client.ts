@@ -38,6 +38,19 @@ export interface ForgeCliClientOptions {
   repoRoot: string;
   cliEntryPath?: string;
   maxOutputBytes?: number;
+  termination?: ProcessTerminationOptions;
+}
+
+export interface ProcessTerminationOptions {
+  platform?: NodeJS.Platform;
+  taskkillTimeoutMs?: number;
+  childCloseTimeoutMs?: number;
+  spawnTaskkill?: (pid: number) => ChildProcess;
+}
+
+export interface SignalHost {
+  on(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  removeListener(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
 }
 
 interface CommandResult {
@@ -51,16 +64,28 @@ interface RunningCommand {
   completion: Promise<CommandResult>;
 }
 
+class ForgeCommandError extends Error {
+  constructor(
+    message: string,
+    readonly result: CommandResult,
+  ) {
+    super(message);
+    this.name = 'ForgeCommandError';
+  }
+}
+
 export class ForgeCliClient implements ForgeClient {
   private readonly repoRoot: string;
   private readonly cliEntryPath: string;
   private readonly maxOutputBytes: number;
+  private readonly termination: ProcessTerminationOptions;
 
   constructor(options: ForgeCliClientOptions) {
     this.repoRoot = resolve(options.repoRoot);
     this.cliEntryPath = options.cliEntryPath
       ?? join(this.repoRoot, 'apps', 'cli', 'src', 'index.ts');
     this.maxOutputBytes = options.maxOutputBytes ?? 1024 * 1024;
+    this.termination = options.termination ?? {};
   }
 
   async createCase(
@@ -80,15 +105,40 @@ export class ForgeCliClient implements ForgeClient {
     if (request.chapterId !== null) {
       args.push('--chapter-id', request.chapterId);
     }
-    const result = await this.invoke(args, {
-      FORGE_INPUT_FILE: request.inputFile,
-    }, signal);
-    const caseId = [...result.jsonLines]
-      .reverse()
-      .map((line) => line.case_id)
-      .find((value): value is string => typeof value === 'string' && value.length > 0);
-    if (!caseId) throw new Error('Forge CLI did not return a Case ID');
-    return caseId;
+    const env = { FORGE_INPUT_FILE: request.inputFile };
+    if (signal?.aborted) {
+      throw new DOMException('The operation was aborted', 'AbortError');
+    }
+    const running = this.startCommand(args, env, []);
+    if (!signal) return requireCaseId(await running.completion);
+
+    const outcome = await raceCommandWithAbort(running.completion, signal);
+    if (outcome.kind === 'completed') return requireCaseId(outcome.result);
+    if (outcome.kind === 'failed') throw outcome.error;
+
+    await terminateProcessTree(running.child, this.termination);
+    let interruptedResult: CommandResult | undefined;
+    try {
+      interruptedResult = await running.completion;
+    } catch (error) {
+      if (error instanceof ForgeCommandError) interruptedResult = error.result;
+      else throw error;
+    }
+    const caseId = interruptedResult ? findCaseId(interruptedResult) : undefined;
+    if (caseId) return caseId;
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
+
+  private async getCaseStatusWithSecrets(
+    caseId: string,
+    dbPath: string,
+    secrets: string[],
+  ): Promise<ForgeCaseSnapshot> {
+    const result = await this.invoke([
+      'case', 'status', caseId,
+      '--db', dbPath,
+    ], {}, undefined, secrets);
+    return requireSnapshot(result, caseId, secrets);
   }
 
   async runCase(
@@ -106,48 +156,39 @@ export class ForgeCliClient implements ForgeClient {
     ];
     if (signal?.aborted) {
       await this.abortCase(caseId, request.dbPath, runnerToken);
-      return this.getCaseStatus(caseId, request.dbPath);
+      return this.getCaseStatusWithSecrets(
+        caseId,
+        request.dbPath,
+        [runnerToken],
+      );
     }
 
     const running = this.startCommand(args, {}, [runnerToken]);
-    if (!signal) return requireSnapshot(await running.completion, caseId);
+    if (!signal) {
+      return requireSnapshot(await running.completion, caseId, [runnerToken]);
+    }
 
-    let notifyAbort: (() => void) | undefined;
-    const aborted = new Promise<'aborted'>((resolvePromise) => {
-      notifyAbort = () => resolvePromise('aborted');
-      signal.addEventListener('abort', notifyAbort, { once: true });
-      if (signal.aborted) notifyAbort();
-    });
-    const completed = running.completion.then(
-      (result) => ({ kind: 'completed' as const, result }),
-      (error: unknown) => ({ kind: 'failed' as const, error }),
-    );
-    const outcome = await Promise.race([
-      completed,
-      aborted.then(() => ({ kind: 'aborted' as const })),
-    ]);
-    if (notifyAbort) signal.removeEventListener('abort', notifyAbort);
-
+    const outcome = await raceCommandWithAbort(running.completion, signal);
     if (outcome.kind === 'completed') {
-      return requireSnapshot(outcome.result, caseId);
+      return requireSnapshot(outcome.result, caseId, [runnerToken]);
     }
     if (outcome.kind === 'failed') throw outcome.error;
 
-    await terminateProcessTree(running.child);
+    await terminateProcessTree(running.child, this.termination);
     await running.completion.catch(() => undefined);
     await this.abortCase(caseId, request.dbPath, runnerToken);
-    return this.getCaseStatus(caseId, request.dbPath);
+    return this.getCaseStatusWithSecrets(
+      caseId,
+      request.dbPath,
+      [runnerToken],
+    );
   }
 
   async getCaseStatus(
     caseId: string,
     dbPath: string,
   ): Promise<ForgeCaseSnapshot> {
-    const result = await this.invoke([
-      'case', 'status', caseId,
-      '--db', dbPath,
-    ], {});
-    return requireSnapshot(result, caseId);
+    return this.getCaseStatusWithSecrets(caseId, dbPath, []);
   }
 
   async abortCase(
@@ -175,25 +216,11 @@ export class ForgeCliClient implements ForgeClient {
     const running = this.startCommand(args, envExtra, secrets);
     if (!signal) return running.completion;
 
-    let notifyAbort: (() => void) | undefined;
-    const aborted = new Promise<'aborted'>((resolvePromise) => {
-      notifyAbort = () => resolvePromise('aborted');
-      signal.addEventListener('abort', notifyAbort, { once: true });
-      if (signal.aborted) notifyAbort();
-    });
-    const completed = running.completion.then(
-      (result) => ({ kind: 'completed' as const, result }),
-      (error: unknown) => ({ kind: 'failed' as const, error }),
-    );
-    const outcome = await Promise.race([
-      completed,
-      aborted.then(() => ({ kind: 'aborted' as const })),
-    ]);
-    if (notifyAbort) signal.removeEventListener('abort', notifyAbort);
+    const outcome = await raceCommandWithAbort(running.completion, signal);
     if (outcome.kind === 'completed') return outcome.result;
     if (outcome.kind === 'failed') throw outcome.error;
 
-    await terminateProcessTree(running.child);
+    await terminateProcessTree(running.child, this.termination);
     await running.completion.catch(() => undefined);
     throw new DOMException('The operation was aborted', 'AbortError');
   }
@@ -229,7 +256,9 @@ export class ForgeCliClient implements ForgeClient {
         forcedError = new Error(`Forge CLI ${label} exceeded the configured limit`);
         if (!terminationStarted) {
           terminationStarted = true;
-          void terminateProcessTree(child);
+          void terminateProcessTree(child, this.termination).catch((error: unknown) => {
+            rejectPromise(error);
+          });
         }
       };
       const appendBounded = (
@@ -258,33 +287,76 @@ export class ForgeCliClient implements ForgeClient {
       child.stderr?.on('data', (chunk: Buffer) => {
         stderrBytes = appendBounded(stderrChunks, chunk, stderrBytes, 'stderr');
       });
-      child.once('error', (error) => rejectPromise(error));
+      child.once('error', () => {
+        rejectPromise(new Error('Forge CLI process failed to start'));
+      });
       child.once('close', (exitCode) => {
         if (forcedError) {
           rejectPromise(forcedError);
           return;
         }
         const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-        const stderr = Buffer.concat(stderrChunks).toString('utf8');
-        const jsonLines = parseJsonLines(stdout);
+        const stderr = redactSecrets(
+          Buffer.concat(stderrChunks).toString('utf8'),
+          secrets,
+        );
+        const jsonLines = parseJsonLines(stdout).map(
+          (line) => sanitizeProtocolValue(line, secrets),
+        );
+        const result = { exitCode, jsonLines, stderr };
         if (exitCode !== 0) {
           const cliError = [...jsonLines].reverse().find(
             (line) => typeof line.error === 'string',
           )?.error;
-          const detail = redactSecrets(
-            typeof cliError === 'string' ? cliError : stderr,
-            secrets,
-          );
-          rejectPromise(new Error(
+          const detail = typeof cliError === 'string' ? cliError : stderr;
+          rejectPromise(new ForgeCommandError(
             `Forge CLI failed with exit code ${String(exitCode)}${detail ? `: ${detail}` : ''}`,
+            result,
           ));
           return;
         }
-        resolvePromise({ exitCode, jsonLines, stderr });
+        resolvePromise(result);
       });
     });
     return { child, completion };
   }
+}
+
+function findCaseId(result: CommandResult): string | undefined {
+  return [...result.jsonLines]
+    .reverse()
+    .map((line) => line.case_id)
+    .find((value): value is string => typeof value === 'string' && value.length > 0);
+}
+
+function requireCaseId(result: CommandResult): string {
+  const caseId = findCaseId(result);
+  if (!caseId) throw new Error('Forge CLI did not return a Case ID');
+  return caseId;
+}
+
+type CommandAbortOutcome =
+  | { kind: 'completed'; result: CommandResult }
+  | { kind: 'failed'; error: unknown }
+  | { kind: 'aborted' };
+
+async function raceCommandWithAbort(
+  completion: Promise<CommandResult>,
+  signal: AbortSignal,
+): Promise<CommandAbortOutcome> {
+  let notifyAbort: (() => void) | undefined;
+  const aborted = new Promise<CommandAbortOutcome>((resolvePromise) => {
+    notifyAbort = () => resolvePromise({ kind: 'aborted' });
+    signal.addEventListener('abort', notifyAbort, { once: true });
+    if (signal.aborted) notifyAbort();
+  });
+  const completed = completion.then(
+    (result): CommandAbortOutcome => ({ kind: 'completed', result }),
+    (error: unknown): CommandAbortOutcome => ({ kind: 'failed', error }),
+  );
+  const outcome = await Promise.race([completed, aborted]);
+  if (notifyAbort) signal.removeEventListener('abort', notifyAbort);
+  return outcome;
 }
 
 function parseJsonLines(stdout: string): Record<string, unknown>[] {
@@ -307,12 +379,13 @@ function parseJsonLines(stdout: string): Record<string, unknown>[] {
 function requireSnapshot(
   result: CommandResult,
   expectedCaseId: string,
+  secrets: string[],
 ): ForgeCaseSnapshot {
   const snapshot = [...result.jsonLines].reverse().find(
     (line) => line.case_id === expectedCaseId && typeof line.status === 'string',
   );
   if (!snapshot) throw new Error('Forge CLI did not return a Case snapshot');
-  return snapshot as unknown as ForgeCaseSnapshot;
+  return sanitizeProtocolValue(snapshot, secrets) as unknown as ForgeCaseSnapshot;
 }
 
 function redactSecrets(value: string, secrets: string[]): string {
@@ -324,23 +397,96 @@ function redactSecrets(value: string, secrets: string[]): string {
   );
 }
 
-async function terminateProcessTree(child: ChildProcess): Promise<void> {
-  if (child.pid === undefined || child.exitCode !== null) return;
-  if (process.platform === 'win32') {
-    await new Promise<void>((resolvePromise) => {
-      const killer = spawn('taskkill.exe', [
-        '/PID',
-        String(child.pid),
-        '/T',
-        '/F',
-      ], {
-        shell: false,
-        windowsHide: true,
-        stdio: 'ignore',
-      });
-      killer.once('error', () => resolvePromise());
-      killer.once('close', () => resolvePromise());
-    });
+function sanitizeProtocolValue<T>(value: T, secrets: string[]): T {
+  if (typeof value === 'string') {
+    return redactSecrets(value, secrets) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeProtocolValue(item, secrets)) as T;
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        sanitizeProtocolValue(item, secrets),
+      ]),
+    ) as T;
+  }
+  return value;
+}
+
+function processHasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForProcessClose(
+  child: ChildProcess,
+  timeoutMs: number,
+  label: string,
+): Promise<number | null> {
+  if (processHasExited(child)) return Promise.resolve(child.exitCode);
+  return new Promise((resolvePromise, rejectPromise) => {
+    const finish = (exitCode: number | null): void => {
+      clearTimeout(timer);
+      child.removeListener('error', fail);
+      resolvePromise(exitCode);
+    };
+    const fail = (): void => {
+      clearTimeout(timer);
+      child.removeListener('close', finish);
+      rejectPromise(new Error(`${label} failed`));
+    };
+    const timer = setTimeout(() => {
+      child.removeListener('close', finish);
+      child.removeListener('error', fail);
+      rejectPromise(new Error(`${label} timed out`));
+    }, timeoutMs);
+    timer.unref();
+    child.once('close', finish);
+    child.once('error', fail);
+  });
+}
+
+export async function terminateProcessTree(
+  child: ChildProcess,
+  options: ProcessTerminationOptions = {},
+): Promise<void> {
+  if (child.pid === undefined || processHasExited(child)) return;
+  const platform = options.platform ?? process.platform;
+  const taskkillTimeoutMs = options.taskkillTimeoutMs ?? 5_000;
+  const childCloseTimeoutMs = options.childCloseTimeoutMs ?? 5_000;
+  if (platform === 'win32') {
+    const killer = options.spawnTaskkill
+      ? options.spawnTaskkill(child.pid)
+      : spawn('taskkill.exe', [
+          '/PID',
+          String(child.pid),
+          '/T',
+          '/F',
+        ], {
+          shell: false,
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+    let taskkillExitCode: number | null;
+    try {
+      taskkillExitCode = await waitForProcessClose(
+        killer,
+        taskkillTimeoutMs,
+        'taskkill',
+      );
+    } catch (error) {
+      killer.kill();
+      throw error;
+    }
+    if (taskkillExitCode !== 0) {
+      throw new Error(`taskkill failed with exit code ${String(taskkillExitCode)}`);
+    }
+    await waitForProcessClose(
+      child,
+      childCloseTimeoutMs,
+      'child process exit',
+    );
     return;
   }
   try {
@@ -348,4 +494,25 @@ async function terminateProcessTree(child: ChildProcess): Promise<void> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
   }
+  await waitForProcessClose(
+    child,
+    childCloseTimeoutMs,
+    'child process exit',
+  );
+}
+
+export function installAbortSignalHandlers(
+  controller: AbortController,
+  host: SignalHost = process,
+): () => void {
+  const abort = (): void => controller.abort();
+  host.on('SIGINT', abort);
+  host.on('SIGTERM', abort);
+  let removed = false;
+  return () => {
+    if (removed) return;
+    removed = true;
+    host.removeListener('SIGINT', abort);
+    host.removeListener('SIGTERM', abort);
+  };
 }

@@ -85,3 +85,55 @@ insufficient privileges.
 - Forge runner tokens remain required CLI arguments by the Task 3 lease
   protocol. They are never placed in manifest events, diagnostics, snapshots,
   logs, or thrown errors by this client.
+
+## Fix round 1
+
+Reviewer follow-up hardened four boundaries:
+
+- Every protocol value produced while a runner token is known is recursively
+  sanitized, including strings nested in objects and arrays. This applies to
+  successful run snapshots, command-failure parsed results, and post-abort
+  status snapshots.
+- Process-tree termination has separate configurable taskkill and child-close
+  bounds. Windows requires taskkill exit code zero and observed child close;
+  POSIX requires observed child close after process-group kill. Timeout,
+  nonzero, and no-op taskkill paths fail token-free and never proceed to Forge
+  abort/status.
+- A cancelled create recovers a Case ID already emitted by the killed child.
+  The pipeline persists its Attempt, event, and restricted credential before
+  recording an already-requested cancellation as `interrupted`. A create with
+  no committed ID still returns `AbortError`.
+- `SIGINT` and `SIGTERM` use persistent idempotent listeners until `main`
+  cleanup, so a second signal cannot restore Node's default termination while
+  reconciliation is still running.
+
+Fix-round RED:
+
+```text
+npx vitest run orchestrators/story-pipeline/src/forge-client.test.ts
+13 tests: 8 failed, 5 passed
+```
+
+The failures independently covered two nested token leaks, three unbounded or
+unverified taskkill modes, committed create cancellation returning AbortError,
+and missing persistent SIGINT/SIGTERM handlers.
+
+Fix-round focused GREEN:
+
+```text
+npx vitest run orchestrators/story-pipeline/src/forge-client.test.ts
+1 file passed, 14 tests passed
+
+npm run check
+exit 0
+```
+
+The Windows/FakePi wrapper-and-validator process-tree integration remains part
+of the focused suite.
+
+Fix-round full regression:
+
+```text
+npm test
+28 files passed, 247 tests passed
+```

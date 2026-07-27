@@ -38,6 +38,7 @@ import {
 } from './manifest.js';
 import {
   ForgeCliClient,
+  installAbortSignalHandlers,
   type ForgeCaseSnapshot,
   type ForgeClient,
 } from './forge-client.js';
@@ -599,6 +600,25 @@ async function executeStage(
     saveManifest(options.runDir, manifest);
   }
 
+  if (signal.aborted) {
+    if (attempt.outcome === 'running') {
+      const beforeOutcome = attempt.outcome;
+      attempt.outcome = 'interrupted';
+      attempt.updated_at = new Date().toISOString();
+      attempt.detail = 'Pipeline cancellation requested before Forge run';
+      appendAttemptEvent(
+        manifest,
+        'stage_interrupted',
+        attempt,
+        beforeOutcome,
+        attempt.outcome,
+        attempt.detail,
+      );
+      saveManifest(options.runDir, manifest);
+    }
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
+
   let result: ForgeResult | undefined;
   try {
     if (attempt.runner_credential_path === null) {
@@ -1108,9 +1128,7 @@ async function main(): Promise<void> {
   }
 
   const controller = new AbortController();
-  const abort = (): void => controller.abort();
-  process.once('SIGINT', abort);
-  process.once('SIGTERM', abort);
+  const removeSignalHandlers = installAbortSignalHandlers(controller);
   try {
     await runPipeline(
       options,
@@ -1118,8 +1136,7 @@ async function main(): Promise<void> {
       controller.signal,
     );
   } finally {
-    process.removeListener('SIGINT', abort);
-    process.removeListener('SIGTERM', abort);
+    removeSignalHandlers();
   }
 }
 

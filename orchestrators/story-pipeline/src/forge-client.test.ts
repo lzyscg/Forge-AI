@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import {
   cpSync,
   existsSync,
@@ -77,9 +78,10 @@ function createRunFakeCli(): {
       "  case_id: 'case-fake-run',",
       "  status: 'approved',",
       '  success: true,',
-      "  final_artifact: { type: 'draft', version: 1, status: 'delivered', content: 'ok', artifact_id: 'a1', version_id: 'v1' },",
+      "  final_artifact: { type: 'draft', version: 1, status: 'delivered', content: `content:${token}`, artifact_id: 'a1', version_id: 'v1' },",
       '  case_identity: null, execution_identity: null,',
-      '  turns: { count: 1, items: [] }, issues: [], gate: null, diff: null,',
+      "  turns: { count: 1, items: [{ seq: 1, agent: token, tools: ['safe', token], produced: [] }] },",
+      "  issues: [{ id: 'i1', severity: 'major', status: 'open', problem: `nested:${token}` }], gate: null, diff: null,",
       '  action_required: null, error: null,',
       "}) + '\\n');",
     ].join('\n'),
@@ -125,17 +127,42 @@ function createAbortFakeCli(): {
       "  process.stdout.write(JSON.stringify({ case_id: 'case-fake-abort', status: 'stopped' }) + '\\n');",
       "} else if (command === 'status') {",
       "  append({ command });",
+      "  const leakedToken = 'abort-runner-secret';",
       '  process.stdout.write(JSON.stringify({',
       "    case_id: 'case-fake-abort', status: 'stopped', success: false,",
       '    final_artifact: null, case_identity: null, execution_identity: null,',
-      '    turns: { count: 0, items: [] }, issues: [], gate: null, diff: null,',
-      "    action_required: null, error: 'stopped',",
+      "    turns: { count: 1, items: [{ seq: 1, agent: leakedToken, tools: [leakedToken], produced: [] }] },",
+      "    issues: [{ id: 'i1', severity: 'major', status: 'open', problem: `status:${leakedToken}` }], gate: null, diff: null,",
+      "    action_required: null, error: `stopped:${leakedToken}`,",
       "  }) + '\\n');",
       '}',
     ].join('\n'),
     'utf8',
   );
   return { cliEntryPath, eventsPath, pidsPath };
+}
+
+function createCancellableCreateFakeCli(committed: boolean): {
+  cliEntryPath: string;
+  pidPath: string;
+} {
+  const directory = mkdtempSync(join(tmpdir(), 'forge-client-create-cancel-'));
+  temporaryDirectories.push(directory);
+  const cliEntryPath = join(directory, 'fake-cli.mjs');
+  const pidPath = join(directory, 'create.pid');
+  writeFileSync(
+    cliEntryPath,
+    [
+      "import { writeFileSync } from 'node:fs';",
+      `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+      committed
+        ? "process.stdout.write(JSON.stringify({ case_id: 'case-create-committed' }) + '\\n');"
+        : "process.stdout.write(JSON.stringify({ progress: 'before-commit' }) + '\\n');",
+      'setInterval(() => {}, 1000);',
+    ].join('\n'),
+    'utf8',
+  );
+  return { cliEntryPath, pidPath };
 }
 
 async function waitForFile(path: string): Promise<void> {
@@ -161,6 +188,13 @@ function forceKillProcessTree(pid: number): void {
   }
 }
 
+function createHangingChild(): ChildProcess {
+  return spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    windowsHide: true,
+    stdio: 'ignore',
+  });
+}
+
 function readWindowsCommandLine(pid: number): string {
   const script = [
     '$processId = [int]$env:FORGE_TEST_PROCESS_ID',
@@ -184,6 +218,29 @@ function readWindowsCommandLine(pid: number): string {
 }
 
 describe('ForgeCliClient', () => {
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'keeps the %s handler installed across repeated signals until cleanup',
+    async (signalName) => {
+      const host = new EventEmitter();
+      const controller = new AbortController();
+      const module = await import('./forge-client.js') as unknown as {
+        installAbortSignalHandlers: (
+          abortController: AbortController,
+          signalHost: EventEmitter,
+        ) => () => void;
+      };
+
+      const cleanup = module.installAbortSignalHandlers(controller, host);
+      host.emit(signalName);
+      host.emit(signalName);
+
+      expect(controller.signal.aborted).toBe(true);
+      expect(host.listenerCount(signalName)).toBe(1);
+      cleanup();
+      expect(host.listenerCount(signalName)).toBe(0);
+    },
+  );
+
   it('creates a Case through the TypeScript CLI and passes immutable run bindings', async () => {
     const fake = createFakeCli();
     const client = new ForgeCliClient({
@@ -221,6 +278,45 @@ describe('ForgeCliClient', () => {
     });
   });
 
+  it.each([
+    { committed: true, expectedCaseId: 'case-create-committed' },
+    { committed: false, expectedCaseId: null },
+  ])(
+    'recovers only a committed Case ID when create cancellation committed=$committed',
+    async ({ committed, expectedCaseId }) => {
+      const fake = createCancellableCreateFakeCli(committed);
+      const client = new ForgeCliClient({
+        repoRoot: resolve('.'),
+        cliEntryPath: fake.cliEntryPath,
+        maxOutputBytes: 4_096,
+      });
+      const controller = new AbortController();
+      const createPromise = client.createCase({
+        template: 'story-template',
+        dbPath: 'forge.db',
+        mode: 'fake',
+        title: 'Cancellation tracking',
+        inputFile: 'input.json',
+        runId: 'run-create-cancel',
+        storyId: 'story-create-cancel',
+        stageKey: 'draft-cancel',
+        chapterId: null,
+      }, controller.signal);
+      await waitForFile(fake.pidPath);
+      const pid = Number(readFileSync(fake.pidPath, 'utf8'));
+      try {
+        controller.abort();
+        if (expectedCaseId) {
+          await expect(createPromise).resolves.toBe(expectedCaseId);
+        } else {
+          await expect(createPromise).rejects.toMatchObject({ name: 'AbortError' });
+        }
+      } finally {
+        forceKillProcessTree(pid);
+      }
+    },
+  );
+
   it('reads the runner credential only for invocation and returns the final JSONL snapshot', async () => {
     const fake = createRunFakeCli();
     const credentialPath = join(
@@ -248,6 +344,9 @@ describe('ForgeCliClient', () => {
       success: true,
       final_artifact: { version_id: 'v1' },
     });
+    expect(JSON.stringify(snapshot)).not.toContain(runnerToken);
+    expect(snapshot.final_artifact?.content).toBe('content:[redacted]');
+    expect(snapshot.turns.items[0]?.tools).toEqual(['safe', '[redacted]']);
     expect(JSON.parse(readFileSync(fake.invocationPath, 'utf8'))).toEqual({
       argv: [
         'case', 'run', 'case-fake-run',
@@ -301,6 +400,110 @@ describe('ForgeCliClient', () => {
     },
   );
 
+  it.runIf(process.platform === 'win32').each([
+    {
+      name: 'taskkill timeout',
+      spawnTaskkill: () => createHangingChild(),
+      taskkillTimeoutMs: 50,
+      expected: 'timed out',
+    },
+    {
+      name: 'taskkill nonzero exit',
+      spawnTaskkill: () => spawn(process.execPath, ['-e', 'process.exit(7)'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      }),
+      taskkillTimeoutMs: 500,
+      expected: 'exit code 7',
+    },
+    {
+      name: 'taskkill no-op success',
+      spawnTaskkill: () => spawn(process.execPath, ['-e', 'process.exit(0)'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      }),
+      taskkillTimeoutMs: 500,
+      expected: 'child process exit timed out',
+    },
+  ])(
+    'fails closed within a bound when $name cannot confirm tree cleanup',
+    async ({ spawnTaskkill, taskkillTimeoutMs, expected }) => {
+      const child = createHangingChild();
+      const startedAt = Date.now();
+      try {
+        const module = await import('./forge-client.js') as unknown as {
+          terminateProcessTree: (
+            childProcess: ChildProcess,
+            options: Record<string, unknown>,
+          ) => Promise<void>;
+        };
+        await expect(module.terminateProcessTree(child, {
+          platform: 'win32',
+          taskkillTimeoutMs,
+          childCloseTimeoutMs: 50,
+          spawnTaskkill,
+        })).rejects.toThrow(expected);
+        expect(Date.now() - startedAt).toBeLessThan(1_000);
+        expect(child.pid && readWindowsCommandLine(child.pid)).not.toBe('');
+      } finally {
+        if (child.pid) forceKillProcessTree(child.pid);
+      }
+    },
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'does not abort or query status when process-tree cleanup cannot be confirmed',
+    async () => {
+      const fake = createAbortFakeCli();
+      const credentialDirectory = mkdtempSync(join(tmpdir(), 'forge-client-failed-kill-'));
+      temporaryDirectories.push(credentialDirectory);
+      const credentialPath = join(credentialDirectory, 'runner-token');
+      writeFileSync(credentialPath, 'failed-kill-secret', 'utf8');
+      const client = new ForgeCliClient({
+        repoRoot: resolve('.'),
+        cliEntryPath: fake.cliEntryPath,
+        maxOutputBytes: 4_096,
+        termination: {
+          platform: 'win32',
+          taskkillTimeoutMs: 500,
+          childCloseTimeoutMs: 50,
+          spawnTaskkill: () => spawn(
+            process.execPath,
+            ['-e', 'process.exit(0)'],
+            { windowsHide: true, stdio: 'ignore' },
+          ),
+        },
+      });
+      const controller = new AbortController();
+      const runPromise = client.runCase('case-fake-abort', {
+        dbPath: 'forge.db',
+        mode: 'fake',
+        runnerCredentialPath: credentialPath,
+      }, controller.signal);
+      await waitForFile(fake.pidsPath);
+      const pids = JSON.parse(readFileSync(fake.pidsPath, 'utf8')) as {
+        runPid: number;
+        descendantPid: number;
+      };
+
+      try {
+        controller.abort();
+        const error = await runPromise.catch((caught: unknown) => caught);
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain('child process exit timed out');
+        expect((error as Error).message).not.toContain('failed-kill-secret');
+        const events = readFileSync(fake.eventsPath, 'utf8')
+          .trim()
+          .split(/\r?\n/)
+          .map((line) => JSON.parse(line));
+        expect(events.map((event) => event.command)).toEqual(['run']);
+      } finally {
+        forceKillProcessTree(pids.runPid);
+        forceKillProcessTree(pids.descendantPid);
+      }
+    },
+  );
+
   it('kills the exact process tree before aborting with the same token and then querying status', async () => {
     const fake = createAbortFakeCli();
     const credentialDirectory = mkdtempSync(join(tmpdir(), 'forge-client-abort-token-'));
@@ -332,7 +535,10 @@ describe('ForgeCliClient', () => {
       await expect(resultPromise).resolves.toMatchObject({
         case_id: 'case-fake-abort',
         status: 'stopped',
+        error: 'stopped:[redacted]',
       });
+      const snapshot = await resultPromise;
+      expect(JSON.stringify(snapshot)).not.toContain(runnerToken);
       const events = readFileSync(fake.eventsPath, 'utf8')
         .trim()
         .split(/\r?\n/)
