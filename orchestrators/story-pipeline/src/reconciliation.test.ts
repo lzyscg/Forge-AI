@@ -508,6 +508,23 @@ describe('stage reconciliation', () => {
     }]);
   });
 
+  it('blocks waiting_human instead of treating it as resumable', () => {
+    const candidate = attempt('case-human', 'draft-b001-a1');
+    const snapshot = runningSnapshot(candidate.case_id);
+    snapshot.status = 'waiting_human';
+
+    expect(reconcileStage(
+      plan,
+      [candidate],
+      new Map([[candidate.case_id, snapshot]]),
+    )).toEqual([{
+      action: 'block',
+      attempt_id: candidate.attempt_id,
+      case_id: candidate.case_id,
+      reason: 'Forge case is waiting for explicit human input',
+    }]);
+  });
+
   it('retains terminal cleanup before the one approved-stage arbitration', () => {
     const stopped = attempt('case-stopped', 'draft-b001-a1');
     const approved = attempt('case-approved', 'draft-b001-a2');

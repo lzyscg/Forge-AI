@@ -47,6 +47,7 @@ export interface StagePlan {
 export type ReconciliationAction =
   | { action: 'adopt'; stage_key: string; attempt_id: string; case_id: string }
   | { action: 'close'; attempt_id: string; outcome: AttemptOutcome; reason: string }
+  | { action: 'block'; attempt_id: string; case_id: string; reason: string }
   | { action: 'resume'; attempt_id: string; case_id: string }
   | { action: 'ambiguous'; stage_key: string; candidates: string[] }
   | { action: 'reject'; attempt_id: string; reason: string };
@@ -372,7 +373,7 @@ export function reconcileStage(
   const cleanup: ReconciliationAction[] = [];
   const live: Array<{
     attempt: StageAttemptV21;
-    action: 'adopt' | 'resume';
+    action: 'adopt' | 'block' | 'resume';
   }> = [];
   for (const attempt of attempts) {
     const snapshot = snapshots.get(attempt.case_id);
@@ -400,6 +401,10 @@ export function reconcileStage(
         outcome: 'failed',
         reason: `Forge case is terminal with status ${snapshot.status}`,
       });
+      continue;
+    }
+    if (snapshot.status === 'waiting_human') {
+      live.push({ attempt, action: 'block' });
       continue;
     }
     if (snapshot.status !== 'approved') {
@@ -451,11 +456,18 @@ export function reconcileStage(
         attempt_id: selected.attempt.attempt_id,
         case_id: selected.attempt.case_id,
       }
-    : {
+    : selected.action === 'block'
+      ? {
+          action: 'block',
+          attempt_id: selected.attempt.attempt_id,
+          case_id: selected.attempt.case_id,
+          reason: 'Forge case is waiting for explicit human input',
+        }
+      : {
         action: 'resume',
         attempt_id: selected.attempt.attempt_id,
         case_id: selected.attempt.case_id,
-      };
+        };
   return [...cleanup, ...unselected, arbitration];
 }
 

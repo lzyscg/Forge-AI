@@ -10,6 +10,7 @@ import {
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  type ChapterBoundary,
   type ChapterBoundaryMap,
   type ValidationResult,
   sha256,
@@ -95,6 +96,7 @@ export interface ReconcileOptions {
   configPath: string;
   runDir: string;
   dbPath: string;
+  mode?: PiMode;
   dryRun: boolean;
   adoptCase?: string;
   attestTemplateCompatibility: boolean;
@@ -150,6 +152,7 @@ function parseReconcileArgs(argv: string[]): ReconcileOptions {
     'config',
     'run-dir',
     'db',
+    'mode',
     'adopt-case',
     'attest-legacy-case-binding',
   ]);
@@ -207,11 +210,16 @@ function parseReconcileArgs(argv: string[]): ReconcileOptions {
   ) {
     throw new Error('reconcile attestation and adoption flags require --apply');
   }
+  const mode = values.get('mode');
+  if (mode !== undefined && mode !== 'fake' && mode !== 'real') {
+    throw new Error('reconcile --mode must be fake or real');
+  }
   return {
     command: 'reconcile',
     configPath: resolve(process.cwd(), config),
     runDir: resolve(process.cwd(), runDir),
     dbPath: resolve(process.cwd(), db),
+    mode: mode as PiMode | undefined,
     dryRun,
     adoptCase: values.get('adopt-case'),
     attestTemplateCompatibility: booleans.has(
@@ -1006,49 +1014,222 @@ function stagePlanFromAttempts(
   };
 }
 
-function transportValidator(
+function recoveryInput(
+  runDir: string,
   attempt: StageAttempt,
-): (rawContent: string) => ValidationResult {
-  const artifactKind = ({
-    blueprint_bundle: 'outline',
-    chapter_packet: 'packet',
-    chapter_draft: 'draft',
-    state_ledger: 'ledger',
-    final_manuscript: 'final',
-  } as const)[attempt.expected_artifact_type as
-    | 'blueprint_bundle'
-    | 'chapter_packet'
-    | 'chapter_draft'
-    | 'state_ledger'
-    | 'final_manuscript'];
-  if (!artifactKind) {
+): Record<string, unknown> {
+  const path = resolve(runDir, attempt.input_path);
+  ensureInsideRunDir(runDir, path);
+  if (!existsSync(path)) {
+    throw new Error(`attempt input evidence is missing: ${attempt.input_path}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
     throw new Error(
-      `no transport validator for ${attempt.expected_artifact_type}`,
+      `attempt input evidence is not valid JSON: ${attempt.input_path}`,
     );
   }
-  return (rawContent) => {
-    const canonicalContent = `${rawContent.trim()}\n`;
-    const artifactSha256 = sha256(canonicalContent);
-    return {
-      canonicalContent,
-      report: {
-        schema_version: '1.0',
-        stage_key: attempt.stage_key,
-        artifact_kind: artifactKind,
-        artifact_sha256: artifactSha256,
-        valid: true,
-        checks: [],
-        errors: [],
-        warnings: [],
-        metrics: {},
-      },
-      sidecar: {
-        schema_version: '1.0',
-        artifact_kind: attempt.expected_artifact_type,
-        artifact_sha256: artifactSha256,
-      },
-    };
-  };
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('attempt input evidence must be a JSON object');
+  }
+  if (sha256(canonicalJson(parsed)) !== attempt.input_sha256) {
+    throw new Error('attempt input evidence SHA-256 does not match the Attempt');
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function requiredInputString(
+  input: Record<string, unknown>,
+  key: string,
+  label: string,
+): string {
+  const value = input[key];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`${label} recovery input is missing ${key}`);
+  }
+  return value;
+}
+
+function structuredInput<T>(
+  input: Record<string, unknown>,
+  key: string,
+  label: string,
+): T {
+  const serialized = requiredInputString(input, key, label);
+  try {
+    return JSON.parse(serialized) as T;
+  } catch {
+    throw new Error(`${label} recovery input has invalid ${key}`);
+  }
+}
+
+function verifiedParentSidecar(
+  runDir: string,
+  manifest: PipelineManifest,
+  attempt: StageAttempt,
+  artifactType: string,
+): Record<string, unknown> {
+  const parent = attempt.parent_record_ids
+    .map((recordId) => manifest.stages.find(
+      (record) => record.record_id === recordId,
+    ))
+    .find((record) => record?.artifact_type === artifactType);
+  if (!parent) {
+    throw new Error(
+      `${attempt.stage_key} recovery evidence is missing ${artifactType} parent`,
+    );
+  }
+  const path = resolve(runDir, parent.sidecar_path);
+  ensureInsideRunDir(runDir, path);
+  if (!existsSync(path)) {
+    throw new Error(`${attempt.stage_key} recovery parent sidecar is missing`);
+  }
+  const bytes = readFileSync(path);
+  if (sha256(bytes) !== parent.sidecar_sha256) {
+    throw new Error(
+      `${attempt.stage_key} recovery parent sidecar SHA-256 does not match`,
+    );
+  }
+  try {
+    return JSON.parse(bytes.toString('utf8')) as Record<string, unknown>;
+  } catch {
+    throw new Error(`${attempt.stage_key} recovery parent sidecar is invalid`);
+  }
+}
+
+export function recoveryValidatorFromEvidence(
+  config: PipelineConfig,
+  manifest: PipelineManifest,
+  attempt: StageAttempt,
+  runDir: string,
+): (rawContent: string) => ValidationResult {
+  const input = recoveryInput(runDir, attempt);
+  if (attempt.stage === 'outline') {
+    const boundaries = structuredInput<ChapterBoundaryMap>(
+      input,
+      'chapter_boundaries',
+      'outline',
+    );
+    if (
+      !Array.isArray(boundaries.chapters)
+      || config.chapters.some((chapter) =>
+        !boundaries.chapters.some((boundary) => boundary.id === chapter.id)
+      )
+    ) {
+      throw new Error('outline recovery chapter boundaries do not match config');
+    }
+    return (rawContent) => validateOutline(
+      attempt.stage_key,
+      rawContent,
+      boundaries,
+    );
+  }
+  if (attempt.stage === 'chapter_packet') {
+    const boundary = structuredInput<ChapterBoundary>(
+      input,
+      'chapter_boundary',
+      'packet',
+    );
+    if (
+      typeof boundary.id !== 'string'
+      || boundary.id !== attempt.chapter_id
+    ) {
+      throw new Error('packet recovery chapter boundary does not match Attempt');
+    }
+    const sourceText = requiredInputString(
+      input,
+      'reference_chapter_text',
+      'packet',
+    );
+    return (rawContent) => validatePacket(
+      attempt.stage_key,
+      rawContent,
+      boundary,
+      sourceText,
+    );
+  }
+  if (attempt.stage === 'chapter_draft') {
+    const packetContent = requiredInputString(
+      input,
+      'chapter_packet',
+      'draft',
+    );
+    const sourceText = requiredInputString(
+      input,
+      'reference_chapter_text',
+      'draft',
+    );
+    const packetSidecar = verifiedParentSidecar(
+      runDir,
+      manifest,
+      attempt,
+      'chapter_packet',
+    );
+    return (rawContent) => validateDraft(
+      attempt.stage_key,
+      rawContent,
+      packetContent,
+      packetSidecar,
+      sourceText,
+    );
+  }
+  if (attempt.stage === 'ledger_update') {
+    const chapterId = requiredInputString(input, 'chapter_id', 'ledger');
+    if (chapterId !== attempt.chapter_id) {
+      throw new Error('ledger recovery chapter_id does not match Attempt');
+    }
+    const draftContent = requiredInputString(
+      input,
+      'approved_chapter_draft',
+      'ledger',
+    );
+    const previousLedger = requiredInputString(
+      input,
+      'previous_ledger',
+      'ledger',
+    );
+    return (rawContent) => validateLedger(
+      attempt.stage_key,
+      rawContent,
+      chapterId,
+      draftContent,
+      previousLedger,
+    );
+  }
+  if (attempt.stage === 'final_review') {
+    const assembled = requiredInputString(
+      input,
+      'assembled_manuscript',
+      'final',
+    );
+    const approved = structuredInput<Array<{ chapter_id?: unknown }>>(
+      input,
+      'approved_chapters',
+      'final',
+    );
+    if (
+      !Array.isArray(approved)
+      || approved.some((chapter) => typeof chapter.chapter_id !== 'string')
+    ) {
+      throw new Error('final recovery approved_chapters is invalid');
+    }
+    const chapterIds = approved.map((chapter) => String(chapter.chapter_id));
+    if (
+      canonicalJson(chapterIds)
+      !== canonicalJson(config.chapters.map((chapter) => chapter.id))
+    ) {
+      throw new Error('final recovery approved chapters do not match config');
+    }
+    return (rawContent) => validateFinal(
+      attempt.stage_key,
+      rawContent,
+      assembled,
+      chapterIds,
+    );
+  }
+  throw new Error(`no recovery validator for stage ${attempt.stage}`);
 }
 
 export async function reconcileRun(
@@ -1056,7 +1237,6 @@ export async function reconcileRun(
   forgeClient: ForgeClient,
   signal: AbortSignal,
   validators: Record<string, (rawContent: string) => ValidationResult> = {},
-  resumeMode: PiMode = 'real',
 ): Promise<ReconcileRunResult> {
   const configText = readFileSync(options.configPath, 'utf8');
   const config = loadConfig(options.configPath);
@@ -1179,8 +1359,27 @@ export async function reconcileRun(
       if (options.dryRun) continue;
 
       const pending = [...stageActions];
+      const processedFingerprints = new Set<string>();
+      let processedActions = 0;
       while (pending.length > 0) {
         const action = pending.shift()!;
+        processedActions += 1;
+        if (processedActions > 64) {
+          throw new Error('reconciliation action limit exceeded');
+        }
+        const actionCaseId = 'case_id' in action ? action.case_id : null;
+        const fingerprint = canonicalJson({
+          action,
+          forge_status: actionCaseId
+            ? snapshots.get(actionCaseId)?.status ?? null
+            : null,
+        });
+        if (processedFingerprints.has(fingerprint)) {
+          throw new Error(
+            `reconciliation made no progress for stage ${plan.stage_key}`,
+          );
+        }
+        processedFingerprints.add(fingerprint);
         if (action.action === 'ambiguous') {
           throw new Error(
             `stage ${action.stage_key} is ambiguous: ${action.candidates.join(', ')}`,
@@ -1214,6 +1413,24 @@ export async function reconcileRun(
           saveManifest(options.runDir, manifest);
           continue;
         }
+        if (action.action === 'block') {
+          if (attempt.outcome !== 'blocked') {
+            const beforeOutcome = attempt.outcome;
+            attempt.outcome = 'blocked';
+            attempt.updated_at = new Date().toISOString();
+            attempt.detail = action.reason;
+            appendAttemptEvent(
+              manifest,
+              'stage_blocked',
+              attempt,
+              beforeOutcome,
+              'blocked',
+              action.reason,
+            );
+            saveManifest(options.runDir, manifest);
+          }
+          continue;
+        }
         if (action.action === 'adopt') {
           const snapshot = snapshots.get(action.case_id);
           if (!snapshot) {
@@ -1226,13 +1443,21 @@ export async function reconcileRun(
             attempt,
             snapshot,
             validate: validators[plan.stage_key]
-              ?? transportValidator(attempt),
+              ?? recoveryValidatorFromEvidence(
+                config,
+                manifest,
+                attempt,
+                options.runDir,
+              ),
           });
           clearRunnerCredential(options.runDir, attempt);
           saveManifest(options.runDir, manifest);
           continue;
         }
 
+        if (!options.mode) {
+          throw new Error('reconcile resume requires --mode fake|real');
+        }
         if (attempt.runner_credential_path === null) {
           throw new Error(
             `Attempt ${attempt.attempt_id} has no runner credential`,
@@ -1247,7 +1472,7 @@ export async function reconcileRun(
           action.case_id,
           {
             dbPath: options.dbPath,
-            mode: resumeMode,
+            mode: options.mode,
             runnerCredentialPath,
           },
           signal,
@@ -1311,10 +1536,11 @@ async function runPipeline(
     configPath: options.configPath,
     runDir: options.runDir,
     dbPath: options.dbPath,
+    mode: options.mode,
     dryRun: false,
     attestTemplateCompatibility: false,
     attestLegacyCaseBindings: [],
-  }, forgeClient, signal, {}, options.mode);
+  }, forgeClient, signal);
   Object.assign(
     manifest,
     loadManifest(join(options.runDir, 'manifest.json')),

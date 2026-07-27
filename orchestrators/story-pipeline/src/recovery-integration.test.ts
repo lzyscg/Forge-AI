@@ -169,6 +169,7 @@ describe('story-pipeline reconcile command parsing', () => {
       '--run-dir', runDir,
       '--db', dbPath,
       '--dry-run',
+      '--mode', 'fake',
     ]);
 
     expect(result.status, result.stderr).toBe(0);
@@ -280,7 +281,7 @@ describe('reconcile apply', () => {
     ]);
     expect(manifest.stages).toHaveLength(1);
     expect(manifest.stages[0]?.case_id).toBe('case-approved');
-    expect(forge.runCalls).toEqual([]);
+    expect(forge.runRequests).toEqual([]);
   });
 
   it('persists terminal cleanup before reporting live-case ambiguity', async () => {
@@ -312,6 +313,191 @@ describe('reconcile apply', () => {
     expect(manifest.events.at(-1)?.type).toBe('stage_failed');
     expect(manifest.events.at(-1)?.case_id).toBe('case-stopped');
     expect(manifest.stages).toEqual([]);
+  });
+
+  it('requires an explicit mode only when a resume action would run', async () => {
+    const candidate = recoveryAttempt('case-running', 'outline-a1', 'input-sha');
+    const fixture = applyFixture([candidate]);
+    persistFakeCredential(fixture.runDir, candidate);
+    const forge = new FakeForgeClient(new Map([
+      ['case-running', runningSnapshot('case-running', 'input-sha')],
+    ]), new Map([
+      ['case-running', failedSnapshot('case-running', 'input-sha')],
+    ]));
+
+    await expect(reconcileRun(
+      fixture.options,
+      forge,
+      new AbortController().signal,
+    )).rejects.toThrow('reconcile resume requires --mode fake|real');
+
+    expect(forge.runRequests).toEqual([]);
+  });
+
+  it('passes the explicitly selected fake mode to resume without a real model', async () => {
+    const candidate = recoveryAttempt('case-running', 'outline-a1', 'input-sha');
+    const fixture = applyFixture([candidate]);
+    persistFakeCredential(fixture.runDir, candidate);
+    const forge = new FakeForgeClient(new Map([
+      ['case-running', runningSnapshot('case-running', 'input-sha')],
+    ]), new Map([
+      ['case-running', failedSnapshot('case-running', 'input-sha')],
+    ]));
+
+    await reconcileRun({
+      ...fixture.options,
+      mode: 'fake',
+    }, forge, new AbortController().signal);
+
+    expect(forge.runRequests).toHaveLength(1);
+    expect(forge.runRequests[0]?.request.mode).toBe('fake');
+  });
+
+  it('blocks waiting_human idempotently without calling runCase or deleting credentials', async () => {
+    const candidate = recoveryAttempt('case-human', 'outline-a1', 'input-sha');
+    const fixture = applyFixture([candidate]);
+    const credentialPath = persistFakeCredential(fixture.runDir, candidate);
+    const forge = new FakeForgeClient(
+      new Map([['case-human', waitingHumanSnapshot('case-human', 'input-sha')]]),
+      undefined,
+      1,
+    );
+
+    await reconcileRun(
+      fixture.options,
+      forge,
+      new AbortController().signal,
+    );
+    const first = loadManifest(join(fixture.runDir, 'manifest.json'));
+    const eventCount = first.events.length;
+    expect(first.attempts[0]?.outcome).toBe('blocked');
+    expect(first.events.at(-1)?.type).toBe('stage_blocked');
+    expect(existsSync(credentialPath)).toBe(true);
+
+    await reconcileRun(
+      fixture.options,
+      forge,
+      new AbortController().signal,
+    );
+    const second = loadManifest(join(fixture.runDir, 'manifest.json'));
+    expect(second.events).toHaveLength(eventCount);
+    expect(forge.runRequests).toEqual([]);
+    expect(existsSync(credentialPath)).toBe(true);
+  });
+
+  it('fails closed when approved recovery input lacks validator evidence', async () => {
+    const input = { source_text: 'source without chapter boundaries' };
+    const inputSha = sha256(JSON.stringify(input));
+    const candidate = recoveryAttempt('case-approved', 'outline-a1', inputSha);
+    const fixture = applyFixture([candidate]);
+    writeAttemptInput(fixture.runDir, candidate, input);
+    const forge = new FakeForgeClient(new Map([
+      ['case-approved', approvedRecoverySnapshot('case-approved', inputSha)],
+    ]));
+
+    await expect(reconcileRun(
+      fixture.options,
+      forge,
+      new AbortController().signal,
+    )).rejects.toThrow('outline recovery input is missing chapter_boundaries');
+
+    expect(loadManifest(join(fixture.runDir, 'manifest.json')).stages).toEqual([]);
+  });
+
+  it('rebuilds packet sidecar fields through the normal packet validator', async () => {
+    const boundary = {
+      id: 'B001',
+      sequence: 1,
+      display: '01',
+      source_label: null,
+      content_start_offset: 0,
+      content_end_offset: 6,
+      boundary_signature: 'boundary-signature',
+      segment_sha256: 'segment-sha',
+      start_anchor: 'start',
+      end_anchor: 'end',
+      next_forbidden_action: null,
+    };
+    const input = {
+      chapter_boundary: JSON.stringify(boundary),
+      reference_chapter_text: 'reference source text',
+    };
+    const inputSha = sha256(JSON.stringify(input));
+    const candidate = recoveryAttempt('case-packet', 'packet-b001-a1', inputSha);
+    Object.assign(candidate, {
+      stage_key: 'packet-b001',
+      stage: 'chapter_packet',
+      chapter_id: 'B001',
+      template: 'zhihu-chapter-packet',
+      expected_artifact_type: 'chapter_packet',
+      input_path: 'inputs/packet-b001/packet-b001-a1.json',
+    });
+    const fixture = applyFixture([candidate]);
+    writeAttemptInput(fixture.runDir, candidate, input);
+    const packetFixture = JSON.parse(readFileSync(
+      join(repoRoot, 'scenarios', 'zhihu-chapter-packet', 'fake-pi-script.json'),
+      'utf8',
+    )) as {
+      turns: Array<{
+        toolCalls: Array<{
+          name: string;
+          arguments: { content?: string };
+        }>;
+      }>;
+    };
+    const packetContent = packetFixture.turns
+      .flatMap((turn) => turn.toolCalls)
+      .find((call) => call.name === 'publish_artifact')
+      ?.arguments.content;
+    if (!packetContent) throw new Error('packet FakePi fixture has no artifact');
+    const snapshot = approvedRecoverySnapshot('case-packet', inputSha);
+    snapshot.case_identity!.scenario_id = 'zhihu-chapter-packet';
+    snapshot.case_identity!.run_binding.stage_key = 'packet-b001';
+    snapshot.case_identity!.run_binding.chapter_id = 'B001';
+    snapshot.final_artifact!.type = 'chapter_packet';
+    snapshot.final_artifact!.content = packetContent;
+    const forge = new FakeForgeClient(new Map([['case-packet', snapshot]]));
+
+    await reconcileRun(
+      fixture.options,
+      forge,
+      new AbortController().signal,
+    );
+
+    const manifest = loadManifest(join(fixture.runDir, 'manifest.json'));
+    const sidecar = JSON.parse(readFileSync(
+      join(fixture.runDir, manifest.stages[0]!.sidecar_path),
+      'utf8',
+    )) as Record<string, unknown>;
+    expect(sidecar).toMatchObject({
+      artifact_kind: 'chapter_packet',
+      chapter: {
+        id: 'B001',
+        boundary_signature: 'boundary-signature',
+      },
+    });
+    expect(sidecar).toHaveProperty('length_budget');
+    expect(sidecar).toHaveProperty('units');
+  });
+
+  it('fails a same-status resume loop after bounded no-progress detection', async () => {
+    const candidate = recoveryAttempt('case-running', 'outline-a1', 'input-sha');
+    const fixture = applyFixture([candidate]);
+    persistFakeCredential(fixture.runDir, candidate);
+    const running = runningSnapshot('case-running', 'input-sha');
+    const forge = new FakeForgeClient(
+      new Map([['case-running', running]]),
+      new Map([['case-running', running]]),
+      4,
+    );
+
+    await expect(reconcileRun({
+      ...fixture.options,
+      mode: 'fake',
+    }, forge, new AbortController().signal)).rejects.toThrow(
+      'reconciliation made no progress',
+    );
+    expect(forge.runRequests.length).toBeLessThanOrEqual(2);
   });
 });
 
@@ -427,19 +613,33 @@ function failedSnapshot(
 }
 
 class FakeForgeClient implements ForgeClient {
-  readonly runCalls: string[] = [];
+  readonly runRequests: Array<{
+    caseId: string;
+    request: Parameters<ForgeClient['runCase']>[1];
+  }> = [];
 
   constructor(
     private readonly snapshots: Map<string, ForgeCaseSnapshot>,
+    private readonly runSnapshots = snapshots,
+    private readonly maxRunCalls = Number.POSITIVE_INFINITY,
   ) {}
 
   async createCase(): Promise<string> {
     throw new Error('recovery must not create a new case');
   }
 
-  async runCase(caseId: string): Promise<ForgeCaseSnapshot> {
-    this.runCalls.push(caseId);
-    return this.getCaseStatus(caseId);
+  async runCase(
+    caseId: string,
+    request: Parameters<ForgeClient['runCase']>[1],
+  ): Promise<ForgeCaseSnapshot> {
+    this.runRequests.push({ caseId, request });
+    if (this.runRequests.length > this.maxRunCalls) {
+      throw new Error('fake detected an unbounded resume loop');
+    }
+    const snapshot = this.runSnapshots.get(caseId);
+    if (!snapshot) throw new Error(`missing fake run snapshot: ${caseId}`);
+    this.snapshots.set(caseId, structuredClone(snapshot));
+    return structuredClone(snapshot);
   }
 
   async getCaseStatus(caseId: string): Promise<ForgeCaseSnapshot> {
@@ -463,6 +663,15 @@ function runningSnapshot(
   snapshot.execution_identity = null;
   snapshot.final_artifact = null;
   snapshot.gate = null;
+  return snapshot;
+}
+
+function waitingHumanSnapshot(
+  caseId: string,
+  inputSha: string,
+): ForgeCaseSnapshot {
+  const snapshot = runningSnapshot(caseId, inputSha);
+  snapshot.status = 'waiting_human';
   return snapshot;
 }
 
@@ -519,4 +728,35 @@ function applyFixture(attempts: StageAttemptV21[]): {
       attestLegacyCaseBindings: [],
     },
   };
+}
+
+function persistFakeCredential(
+  runDir: string,
+  attempt: StageAttemptV21,
+): string {
+  const path = join(runDir, 'credentials', `${attempt.attempt_id}.token`);
+  mkdirSync(join(runDir, 'credentials'), { recursive: true });
+  writeFileSync(path, 'fake-runner-token', 'utf8');
+  attempt.runner_credential_path = `credentials/${attempt.attempt_id}.token`;
+  attempt.runner_token_sha256 = sha256('fake-runner-token');
+  const manifestPath = join(runDir, 'manifest.json');
+  const manifest = loadManifest(manifestPath);
+  const persisted = manifest.attempts.find(
+    (candidate) => candidate.attempt_id === attempt.attempt_id,
+  );
+  if (!persisted) throw new Error('fixture attempt is missing');
+  persisted.runner_credential_path = attempt.runner_credential_path;
+  persisted.runner_token_sha256 = attempt.runner_token_sha256;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  return path;
+}
+
+function writeAttemptInput(
+  runDir: string,
+  attempt: StageAttemptV21,
+  input: Record<string, unknown>,
+): void {
+  const path = join(runDir, attempt.input_path);
+  mkdirSync(join(path, '..'), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(input, null, 2)}\n`, 'utf8');
 }
