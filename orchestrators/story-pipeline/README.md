@@ -69,3 +69,23 @@ npx tsx orchestrators/story-pipeline/src/index.ts run `
 - 正文逐段证据 sidecar；
 - 状态账本增量 schema；
 - 跨阶段回退后的下游失效传播。
+
+## 安全对账与历史恢复
+
+外接编排器只负责流程状态、身份、血缘、文件哈希和传输合同；故事内容是否合格由对应 Forge Case 的生成、审核和门禁负责。恢复流程不会重新判断故事质量，也不会因为 Case 较新就自动选择候选。
+
+先执行零写入诊断：
+
+```powershell
+npx tsx orchestrators/story-pipeline/src/index.ts reconcile `
+  --config <production-config.json> `
+  --run-dir data/story-runs/<run-id> `
+  --db data/story-runs/<run-id>/forge.db `
+  --dry-run
+```
+
+同一 Stage 存在多个合格 Case 时，结果会列为 `ambiguous`，必须在 `--apply` 时用 `--adopt-case <case-id>` 显式选择。旧 Case 缺少新身份协议时，只能使用 `--attest-legacy-case-binding <case-id>:<stage-key>` 和 `--attestation-reason <reason>` 做精确声明；无法密码学复原的模板兼容性只能记录为 `operator_attested`，不得标记为 `verified`。
+
+`reconcile --apply` 会在一次 Manifest CAS 中追加恢复记录、关闭悬空 Attempt 并接纳既有证据；它不删除历史 event、invalidation 或失败 Attempt。重复执行零动作时不会增加 Manifest revision。只有恢复动作明确需要继续运行原 Case 时才允许提供 `--mode fake|real`；纯诊断和既有产物接纳不会创建 Case 或调用模型。
+
+替换已交付 Stage 使用两阶段 replacement：候选验证失败时旧记录仍有效；候选成功后，旧记录切换和下游失效传播在同一次 CAS 中提交。任何身份、输入、父版本、artifact、gate version 或文件哈希不一致都会 fail closed。
