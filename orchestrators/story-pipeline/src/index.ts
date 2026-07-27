@@ -542,36 +542,56 @@ export function persistReplacementCancellation(
   });
 }
 
-function replacementCredentialPath(
-  manifestPath: string,
+function replacementAttempt(
   manifest: PipelineManifest,
   replacementId: string,
-): string | null {
+): StageAttempt | null {
   const replacement = manifest.replacements.find(
     (item) => item.replacement_id === replacementId,
   );
   if (!replacement?.attempt_id) return null;
-  const attempt = manifest.attempts.find(
+  return manifest.attempts.find(
     (item) => item.attempt_id === replacement.attempt_id,
-  );
-  if (!attempt) return null;
-  const relativePath = attempt.runner_credential_path
-    ?? join('credentials', `${sha256(attempt.attempt_id)}.runner-token`);
-  const runDir = dirname(manifestPath);
-  const absolutePath = resolve(runDir, relativePath);
-  ensureInsideRunDir(runDir, absolutePath);
-  return absolutePath;
+  ) ?? null;
 }
 
-function removeReplacementCredential(path: string | null): void {
-  if (path !== null) rmSync(path, { force: true });
+function removeReplacementCredential(
+  manifestPath: string,
+  attempt: StageAttempt | null,
+): void {
+  if (attempt === null) return;
+  const runDir = dirname(manifestPath);
+  const credentialPath = resolve(
+    runDir,
+    'credentials',
+    `${sha256(attempt.attempt_id)}.runner-token`,
+  );
+  ensureInsideRunDir(runDir, credentialPath);
+  if (!existsSync(credentialPath)) return;
+  if (attempt.runner_token_sha256 === null) {
+    throw new Error(
+      `terminal replacement credential has no Attempt secret hash: ${attempt.attempt_id}`,
+    );
+  }
+  const credentialStat = lstatSync(credentialPath);
+  if (!credentialStat.isFile() || credentialStat.isSymbolicLink()) {
+    throw new Error(
+      `terminal replacement credential is not a regular file: ${attempt.attempt_id}`,
+    );
+  }
+  const credential = readFileSync(credentialPath);
+  if (sha256(credential) !== attempt.runner_token_sha256) {
+    throw new Error(
+      `terminal replacement credential does not match Attempt: ${attempt.attempt_id}`,
+    );
+  }
+  rmSync(credentialPath, { force: true });
 }
 
 function cleanupTerminalReplacementCredentials(
   manifestPath: string,
   manifest: PipelineManifest,
 ): void {
-  const runDir = dirname(manifestPath);
   for (const replacement of manifest.replacements) {
     if (replacement.status === 'pending' || replacement.attempt_id === null) {
       continue;
@@ -579,32 +599,7 @@ function cleanupTerminalReplacementCredentials(
     const attempt = manifest.attempts.find(
       (item) => item.attempt_id === replacement.attempt_id,
     );
-    if (!attempt) continue;
-    const credentialPath = resolve(
-      runDir,
-      'credentials',
-      `${sha256(attempt.attempt_id)}.runner-token`,
-    );
-    ensureInsideRunDir(runDir, credentialPath);
-    if (!existsSync(credentialPath)) continue;
-    if (attempt.runner_token_sha256 === null) {
-      throw new Error(
-        `terminal replacement credential has no Attempt secret hash: ${attempt.attempt_id}`,
-      );
-    }
-    const credentialStat = lstatSync(credentialPath);
-    if (!credentialStat.isFile() || credentialStat.isSymbolicLink()) {
-      throw new Error(
-        `terminal replacement credential is not a regular file: ${attempt.attempt_id}`,
-      );
-    }
-    const credential = readFileSync(credentialPath);
-    if (sha256(credential) !== attempt.runner_token_sha256) {
-      throw new Error(
-        `terminal replacement credential does not match Attempt: ${attempt.attempt_id}`,
-      );
-    }
-    rmSync(credentialPath, { force: true });
+    removeReplacementCredential(manifestPath, attempt ?? null);
   }
 }
 
@@ -615,16 +610,12 @@ export function persistReplacementCommit(
   at = new Date().toISOString(),
 ): PipelineManifest {
   const latest = loadManifest(manifestPath);
-  const credentialPath = replacementCredentialPath(
-    manifestPath,
-    latest,
-    replacementId,
-  );
+  const attempt = replacementAttempt(latest, replacementId);
   const existing = latest.replacements.find(
     (replacement) => replacement.replacement_id === replacementId,
   );
   if (existing?.status === 'committed') {
-    removeReplacementCredential(credentialPath);
+    removeReplacementCredential(manifestPath, attempt);
     return latest;
   }
   try {
@@ -635,7 +626,7 @@ export function persistReplacementCommit(
         commitReplacement(manifest, replacementId, at);
       },
     );
-    removeReplacementCredential(credentialPath);
+    removeReplacementCredential(manifestPath, attempt);
     return committed;
   } catch (error) {
     const afterFailure = loadManifest(manifestPath);
@@ -643,7 +634,10 @@ export function persistReplacementCommit(
       (item) => item.replacement_id === replacementId,
     );
     if (replacement?.status === 'committed') {
-      removeReplacementCredential(credentialPath);
+      removeReplacementCredential(
+        manifestPath,
+        replacementAttempt(afterFailure, replacementId),
+      );
       return afterFailure;
     }
     if (replacement?.status === 'pending') {
@@ -660,7 +654,10 @@ export function persistReplacementCommit(
         if (cancelledReplacement?.status !== 'cancelled') {
           throw new Error('replacement cancellation did not commit');
         }
-        removeReplacementCredential(credentialPath);
+        removeReplacementCredential(
+          manifestPath,
+          replacementAttempt(cancelled, replacementId),
+        );
       } catch (cancellationError) {
         throw new AggregateError(
           [error, cancellationError],

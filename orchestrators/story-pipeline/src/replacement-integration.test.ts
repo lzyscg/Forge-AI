@@ -1,8 +1,10 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -393,6 +395,107 @@ describe('replacement Manifest CAS integration', () => {
     expect(existsSync(credentialPath)).toBe(false);
     expect(saved.stages).toEqual([old]);
     expect(saved.invalidations).toEqual([]);
+  });
+
+  it('ignores a tampered Manifest credential path on normal commit', () => {
+    const old = record('outline-v1', 'outline');
+    const candidate = {
+      ...record('outline-v2', 'outline'),
+      input_sha256: 'outline-v2-input',
+    };
+    const attempt = attemptFor(candidate);
+    const path = manifestPathWith([old], [attempt], true);
+    const runDir = dirname(path);
+    const credentialPath = join(runDir, attempt.runner_credential_path!);
+    const victimPath = join(runDir, 'victim.txt');
+    writeFileSync(victimPath, 'must-survive', 'utf8');
+    saveManifestCas(path, 0, (manifest) => {
+      manifest.attempts[0]!.runner_credential_path = 'victim.txt';
+      appendManifestEvent(manifest, {
+        at: '2026-01-02T03:00:00.000Z',
+        type: 'concurrent_audit',
+        stage_key: 'manifest',
+        attempt_id: null,
+        before_outcome: null,
+        after_outcome: null,
+        case_id: null,
+        artifact_id: null,
+        artifact_version: null,
+        version_id: null,
+        record_id: null,
+        reason: 'tampered credential path fixture',
+        actor: 'story-pipeline',
+      });
+    });
+    const pending = persistPendingReplacement(path, {
+      stage_key: 'outline',
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      reason: 'input changed',
+    });
+    const replacementId = pending.replacements[0]!.replacement_id;
+    persistReplacementAttempt(path, replacementId, attempt.attempt_id);
+    const prepared = persistReplacementCandidate(
+      path,
+      replacementId,
+      attempt.attempt_id,
+      candidate,
+    );
+
+    persistReplacementCommit(path, replacementId, prepared.revision);
+
+    expect(readFileSync(victimPath, 'utf8')).toBe('must-survive');
+    expect(existsSync(credentialPath)).toBe(false);
+  });
+
+  it('fails closed when the normal commit credential is a symbolic link', () => {
+    const old = record('outline-v1', 'outline');
+    const candidate = {
+      ...record('outline-v2', 'outline'),
+      input_sha256: 'outline-v2-input',
+    };
+    const attempt = attemptFor(candidate);
+    const path = manifestPathWith([old], [attempt], true);
+    const runDir = dirname(path);
+    const credentialPath = join(runDir, attempt.runner_credential_path!);
+    const targetDirectory = join(runDir, 'foreign-target');
+    const targetFile = join(targetDirectory, 'must-survive.txt');
+    rmSync(credentialPath);
+    mkdirSync(targetDirectory);
+    writeFileSync(targetFile, 'must-survive', 'utf8');
+    symlinkSync(
+      targetDirectory,
+      credentialPath,
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    const pending = persistPendingReplacement(path, {
+      stage_key: 'outline',
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      reason: 'input changed',
+    });
+    const replacementId = pending.replacements[0]!.replacement_id;
+    persistReplacementAttempt(path, replacementId, attempt.attempt_id);
+    const prepared = persistReplacementCandidate(
+      path,
+      replacementId,
+      attempt.attempt_id,
+      candidate,
+    );
+
+    expect(() => persistReplacementCommit(
+      path,
+      replacementId,
+      prepared.revision,
+    )).toThrow('replacement credential is not a regular file');
+
+    expect(loadManifest(path).replacements[0]!.status).toBe('committed');
+    expect(existsSync(credentialPath)).toBe(true);
+    expect(readFileSync(targetFile, 'utf8')).toBe('must-survive');
   });
 
   it('cleans a committed replacement credential left by a crash on restart', async () => {
