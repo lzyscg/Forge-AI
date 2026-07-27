@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { sha256 } from './hash.js';
 import type { TemplateIdentity } from './manifest.js';
-import { sha256 } from './quality.js';
 
 const IGNORED_DIRECTORIES = new Set(['__pycache__', '.pytest_cache']);
 
@@ -55,6 +55,12 @@ export function compareTemplateIdentity(
   left: TemplateIdentity,
   right: TemplateIdentity,
 ): TemplateIdentityComparison {
-  if (left.algorithm !== right.algorithm) return 'migration_required';
+  if (
+    left.algorithm !== right.algorithm ||
+    left.equivalence === 'unknown' ||
+    right.equivalence === 'unknown'
+  ) {
+    return 'migration_required';
+  }
   return left.content_sha256 === right.content_sha256 ? 'equal' : 'content_changed';
 }

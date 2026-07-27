@@ -47,6 +47,21 @@ describe('template identity', () => {
     )).toBe('migration_required');
   });
 
+  it('fails closed when either same-algorithm identity has unknown equivalence', () => {
+    expect(compareTemplateIdentity(
+      {
+        algorithm: 'source-tree-sha256-v2',
+        content_sha256: 'same-bytes',
+        equivalence: 'unknown',
+      },
+      {
+        algorithm: 'source-tree-sha256-v2',
+        content_sha256: 'same-bytes',
+        equivalence: 'verified',
+      },
+    )).toBe('migration_required');
+  });
+
   it('identifies source trees with the versioned algorithm while still ignoring runtime files', () => {
     const root = mkdtempSync(join(tmpdir(), 'forge-template-identity-'));
     roots.push(root);

@@ -7,12 +7,15 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   appendManifestEvent,
   clearRunnerCredential,
+  initializeManifest,
   loadManifest,
   persistRunnerCredential,
   saveManifestCas,
@@ -72,6 +75,97 @@ function appendTestEvent(manifest: PipelineManifestV21, reason: string): void {
     reason,
     actor: 'story-pipeline',
   });
+}
+
+function runningAttempt(): StageAttemptV21 {
+  return {
+    attempt_id: 'attempt-1',
+    stage_key: 'stage-1',
+    stage: 'generic-stage',
+    chapter_id: null,
+    template: 'generic-template',
+    expected_artifact_type: 'generic-artifact',
+    case_id: 'case-1',
+    input_sha256: 'input-hash',
+    parent_record_ids: [],
+    template_identity: {
+      algorithm: 'source-tree-sha256-v2',
+      content_sha256: 'template-hash',
+      equivalence: 'verified',
+    },
+    runner_token_sha256: null,
+    runner_credential_path: null,
+    outcome: 'running',
+    input_path: 'inputs/stage-1.json',
+    raw_artifact_path: null,
+    validation_report_path: null,
+    started_at: '2026-07-27T00:00:00.000Z',
+    updated_at: '2026-07-27T00:00:00.000Z',
+    detail: null,
+  };
+}
+
+interface RaceResult {
+  worker: string;
+  status: 'created' | 'reloaded' | 'committed' | 'conflict';
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('timed out waiting for worker readiness');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function runProcessRace(
+  mode: 'initialize' | 'cas',
+  manifestPath: string,
+): Promise<RaceResult[]> {
+  const root = dirname(manifestPath);
+  const gatePath = join(root, `${mode}.gate`);
+  const workerPath = fileURLToPath(new URL('./manifest-race-worker.ts', import.meta.url));
+  const workers = ['one', 'two'].map((worker) => {
+    const readyPath = join(root, `${mode}.${worker}.ready`);
+    const child = spawn(process.execPath, [
+      '--import',
+      'tsx',
+      workerPath,
+      mode,
+      manifestPath,
+      worker,
+      readyPath,
+      gatePath,
+    ], {
+      cwd: process.cwd(),
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    const completed = new Promise<RaceResult>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code) => {
+        if (code !== 0) {
+          reject(new Error(`race worker ${worker} exited ${String(code)}: ${stderr}`));
+          return;
+        }
+        resolve(JSON.parse(stdout.trim()) as RaceResult);
+      });
+    });
+    return { readyPath, completed };
+  });
+  await waitUntil(() => workers.every(({ readyPath }) => existsSync(readyPath)));
+  writeFileSync(gatePath, 'go', 'utf8');
+  return Promise.all(workers.map(({ completed }) => completed));
 }
 
 describe('loadManifest', () => {
@@ -175,6 +269,23 @@ describe('saveManifestCas', () => {
     expect(reloaded.events[0]?.reason).toBe('first writer');
   });
 
+  it('serializes independent processes competing on the same revision without losing events', async () => {
+    const { path } = tempManifestPath();
+    initializeManifest(path, emptyManifest);
+
+    const results = await runProcessRace('cas', path);
+
+    expect(results.map(({ status }) => status).sort()).toEqual(['committed', 'conflict']);
+    const committedWorker = results.find(({ status }) => status === 'committed')!.worker;
+    const reloaded = loadManifest(path);
+    expect(reloaded.revision).toBe(1);
+    expect(reloaded.events.map(({ type }) => type)).toEqual([
+      'manifest_created',
+      'attempt_outcome_changed',
+    ]);
+    expect(reloaded.events[1]?.reason).toBe(`worker ${committedWorker}`);
+  }, 15_000);
+
   it('keeps the committed file and removes the temporary file when rename fails', () => {
     const { root, path } = tempManifestPath();
     const original = `${JSON.stringify(emptyManifest(), null, 2)}\n`;
@@ -201,34 +312,35 @@ describe('saveManifestCas', () => {
   });
 });
 
+describe('initializeManifest', () => {
+  it('atomically creates once while a concurrent process reloads the committed manifest', async () => {
+    const { path } = tempManifestPath();
+
+    const results = await runProcessRace('initialize', path);
+
+    expect(results.map(({ status }) => status).sort()).toEqual(['created', 'reloaded']);
+    const manifest = loadManifest(path);
+    expect(manifest.revision).toBe(0);
+    expect(manifest.events).toHaveLength(1);
+    expect(manifest.events[0]).toMatchObject({
+      type: 'manifest_created',
+      attempt_id: null,
+      before_outcome: null,
+      after_outcome: null,
+      case_id: null,
+      artifact_id: null,
+      artifact_version: null,
+      version_id: null,
+      record_id: null,
+      reason: 'manifest initialized',
+    });
+  }, 15_000);
+});
+
 describe('runner credentials', () => {
   it('stores only token identity in the manifest and removes the credential at terminal outcome', () => {
     const { root } = tempManifestPath();
-    const attempt: StageAttemptV21 = {
-      attempt_id: 'attempt-1',
-      stage_key: 'stage-1',
-      stage: 'generic-stage',
-      chapter_id: null,
-      template: 'generic-template',
-      expected_artifact_type: 'generic-artifact',
-      case_id: 'case-1',
-      input_sha256: 'input-hash',
-      parent_record_ids: [],
-      template_identity: {
-        algorithm: 'source-tree-sha256-v2',
-        content_sha256: 'template-hash',
-        equivalence: 'verified',
-      },
-      runner_token_sha256: null,
-      runner_credential_path: null,
-      outcome: 'running',
-      input_path: 'inputs/stage-1.json',
-      raw_artifact_path: null,
-      validation_report_path: null,
-      started_at: '2026-07-27T00:00:00.000Z',
-      updated_at: '2026-07-27T00:00:00.000Z',
-      detail: null,
-    };
+    const attempt = runningAttempt();
 
     persistRunnerCredential(root, attempt, 'secret-runner-token');
 
@@ -243,6 +355,28 @@ describe('runner credentials', () => {
     attempt.outcome = 'delivered';
     clearRunnerCredential(root, attempt);
     expect(existsSync(credentialPath)).toBe(false);
+    expect(attempt.runner_credential_path).toBeNull();
+  });
+
+  it('fails closed without leaving a token when Windows ACL restriction fails', () => {
+    const { root } = tempManifestPath();
+    const attempt = runningAttempt();
+    let aclCalls = 0;
+
+    expect(() => persistRunnerCredential(root, attempt, 'secret-runner-token', {
+      platform: 'win32',
+      restrictWindowsAcl() {
+        aclCalls += 1;
+        if (aclCalls === 3) throw new Error('simulated ACL failure');
+      },
+    })).toThrow('simulated ACL failure');
+
+    expect(aclCalls).toBe(3);
+    const credentialsDirectory = join(root, 'credentials');
+    expect(
+      existsSync(credentialsDirectory) ? readdirSync(credentialsDirectory) : [],
+    ).toEqual([]);
+    expect(attempt.runner_token_sha256).toBeNull();
     expect(attempt.runner_credential_path).toBeNull();
   });
 });

@@ -22,6 +22,7 @@ import {
 import { descendantClosure } from './invalidation.js';
 import {
   appendManifestEvent,
+  initializeManifest,
   loadManifest,
   saveManifestCas,
   validateManifestChain,
@@ -217,29 +218,8 @@ function loadOrCreateManifest(
   boundaryMapHash: string,
 ): PipelineManifest {
   const manifestPath = join(runDir, 'manifest.json');
-  if (existsSync(manifestPath)) {
-    const manifest = loadManifest(manifestPath);
-    if (manifest.run_id !== config.run_id || manifest.story_id !== config.story_id) {
-      throw new Error('现有运行目录属于其他 run/story，拒绝覆盖');
-    }
-    if (manifest.config_sha256 !== configHash) {
-      throw new Error('生产配置已变化。请使用新 run_id，或先完成明确的回退决策');
-    }
-    manifest.attempts ??= [];
-    manifest.invalidations ??= [];
-    if (
-      manifest.boundary_map_sha256 !== boundaryMapHash ||
-      resolve(runDir, manifest.boundary_map_path) !== boundaryMapPath
-    ) {
-      throw new Error('章节边界 sidecar 与 manifest 不一致');
-    }
-    validateManifestChain(manifest);
-    return manifest;
-  }
-
-  mkdirSync(runDir, { recursive: true });
   const now = new Date().toISOString();
-  const manifest: PipelineManifest = {
+  const { manifest } = initializeManifest(manifestPath, () => ({
     schema_version: '2.1',
     revision: 0,
     previous_manifest_sha256: null,
@@ -259,8 +239,22 @@ function loadOrCreateManifest(
     replacements: [],
     events: [],
     final_artifact_path: null,
-  };
-  writeJson(manifestPath, manifest);
+  }));
+  if (manifest.run_id !== config.run_id || manifest.story_id !== config.story_id) {
+    throw new Error('现有运行目录属于其他 run/story，拒绝覆盖');
+  }
+  if (manifest.config_sha256 !== configHash) {
+    throw new Error('生产配置已变化。请使用新 run_id，或先完成明确的回退决策');
+  }
+  manifest.attempts ??= [];
+  manifest.invalidations ??= [];
+  if (
+    manifest.boundary_map_sha256 !== boundaryMapHash ||
+    resolve(runDir, manifest.boundary_map_path) !== boundaryMapPath
+  ) {
+    throw new Error('章节边界 sidecar 与 manifest 不一致');
+  }
+  validateManifestChain(manifest);
   return manifest;
 }
 

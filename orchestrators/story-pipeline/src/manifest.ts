@@ -1,4 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
   closeSync,
@@ -12,6 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { sha256 } from './hash.js';
 
 export type AttemptOutcome =
   | 'running'
@@ -161,6 +163,19 @@ export interface ManifestFsOps {
   remove(path: string): void;
 }
 
+export interface ManifestInitialization {
+  manifest: PipelineManifestV21;
+  created: boolean;
+}
+
+export interface RunnerCredentialOptions {
+  platform?: NodeJS.Platform;
+  restrictWindowsAcl?: (
+    path: string,
+    kind: 'directory' | 'file' | 'verify-file',
+  ) => void;
+}
+
 interface LegacyStageRecord extends Omit<StageRecordV21, 'template_identity'> {
   template_sha256: string;
 }
@@ -192,10 +207,6 @@ interface PipelineManifestV20 extends Omit<
   schema_version: '2.0';
   attempts?: LegacyStageAttempt[];
   stages: LegacyStageRecord[];
-}
-
-function sha256(value: string | Buffer): string {
-  return createHash('sha256').update(value).digest('hex');
 }
 
 function canonicalJson(value: unknown): string {
@@ -368,6 +379,76 @@ function waitForLock(lockPath: string): number {
   }
 }
 
+function temporaryManifestPath(path: string): string {
+  return join(
+    dirname(path),
+    `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+}
+
+export function initializeManifest(
+  path: string,
+  createInitial: () => PipelineManifestV21,
+  fsOps: ManifestFsOps = defaultFsOps,
+): ManifestInitialization {
+  const lockDirectory = join(dirname(path), '.locks');
+  const lockPath = join(lockDirectory, 'manifest.lock');
+  mkdirSync(lockDirectory, { recursive: true });
+  const lockDescriptor = waitForLock(lockPath);
+  let temporaryPath: string | null = null;
+  try {
+    if (existsSync(path)) {
+      return { manifest: loadManifest(path), created: false };
+    }
+    const manifest = createInitial();
+    if (
+      manifest.schema_version !== '2.1' ||
+      manifest.revision !== 0 ||
+      manifest.previous_manifest_sha256 !== null ||
+      manifest.events.length !== 0
+    ) {
+      throw new Error('initial manifest must be empty schema 2.1 at revision 0');
+    }
+    appendManifestEvent(manifest, {
+      at: manifest.created_at,
+      type: 'manifest_created',
+      stage_key: 'manifest',
+      attempt_id: null,
+      before_outcome: null,
+      after_outcome: null,
+      case_id: null,
+      artifact_id: null,
+      artifact_version: null,
+      version_id: null,
+      record_id: null,
+      reason: 'manifest initialized',
+      actor: 'story-pipeline',
+    });
+    validateManifestChain(manifest);
+    temporaryPath = temporaryManifestPath(path);
+    writeFileSync(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    fsOps.fsyncFile(temporaryPath);
+    fsOps.rename(temporaryPath, path);
+    temporaryPath = null;
+    return { manifest, created: true };
+  } catch (error) {
+    if (temporaryPath !== null) {
+      try {
+        fsOps.remove(temporaryPath);
+      } catch {
+        // Preserve the initialization error.
+      }
+    }
+    throw error;
+  } finally {
+    closeSync(lockDescriptor);
+    rmSync(lockPath, { force: true });
+  }
+}
+
 export function saveManifestCas(
   path: string,
   expectedRevision: number,
@@ -410,10 +491,7 @@ export function saveManifestCas(
     validateManifestChain(latest);
     latest.revision = expectedRevision + 1;
     latest.previous_manifest_sha256 = sha256(previousBytes);
-    temporaryPath = join(
-      dirname(path),
-      `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
-    );
+    temporaryPath = temporaryManifestPath(path);
     writeFileSync(temporaryPath, `${JSON.stringify(latest, null, 2)}\n`, {
       encoding: 'utf8',
       mode: 0o600,
@@ -453,17 +531,123 @@ function credentialPath(runDirectory: string, attemptId: string): {
   };
 }
 
+function defaultRestrictWindowsAcl(
+  path: string,
+  kind: 'directory' | 'file' | 'verify-file',
+): void {
+  const script = `
+$ErrorActionPreference = 'Stop'
+$target = $env:FORGE_RUNNER_CREDENTIAL_ACL_TARGET
+$kind = $env:FORGE_RUNNER_CREDENTIAL_ACL_KIND
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+if ($kind -eq 'directory') {
+  $apply = $true
+  $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $sid,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow
+  )
+} elseif ($kind -eq 'file') {
+  $apply = $true
+  $acl = [System.Security.AccessControl.FileSecurity]::new()
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $sid,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow
+  )
+} elseif ($kind -eq 'verify-file') {
+  $apply = $false
+} else {
+  throw 'unsupported ACL target kind'
+}
+if ($apply) {
+  $acl.SetOwner($sid)
+  $acl.SetAccessRuleProtection($true, $false)
+  [void]$acl.AddAccessRule($rule)
+  Set-Acl -LiteralPath $target -AclObject $acl
+}
+$actual = Get-Acl -LiteralPath $target
+if (-not $actual.AreAccessRulesProtected) {
+  throw 'credential ACL still inherits permissions'
+}
+$allowed = @($actual.Access | Where-Object {
+  $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
+})
+if ($allowed.Count -eq 0) {
+  throw 'credential ACL has no owner allow rule'
+}
+foreach ($entry in $allowed) {
+  $entrySid = $entry.IdentityReference.Translate(
+    [System.Security.Principal.SecurityIdentifier]
+  )
+  if ($entrySid.Value -ne $sid.Value) {
+    throw 'credential ACL grants another identity'
+  }
+}
+`;
+  const result = spawnSync('powershell.exe', [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    script,
+  ], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      FORGE_RUNNER_CREDENTIAL_ACL_TARGET: path,
+      FORGE_RUNNER_CREDENTIAL_ACL_KIND: kind,
+    },
+    shell: false,
+    windowsHide: true,
+    timeout: 10_000,
+  });
+  if (result.status !== 0 || result.error) {
+    const detail = result.error?.message || result.stderr.trim() || 'unknown ACL error';
+    throw new Error(`failed to restrict runner credential ACL: ${detail}`);
+  }
+}
+
 export function persistRunnerCredential(
   runDirectory: string,
   attempt: StageAttemptV21,
   runnerToken: string,
+  options: RunnerCredentialOptions = {},
 ): void {
   const path = credentialPath(runDirectory, attempt.attempt_id);
-  mkdirSync(dirname(path.absolute), { recursive: true, mode: 0o700 });
-  writeFileSync(path.absolute, runnerToken, { encoding: 'utf8', mode: 0o600 });
-  chmodSync(path.absolute, 0o600);
-  attempt.runner_token_sha256 = sha256(runnerToken);
-  attempt.runner_credential_path = path.relative;
+  const platform = options.platform ?? process.platform;
+  const restrictWindowsAcl = options.restrictWindowsAcl ?? defaultRestrictWindowsAcl;
+  const credentialsDirectory = dirname(path.absolute);
+  const temporaryPath = `${path.absolute}.${process.pid}.${randomUUID()}.tmp`;
+  let published = false;
+  mkdirSync(credentialsDirectory, { recursive: true, mode: 0o700 });
+  try {
+    if (platform === 'win32') {
+      restrictWindowsAcl(credentialsDirectory, 'directory');
+    } else {
+      chmodSync(credentialsDirectory, 0o700);
+    }
+    writeFileSync(temporaryPath, runnerToken, { encoding: 'utf8', mode: 0o600 });
+    if (platform === 'win32') {
+      restrictWindowsAcl(temporaryPath, 'file');
+    } else {
+      chmodSync(temporaryPath, 0o600);
+    }
+    renameSync(temporaryPath, path.absolute);
+    published = true;
+    if (platform === 'win32') {
+      restrictWindowsAcl(path.absolute, 'verify-file');
+    }
+    attempt.runner_token_sha256 = sha256(runnerToken);
+    attempt.runner_credential_path = path.relative;
+  } catch (error) {
+    rmSync(temporaryPath, { force: true });
+    if (published) rmSync(path.absolute, { force: true });
+    throw error;
+  }
 }
 
 export function clearRunnerCredential(
