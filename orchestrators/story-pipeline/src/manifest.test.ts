@@ -464,6 +464,118 @@ describe('replacement manifest invariants', () => {
   });
 });
 
+describe('historical reinstatement invariants', () => {
+  function historicalManifest() {
+    const manifest = emptyManifest();
+    const oldRecord = {
+      ...deliveredRecord('stage-1-v1'),
+      template_identity: {
+        algorithm: 'legacy-unversioned-v1' as const,
+        content_sha256: 'legacy-template-hash',
+        equivalence: 'unknown' as const,
+      },
+    };
+    manifest.stages.push(oldRecord);
+    manifest.invalidations.push({
+      invalidation_id: 'inv-1',
+      record_id: oldRecord.record_id,
+      stage_key: oldRecord.stage_key,
+      reason: 'historical invalidation',
+      root_record_id: oldRecord.record_id,
+      invalidated_at: '2026-07-27T00:00:03.000Z',
+    });
+    const historicalEvent = appendManifestEvent(manifest, {
+      at: '2026-07-27T00:00:02.000Z',
+      type: 'stage_delivered',
+      stage_key: oldRecord.stage_key,
+      attempt_id: 'attempt-1',
+      before_outcome: 'running',
+      after_outcome: 'delivered',
+      case_id: oldRecord.case_id,
+      artifact_id: 'artifact-1',
+      artifact_version: 1,
+      version_id: 'version-1',
+      record_id: oldRecord.record_id,
+      reason: 'historical delivery',
+      actor: 'story-pipeline',
+    });
+    manifest.attempts.push({
+      ...runningAttempt(),
+      outcome: 'delivered',
+      template_identity: oldRecord.template_identity,
+      raw_artifact_path: oldRecord.raw_artifact_path,
+      validation_report_path: oldRecord.validation_report_path,
+    });
+    const restoredRecord = {
+      ...oldRecord,
+      record_id: 'stage-1-v2',
+      revision: 2,
+      template_identity: {
+        ...oldRecord.template_identity,
+        equivalence: 'operator_attested' as const,
+      },
+      legacy_binding_attestation: {
+        proof: 'operator_attested' as const,
+        case_id: oldRecord.case_id,
+        run_id: manifest.run_id,
+        story_id: manifest.story_id,
+        stage_key: oldRecord.stage_key,
+        chapter_id: oldRecord.chapter_id,
+        input_sha256: oldRecord.input_sha256,
+        scenario_snapshot_sha256: 'legacy-scenario-hash',
+        attempt_id: 'attempt-1',
+        historical_attempt_id: 'attempt-1',
+        historical_event_sha256: historicalEvent.event_sha256,
+        template_identity_before: oldRecord.template_identity,
+        template_identity_after: {
+          ...oldRecord.template_identity,
+          equivalence: 'operator_attested' as const,
+        },
+        attested_at: '2026-07-27T00:00:04.000Z',
+        reason: 'operator reviewed the immutable historical evidence',
+      },
+    };
+    manifest.stages.push(restoredRecord);
+    manifest.reinstatements.push({
+      reinstatement_id: 'reinstate-1',
+      old_record_id: oldRecord.record_id,
+      new_record_id: restoredRecord.record_id,
+      case_id: oldRecord.case_id,
+      evidence_sha256: restoredRecord.artifact_sha256,
+      compatibility: 'operator_attested',
+      reason: 'operator reviewed the immutable historical evidence',
+    });
+    return { manifest, restoredRecord };
+  }
+
+  it('accepts an append-only operator-attested reinstatement bound to historical evidence', () => {
+    const { manifest } = historicalManifest();
+
+    expect(() => validateManifestChain(manifest)).not.toThrow();
+    expect(manifest.invalidations.map(({ invalidation_id }) => invalidation_id))
+      .toEqual(['inv-1']);
+  });
+
+  it('rejects a reinstatement whose attestation does not bind a historical event', () => {
+    const { manifest, restoredRecord } = historicalManifest();
+    restoredRecord.legacy_binding_attestation.historical_event_sha256 =
+      'not-a-historical-event';
+
+    expect(() => validateManifestChain(manifest)).toThrow(
+      'legacy binding attestation historical event is missing',
+    );
+  });
+
+  it('rejects a legacy reinstatement that claims verified compatibility', () => {
+    const { manifest } = historicalManifest();
+    manifest.reinstatements[0]!.compatibility = 'verified';
+
+    expect(() => validateManifestChain(manifest)).toThrow(
+      'legacy reinstatement must remain operator_attested',
+    );
+  });
+});
+
 describe('saveManifestCas', () => {
   it('allows only one writer to commit the same expected revision', () => {
     const { path } = tempManifestPath();

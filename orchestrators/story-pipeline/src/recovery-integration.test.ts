@@ -112,6 +112,14 @@ describe('story-pipeline reconcile command parsing', () => {
         '--db', paths.db, '--dry-run', '--mystery',
       ],
     },
+    {
+      name: 'attestation without an operator reason',
+      error: 'reconcile attestation requires --attestation-reason',
+      args: (paths: ReturnType<typeof unwrittenPaths>) => [
+        'reconcile', '--config', paths.config, '--run-dir', paths.runDir,
+        '--db', paths.db, '--apply', '--attest-template-compatibility',
+      ],
+    },
   ])('rejects $name before writing anything', ({ args, error }) => {
     const paths = unwrittenPaths();
     const result = invoke(args(paths));

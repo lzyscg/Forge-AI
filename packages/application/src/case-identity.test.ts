@@ -39,6 +39,17 @@ const NO_TOOLS: PiToolDefinition[] = [];
 const logger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 const temporaryDirectories: string[] = [];
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -188,6 +199,17 @@ describe('immutable Forge Case identity', () => {
 
     expect(status.case_identity).toBeNull();
     expect(status.execution_identity).toBeNull();
+    expect(status.legacy_case_evidence).toEqual({
+      scenario_id: 'identity-scenario',
+      scenario_snapshot_sha256: createHash('sha256')
+        .update(canonicalJson(ORIGINAL_SCENARIO))
+        .digest('hex'),
+      input_payload_sha256: createHash('sha256')
+        .update(canonicalJson({ a: 1, z: 2 }))
+        .digest('hex'),
+      created_at: '2026-01-01T00:00:00.000Z',
+      protocol_identity_absent: true,
+    });
     repo.close();
   });
 });

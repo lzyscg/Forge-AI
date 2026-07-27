@@ -113,6 +113,7 @@ export interface ReconcileOptions {
   adoptCase?: string;
   attestTemplateCompatibility: boolean;
   attestLegacyCaseBindings: string[];
+  attestationReason?: string;
 }
 
 export interface ReconcileRunResult {
@@ -167,6 +168,7 @@ function parseReconcileArgs(argv: string[]): ReconcileOptions {
     'mode',
     'adopt-case',
     'attest-legacy-case-binding',
+    'attestation-reason',
   ]);
   const booleanNames = new Set([
     'dry-run',
@@ -226,6 +228,17 @@ function parseReconcileArgs(argv: string[]): ReconcileOptions {
   if (mode !== undefined && mode !== 'fake' && mode !== 'real') {
     throw new Error('reconcile --mode must be fake or real');
   }
+  const hasAttestation = booleans.has('attest-template-compatibility')
+    || values.has('attest-legacy-case-binding');
+  const attestationReason = values.get('attestation-reason')?.trim();
+  if (hasAttestation && !attestationReason) {
+    throw new Error('reconcile attestation requires --attestation-reason');
+  }
+  if (!hasAttestation && values.has('attestation-reason')) {
+    throw new Error(
+      'reconcile --attestation-reason requires an attestation flag',
+    );
+  }
   return {
     command: 'reconcile',
     configPath: resolve(process.cwd(), config),
@@ -240,6 +253,7 @@ function parseReconcileArgs(argv: string[]): ReconcileOptions {
     attestLegacyCaseBindings: values.has('attest-legacy-case-binding')
       ? [values.get('attest-legacy-case-binding')!]
       : [],
+    attestationReason,
   };
 }
 

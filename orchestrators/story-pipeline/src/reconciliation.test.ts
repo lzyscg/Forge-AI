@@ -17,10 +17,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { ForgeCaseSnapshot } from './forge-client.js';
 import { sha256 } from './hash.js';
 import type {
+  LegacyBindingAttestation,
   PipelineManifestV21,
   StageAttemptV21,
   StageRecordV21,
 } from './manifest.js';
+import { appendManifestEvent } from './manifest.js';
 import {
   materializeDeliveredArtifact,
   requireScenarioSnapshotIdentity,
@@ -453,6 +455,143 @@ describe('stage reconciliation', () => {
       attempt_id: candidate.attempt_id,
       case_id: candidate.case_id,
     }]);
+  });
+
+  it('materializes a legacy Case only with an exact historical binding attestation', () => {
+    const fixture = materializationFixture();
+    const legacyBefore = {
+      algorithm: 'legacy-unversioned-v1' as const,
+      content_sha256: 'legacy-template-hash',
+      equivalence: 'unknown' as const,
+    };
+    const legacyAfter = {
+      ...legacyBefore,
+      equivalence: 'operator_attested' as const,
+    };
+    fixture.candidate.template_identity = legacyBefore;
+    fixture.candidate.expected_scenario_snapshot_sha256 = null;
+    fixture.plan.template_identity = legacyAfter;
+    fixture.plan.expected_scenario_snapshot_sha256 = null;
+    fixture.snapshot.case_identity = null;
+    fixture.snapshot.execution_identity = null;
+    fixture.snapshot.legacy_case_evidence = {
+      scenario_id: fixture.candidate.template,
+      scenario_snapshot_sha256: 'legacy-scenario-hash',
+      input_payload_sha256: fixture.plan.input_sha256,
+      created_at: '2026-07-26T00:00:00.000Z',
+      protocol_identity_absent: true,
+    };
+    const historicalEvent = appendManifestEvent(fixture.manifest, {
+      at: '2026-07-26T00:00:01.000Z',
+      type: 'stage_started',
+      stage_key: fixture.candidate.stage_key,
+      attempt_id: fixture.candidate.attempt_id,
+      before_outcome: null,
+      after_outcome: 'running',
+      case_id: fixture.candidate.case_id,
+      artifact_id: null,
+      artifact_version: null,
+      version_id: null,
+      record_id: null,
+      reason: 'historical execution',
+      actor: 'story-pipeline',
+    });
+    const attestation: LegacyBindingAttestation = {
+      proof: 'operator_attested',
+      case_id: fixture.candidate.case_id,
+      run_id: fixture.manifest.run_id,
+      story_id: fixture.manifest.story_id,
+      stage_key: fixture.candidate.stage_key,
+      chapter_id: fixture.candidate.chapter_id,
+      input_sha256: fixture.candidate.input_sha256,
+      scenario_snapshot_sha256: 'legacy-scenario-hash',
+      attempt_id: fixture.candidate.attempt_id,
+      historical_attempt_id: fixture.candidate.attempt_id,
+      historical_event_sha256: historicalEvent.event_sha256,
+      template_identity_before: legacyBefore,
+      template_identity_after: legacyAfter,
+      attested_at: '2026-07-27T00:00:00.000Z',
+      reason: 'operator reviewed the historical Case evidence',
+    };
+
+    const record = materializeDeliveredArtifact({
+      run_dir: fixture.runDirectory,
+      manifest: fixture.manifest,
+      plan: fixture.plan,
+      attempt: fixture.candidate,
+      snapshot: fixture.snapshot,
+      validate: fixture.validate,
+      legacy_binding_attestation: attestation,
+    });
+
+    expect(record.legacy_binding_attestation).toEqual(attestation);
+    expect(record.template_identity.equivalence).toBe('operator_attested');
+  });
+
+  it('rejects legacy materialization when Case input evidence differs from the attestation', () => {
+    const fixture = materializationFixture();
+    fixture.candidate.template_identity = {
+      algorithm: 'legacy-unversioned-v1',
+      content_sha256: 'legacy-template-hash',
+      equivalence: 'unknown',
+    };
+    fixture.candidate.expected_scenario_snapshot_sha256 = null;
+    fixture.plan.template_identity = {
+      ...fixture.candidate.template_identity,
+      equivalence: 'operator_attested',
+    };
+    fixture.plan.expected_scenario_snapshot_sha256 = null;
+    fixture.snapshot.case_identity = null;
+    fixture.snapshot.execution_identity = null;
+    fixture.snapshot.legacy_case_evidence = {
+      scenario_id: fixture.candidate.template,
+      scenario_snapshot_sha256: 'legacy-scenario-hash',
+      input_payload_sha256: 'different-input',
+      created_at: '2026-07-26T00:00:00.000Z',
+      protocol_identity_absent: true,
+    };
+    const historicalEvent = appendManifestEvent(fixture.manifest, {
+      at: '2026-07-26T00:00:01.000Z',
+      type: 'stage_started',
+      stage_key: fixture.candidate.stage_key,
+      attempt_id: fixture.candidate.attempt_id,
+      before_outcome: null,
+      after_outcome: 'running',
+      case_id: fixture.candidate.case_id,
+      artifact_id: null,
+      artifact_version: null,
+      version_id: null,
+      record_id: null,
+      reason: 'historical execution',
+      actor: 'story-pipeline',
+    });
+    const attestation: LegacyBindingAttestation = {
+      proof: 'operator_attested',
+      case_id: fixture.candidate.case_id,
+      run_id: fixture.manifest.run_id,
+      story_id: fixture.manifest.story_id,
+      stage_key: fixture.candidate.stage_key,
+      chapter_id: fixture.candidate.chapter_id,
+      input_sha256: fixture.candidate.input_sha256,
+      scenario_snapshot_sha256: 'legacy-scenario-hash',
+      attempt_id: fixture.candidate.attempt_id,
+      historical_attempt_id: fixture.candidate.attempt_id,
+      historical_event_sha256: historicalEvent.event_sha256,
+      template_identity_before: fixture.candidate.template_identity,
+      template_identity_after: fixture.plan.template_identity,
+      attested_at: '2026-07-27T00:00:00.000Z',
+      reason: 'operator reviewed the historical Case evidence',
+    };
+
+    expect(() => materializeDeliveredArtifact({
+      run_dir: fixture.runDirectory,
+      manifest: fixture.manifest,
+      plan: fixture.plan,
+      attempt: fixture.candidate,
+      snapshot: fixture.snapshot,
+      validate: fixture.validate,
+      legacy_binding_attestation: attestation,
+    })).toThrow('legacy Case input evidence does not match');
   });
 
   it('extracts the immutable scenario snapshot identity captured after create', () => {

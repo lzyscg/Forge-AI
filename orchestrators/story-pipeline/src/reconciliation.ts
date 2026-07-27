@@ -24,6 +24,7 @@ import { sha256 } from './hash.js';
 import {
   appendManifestEvent,
   AttemptOutcome,
+  type LegacyBindingAttestation,
   type PipelineManifestV21,
   StageAttemptV21,
   type StageRecordV21,
@@ -67,6 +68,7 @@ export interface MaterializeDeliveredArtifactOptions {
   activation?: 'active' | 'candidate';
   completed_at?: string;
   fs_ops?: Partial<MaterializationFsOps>;
+  legacy_binding_attestation?: LegacyBindingAttestation;
 }
 
 export interface MaterializationFileStat {
@@ -365,6 +367,115 @@ function adoptionRejectionReason(
   return null;
 }
 
+function legacyAdoptionRejectionReason(
+  manifest: PipelineManifestV21,
+  plan: StagePlan,
+  attempt: StageAttemptV21,
+  snapshot: ForgeCaseSnapshot,
+  attestation: LegacyBindingAttestation,
+): string | null {
+  const evidence = snapshot.legacy_case_evidence;
+  if (
+    snapshot.case_identity !== null
+    || snapshot.execution_identity !== null
+    || !evidence
+    || evidence.protocol_identity_absent !== true
+  ) {
+    return 'legacy Case protocol evidence is unavailable';
+  }
+  if (
+    attempt.template_identity.algorithm !== 'legacy-unversioned-v1'
+    || attempt.template_identity.equivalence !== 'unknown'
+    || attempt.expected_scenario_snapshot_sha256 !== null
+    || plan.expected_scenario_snapshot_sha256 !== null
+    || plan.template_identity.algorithm !== attempt.template_identity.algorithm
+    || plan.template_identity.content_sha256
+      !== attempt.template_identity.content_sha256
+    || plan.template_identity.equivalence !== 'operator_attested'
+  ) {
+    return 'Attempt is not eligible for legacy identity attestation';
+  }
+  if (
+    attempt.stage_key !== plan.stage_key
+    || attempt.stage !== plan.stage
+    || attempt.chapter_id !== plan.chapter_id
+    || attempt.input_sha256 !== plan.input_sha256
+    || canonicalJson(attempt.parent_record_ids)
+      !== canonicalJson(plan.parent_record_ids)
+  ) {
+    return 'Attempt identity does not match the legacy stage plan';
+  }
+  if (
+    attestation.proof !== 'operator_attested'
+    || attestation.reason.trim().length === 0
+    || attestation.case_id !== attempt.case_id
+    || attestation.run_id !== manifest.run_id
+    || attestation.story_id !== manifest.story_id
+    || attestation.stage_key !== attempt.stage_key
+    || attestation.chapter_id !== attempt.chapter_id
+    || attestation.input_sha256 !== attempt.input_sha256
+    || attestation.attempt_id !== attempt.attempt_id
+    || canonicalJson(attestation.template_identity_before)
+      !== canonicalJson(attempt.template_identity)
+    || canonicalJson(attestation.template_identity_after)
+      !== canonicalJson(plan.template_identity)
+  ) {
+    return 'legacy binding attestation does not match the Attempt';
+  }
+  if (
+    evidence.scenario_id !== attempt.template
+    || evidence.input_payload_sha256 !== attempt.input_sha256
+    || evidence.input_payload_sha256 !== attestation.input_sha256
+  ) {
+    return 'legacy Case input evidence does not match';
+  }
+  if (
+    evidence.scenario_snapshot_sha256
+      !== attestation.scenario_snapshot_sha256
+  ) {
+    return 'legacy Case scenario evidence does not match';
+  }
+  const historicalEvent = manifest.events.find(
+    (event) => event.event_sha256 === attestation.historical_event_sha256,
+  );
+  const historicalAttempt = manifest.attempts.find(
+    (candidate) =>
+      candidate.attempt_id === attestation.historical_attempt_id,
+  );
+  if (
+    !historicalAttempt
+    || historicalAttempt.case_id !== attempt.case_id
+    || historicalAttempt.stage_key !== attempt.stage_key
+    || historicalAttempt.input_sha256 !== attempt.input_sha256
+    || !historicalEvent
+    || historicalEvent.case_id !== attempt.case_id
+    || historicalEvent.stage_key !== attempt.stage_key
+    || (
+      historicalEvent.attempt_id !== undefined
+      && historicalEvent.attempt_id !== null
+      && historicalEvent.attempt_id !== historicalAttempt.attempt_id
+    )
+  ) {
+    return 'legacy binding historical Attempt event does not match';
+  }
+  if (
+    snapshot.status !== 'approved'
+    || snapshot.success !== true
+    || snapshot.gate?.status !== 'pass'
+    || snapshot.final_artifact?.status !== 'delivered'
+    || snapshot.final_artifact.type !== plan.expected_artifact_type
+  ) {
+    return 'Forge legacy Case has not passed the delivery gate';
+  }
+  if (
+    snapshot.gate.artifact_version_id
+      !== snapshot.final_artifact.version_id
+  ) {
+    return 'Forge legacy gate and artifact versions do not match';
+  }
+  return null;
+}
+
 export function reconcileStage(
   plan: StagePlan,
   attempts: StageAttemptV21[],
@@ -493,7 +604,15 @@ export function materializeDeliveredArtifact(
   if (snapshot.case_id !== attempt.case_id) {
     throw new Error('Forge snapshot case id does not match the attempt');
   }
-  const rejection = adoptionRejectionReason(plan, attempt, snapshot);
+  const rejection = options.legacy_binding_attestation
+    ? legacyAdoptionRejectionReason(
+        manifest,
+        plan,
+        attempt,
+        snapshot,
+        options.legacy_binding_attestation,
+      )
+    : adoptionRejectionReason(plan, attempt, snapshot);
   if (rejection) throw new Error(rejection);
 
   const invalidated = new Set(
@@ -751,6 +870,12 @@ export function materializeDeliveredArtifact(
     artifact_version_id: artifactVersionId,
     materialization_key: materializationKey,
     completed_at: completedAt,
+    ...(options.legacy_binding_attestation
+      ? {
+          legacy_binding_attestation:
+            structuredClone(options.legacy_binding_attestation),
+        }
+      : {}),
   };
   if (options.activation === 'candidate') return record;
   const beforeOutcome = attempt.outcome;

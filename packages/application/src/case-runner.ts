@@ -26,6 +26,7 @@ import type {
   CaseRunBinding,
   ResultCaseIdentity,
   ResultExecutionIdentity,
+  ResultLegacyCaseEvidence,
 } from '@forge-ai/contracts';
 import { CaseService } from './case-service.js';
 import { TurnExecutor } from './turn-executor.js';
@@ -74,6 +75,22 @@ export interface RunCaseOptions {
 export interface ResumeCaseOptions {
   runnerToken: string;
   runnerPid?: number;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
 }
 
 export class CaseRunner {
@@ -947,6 +964,29 @@ export class CaseRunner {
         },
       };
     }
+    let legacyCaseEvidence: ResultLegacyCaseEvidence | null = null;
+    if (caseRecord && caseIdentity === null && scenarioSnapshot) {
+      let inputPayload: unknown;
+      try {
+        inputPayload = JSON.parse(String(caseRecord.input_payload));
+      } catch {
+        inputPayload = null;
+      }
+      const scenarioId = scenarioSnapshot.scenario?.id;
+      if (
+        typeof scenarioId === 'string'
+        && typeof caseRecord.created_at === 'string'
+        && inputPayload !== null
+      ) {
+        legacyCaseEvidence = {
+          scenario_id: scenarioId,
+          scenario_snapshot_sha256: sha256(canonicalJson(scenarioSnapshot)),
+          input_payload_sha256: sha256(canonicalJson(inputPayload)),
+          created_at: caseRecord.created_at,
+          protocol_identity_absent: true,
+        };
+      }
+    }
 
     // final_artifact
     let finalArtifact: ResultArtifact | null = null;
@@ -1037,6 +1077,7 @@ export class CaseRunner {
       final_artifact: finalArtifact,
       case_identity: caseIdentity,
       execution_identity: executionIdentity,
+      legacy_case_evidence: legacyCaseEvidence,
       turns: { count: turns.length, items: turnItems },
       issues: resultIssues,
       gate,

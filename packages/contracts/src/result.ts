@@ -53,6 +53,14 @@ export interface ResultExecutionIdentity {
   artifact_version_id: string;
 }
 
+export interface ResultLegacyCaseEvidence {
+  scenario_id: string;
+  scenario_snapshot_sha256: string;
+  input_payload_sha256: string;
+  created_at: string;
+  protocol_identity_absent: true;
+}
+
 export interface ResultDiff {
   from_version: number;
   to_version: number;
@@ -68,6 +76,7 @@ export interface ResultJson {
   final_artifact: ResultArtifact | null;
   case_identity: ResultCaseIdentity | null;
   execution_identity: ResultExecutionIdentity | null;
+  legacy_case_evidence?: ResultLegacyCaseEvidence | null;
   turns: { count: number; items: ResultTurnItem[] };
   issues: ResultIssue[];
   gate: ResultGate | null;

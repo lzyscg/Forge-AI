@@ -29,6 +29,24 @@ export interface TemplateIdentity {
   equivalence: 'verified' | 'operator_attested' | 'unknown';
 }
 
+export interface LegacyBindingAttestation {
+  proof: 'operator_attested';
+  case_id: string;
+  run_id: string;
+  story_id: string;
+  stage_key: string;
+  chapter_id: string | null;
+  input_sha256: string;
+  scenario_snapshot_sha256: string;
+  attempt_id: string;
+  historical_attempt_id: string;
+  historical_event_sha256: string;
+  template_identity_before: TemplateIdentity;
+  template_identity_after: TemplateIdentity;
+  attested_at: string;
+  reason: string;
+}
+
 export interface StageRecordV21 {
   record_id: string;
   revision: number;
@@ -54,6 +72,7 @@ export interface StageRecordV21 {
   artifact_type: string;
   artifact_version: number;
   completed_at: string;
+  legacy_binding_attestation?: LegacyBindingAttestation;
 }
 
 export interface StageAttemptV21 {
@@ -314,6 +333,9 @@ export function validateManifestChain(manifest: PipelineManifestV21): void {
   const recordIds = new Set<string>();
   const activeByStage = new Map<string, string>();
   const invalidated = new Set(manifest.invalidations.map((item) => item.record_id));
+  const recordsById = new Map(
+    manifest.stages.map((record) => [record.record_id, record]),
+  );
   for (const stage of manifest.stages) {
     if (recordIds.has(stage.record_id)) {
       throw new Error(`manifest contains duplicate record: ${stage.record_id}`);
@@ -338,11 +360,102 @@ export function validateManifestChain(manifest: PipelineManifestV21): void {
       throw new Error(`invalidation references missing record: ${invalidation.record_id}`);
     }
   }
+  const eventsByHash = new Map(
+    manifest.events.map((event) => [event.event_sha256, event]),
+  );
+  const attemptsById = new Map(
+    manifest.attempts.map((attempt) => [attempt.attempt_id, attempt]),
+  );
+  for (const record of manifest.stages) {
+    const attestation = record.legacy_binding_attestation;
+    if (!attestation) continue;
+    if (
+      attestation.proof !== 'operator_attested'
+      || record.template_identity.equivalence !== 'operator_attested'
+      || canonicalJson(attestation.template_identity_after)
+        !== canonicalJson(record.template_identity)
+      || attestation.reason.trim().length === 0
+    ) {
+      throw new Error('legacy binding attestation must remain operator_attested');
+    }
+    const attempt = attemptsById.get(attestation.attempt_id);
+    if (
+      !attempt
+      || attempt.case_id !== record.case_id
+      || attempt.stage_key !== record.stage_key
+      || attempt.input_sha256 !== record.input_sha256
+      || canonicalJson(attempt.template_identity)
+        !== canonicalJson(attestation.template_identity_before)
+    ) {
+      throw new Error('legacy binding attestation Attempt identity does not match');
+    }
+    if (
+      attestation.case_id !== record.case_id
+      || attestation.run_id !== manifest.run_id
+      || attestation.story_id !== manifest.story_id
+      || attestation.stage_key !== record.stage_key
+      || attestation.chapter_id !== record.chapter_id
+      || attestation.input_sha256 !== record.input_sha256
+      || attestation.scenario_snapshot_sha256.length === 0
+    ) {
+      throw new Error('legacy binding attestation record identity does not match');
+    }
+    const historicalEvent = eventsByHash.get(
+      attestation.historical_event_sha256,
+    );
+    const historicalAttempt = attemptsById.get(
+      attestation.historical_attempt_id,
+    );
+    if (
+      !historicalAttempt
+      || historicalAttempt.case_id !== record.case_id
+      || historicalAttempt.stage_key !== record.stage_key
+      || historicalAttempt.input_sha256 !== record.input_sha256
+      || !historicalEvent
+      || historicalEvent.case_id !== record.case_id
+      || historicalEvent.stage_key !== record.stage_key
+      || (
+        historicalEvent.attempt_id !== undefined
+        && historicalEvent.attempt_id !== null
+        && historicalEvent.attempt_id !== historicalAttempt.attempt_id
+      )
+    ) {
+      throw new Error('legacy binding attestation historical event is missing');
+    }
+  }
+  const reinstatementIds = new Set<string>();
+  for (const reinstatement of manifest.reinstatements) {
+    if (reinstatementIds.has(reinstatement.reinstatement_id)) {
+      throw new Error(
+        `manifest contains duplicate reinstatement: ${reinstatement.reinstatement_id}`,
+      );
+    }
+    reinstatementIds.add(reinstatement.reinstatement_id);
+    const oldRecord = recordsById.get(reinstatement.old_record_id);
+    const newRecord = recordsById.get(reinstatement.new_record_id);
+    if (
+      !oldRecord
+      || !newRecord
+      || !invalidated.has(oldRecord.record_id)
+      || oldRecord.stage_key !== newRecord.stage_key
+      || reinstatement.case_id !== newRecord.case_id
+      || reinstatement.evidence_sha256 !== newRecord.artifact_sha256
+    ) {
+      throw new Error('reinstatement evidence does not match its records');
+    }
+    if (
+      oldRecord.template_identity.algorithm === 'legacy-unversioned-v1'
+      && (
+        reinstatement.compatibility !== 'operator_attested'
+        || newRecord.template_identity.equivalence !== 'operator_attested'
+        || !newRecord.legacy_binding_attestation
+      )
+    ) {
+      throw new Error('legacy reinstatement must remain operator_attested');
+    }
+  }
   const replacementIds = new Set<string>();
   const pendingReplacementStages = new Set<string>();
-  const recordsById = new Map(
-    manifest.stages.map((record) => [record.record_id, record]),
-  );
   const dependsOn = (record: StageRecordV21, ancestorId: string): boolean => {
     const pending = [...record.parent_record_ids];
     const visited = new Set<string>();
