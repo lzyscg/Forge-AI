@@ -138,4 +138,62 @@ describe('Worker execution identity', () => {
       repo.close();
     }
   });
+
+  it('fails closed on a claimed recovery lease with an actionable transfer hint', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'forge-worker-recovery-owner-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'worker.db');
+    const scenarioPath = resolve('scenarios/copywriting/scenario.yaml');
+    const config = new FileConfigLoader().loadScenario(scenarioPath);
+    const token = 'worker-recovery-secret-token';
+    const repo = new SqliteRepository(dbPath);
+    repo.insertCase({
+      case_id: 'case-recovery-owned',
+      title: 'owned recovery case',
+      status: 'created',
+      current_stage: 'init',
+      scenario_id: config.scenario.id,
+      scenario_snapshot: JSON.stringify(config),
+      input_payload: '{}',
+      created_at: '2026-07-27T00:00:00.000Z',
+      updated_at: '2026-07-27T00:00:00.000Z',
+      completed_at: null,
+    });
+    repo.acquireExecutionLease('case-recovery-owned', {
+      runner_token_sha256: createHash('sha256').update(token).digest('hex'),
+      runner_pid: 999,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+    repo.updateCase('case-recovery-owned', { status: 'running' });
+    repo.close();
+
+    const result = spawnSync(
+      process.execPath,
+      ['--import', 'tsx/esm', resolve('apps/worker/src/main.ts')],
+      {
+        cwd: resolve('.'),
+        env: {
+          ...process.env,
+          DB_PATH: dbPath,
+          PI_MODE: 'fake',
+          SCENARIO_PATH: scenarioPath,
+          MAX_TURNS: '0',
+          FORGE_RUNNER_TOKEN: token,
+        },
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 30_000,
+        maxBuffer: 10 * 1024 * 1024,
+      },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toContain('case transfer-lease');
+    expect(`${result.stdout}${result.stderr}`).not.toContain(token);
+    const observer = new SqliteRepository(dbPath);
+    expect(observer.getExecutionLease('case-recovery-owned')?.runner_pid)
+      .toBe(999);
+    observer.close();
+  });
 });

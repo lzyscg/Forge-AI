@@ -10,7 +10,7 @@
  *    active revision count=0、delivery gate pass、Case approved。
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { resolve, dirname } from 'node:path';
 import { mkdirSync, rmSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -140,7 +140,13 @@ class BlockingFakePiAdapter extends FakePiAdapter {
   }
 }
 
-function makeRunner(repo: SqliteRepository, pi: FakePiAdapter, scenarioConfig: ScenarioConfig, maxTurns = 20): CaseRunner {
+function makeRunner(
+  repo: SqliteRepository,
+  pi: FakePiAdapter,
+  scenarioConfig: ScenarioConfig,
+  maxTurns = 20,
+  logger: Logger = silentLogger,
+): CaseRunner {
   return new CaseRunner({
     repo,
     clock: new SystemClock(),
@@ -150,7 +156,7 @@ function makeRunner(repo: SqliteRepository, pi: FakePiAdapter, scenarioConfig: S
     scenarioPath: SCENARIO_PATH,
     configLoader: new FileConfigLoader(),
     toolDefinitions: TOOL_DEFINITIONS,
-    logger: silentLogger,
+    logger,
     maxTurns,
   });
 }
@@ -213,6 +219,61 @@ describe('7.4 非终态无工具调用（5.4）', () => {
 
     pi.release();
     await firstRun;
+    expect(repo.getExecutionLease(caseId)).toMatchObject({ runner_pid: 0 });
+  });
+
+  it('clears its heartbeat timer and releases its owner after a controlled run error', async () => {
+    const throwingLogger: Logger = {
+      info: () => {
+        throw new Error('controlled runner failure');
+      },
+      error: () => {},
+      warn: () => {},
+    };
+    const runner = makeRunner(
+      repo,
+      new FakePiAdapter(),
+      scenarioConfig,
+      1,
+      throwingLogger,
+    );
+    const caseId = runner.createCase({
+      title: 'controlled failure owner release',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+    const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval');
+
+    await expect(runner.runCase(caseId, {
+      maxTurns: 1,
+      runnerToken: 'controlled-failure-token',
+      runnerPid: 303,
+    })).rejects.toThrow('controlled runner failure');
+
+    expect(clearIntervalSpy).toHaveBeenCalled();
+    expect(repo.getExecutionLease(caseId)).toMatchObject({ runner_pid: 0 });
+    clearIntervalSpy.mockRestore();
+  });
+
+  it('releases a claimed owner when human resume rejects the current state', async () => {
+    const runner = makeRunner(repo, new FakePiAdapter(), scenarioConfig, 0);
+    const caseId = runner.createCase({
+      title: 'invalid resume state',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+    const token = 'invalid-resume-token';
+    repo.acquireExecutionLease(caseId, {
+      runner_token_sha256: createHash('sha256').update(token).digest('hex'),
+      runner_pid: 0,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+    repo.updateCase(caseId, { status: 'running' });
+
+    await expect(runner.resumeCaseWithHumanInput(
+      caseId,
+      'continue',
+      { runnerToken: token, runnerPid: 404 },
+    )).rejects.toThrow();
     expect(repo.getExecutionLease(caseId)).toMatchObject({ runner_pid: 0 });
   });
 

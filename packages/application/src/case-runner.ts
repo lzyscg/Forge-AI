@@ -406,27 +406,15 @@ export class CaseRunner {
     }, 1_000);
     heartbeat.unref?.();
 
-    let completedNormally = false;
     try {
-      const result = await execute();
-      completedNormally = true;
-      return result;
+      return await execute();
     } finally {
       clearInterval(heartbeat);
-      if (completedNormally) {
-        const status = this.repo.getCase(caseId)?.status as string | undefined;
-        if (
-          status !== 'approved'
-          && status !== 'failed'
-          && status !== 'stopped'
-        ) {
-          this.caseService.releaseExecutionLeaseOwner(
-            caseId,
-            runnerToken,
-            runnerPid,
-          );
-        }
-      }
+      this.caseService.releaseExecutionLeaseOwner(
+        caseId,
+        runnerToken,
+        runnerPid,
+      );
     }
   }
 

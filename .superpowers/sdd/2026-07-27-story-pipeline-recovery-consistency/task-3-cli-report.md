@@ -116,3 +116,37 @@ The focused tests include real Worker-thread claim and stop/acquire races, a
 blocking FakePi run that observes owner PID and heartbeat while executing,
 Worker process secret/lifecycle checks, and real CLI process coverage. The full
 run retained only the pre-existing Windows symlink privilege skip note.
+
+## Full Fix Round 2
+
+The final review fix distinguishes recoverable JavaScript failures from hard
+process death while preserving explicit transfer semantics.
+
+- `CaseRunner` always clears its heartbeat timer and attempts an owner release
+  in `finally`, including controlled exceptions and invalid resume-state
+  transitions. The release remains conditional on the same token hash and PID,
+  so a concurrent transfer cannot release another owner. Terminal cleanup has
+  already deleted the lease, making the release a safe no-op.
+- A hard crash still leaves a nonzero owner PID because process-level death
+  cannot execute `finally`. A same-token runner with a different PID remains
+  fail-closed. Explicit transfer, including same-token transfer, resets the
+  owner to PID 0 and allows a new runner to claim it.
+- Worker recovery does not steal an occupied lease. Claim failure returns a
+  token-free actionable instruction to run `forge case transfer-lease` before
+  retrying.
+
+Fix-round RED:
+
+```text
+controlled run error: lease remained owned by PID 303
+invalid human resume state: lease remained owned by PID 404
+Worker recovery: owner claim failed without a case transfer-lease hint
+```
+
+Fix-round verification:
+
+```text
+focused: 3 files passed, 26 tests passed
+full: 27 files passed, 233 tests passed
+npm run check: exit 0
+```

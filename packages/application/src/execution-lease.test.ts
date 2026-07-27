@@ -156,4 +156,25 @@ describe('CaseService execution lease', () => {
     expect(repo.getCase('case-1')?.status).toBe('waiting_review');
     repo.close();
   });
+
+  it('requires explicit transfer before a new pid can claim a crashed owner', () => {
+    const { repo, service } = buildService();
+    service.acquireExecutionLease('case-1', 'recovery-token', 101);
+    service.startCase('case-1', 'recovery-token');
+
+    expect(service.claimExecutionLease('case-1', 'recovery-token', 202))
+      .toBe(false);
+    expect(repo.getExecutionLease('case-1')?.runner_pid).toBe(101);
+
+    expect(service.transferExecutionLease(
+      'case-1',
+      'recovery-token',
+      'recovery-token',
+    )).toBe(true);
+    expect(repo.getExecutionLease('case-1')?.runner_pid).toBe(0);
+    expect(service.claimExecutionLease('case-1', 'recovery-token', 202))
+      .toBe(true);
+    expect(repo.getExecutionLease('case-1')?.runner_pid).toBe(202);
+    repo.close();
+  });
 });

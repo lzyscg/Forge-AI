@@ -282,6 +282,17 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('[Fatal]', err);
+  if (
+    err instanceof Error
+    && err.message === 'Execution lease owner claim failed'
+  ) {
+    console.error(
+      "[Fatal] Execution lease owner claim failed. "
+      + "Run 'forge case transfer-lease <id> "
+      + "--old-runner-token <uuid> --new-runner-token <uuid>' before retrying.",
+    );
+  } else {
+    console.error('[Fatal]', err);
+  }
   process.exit(1);
 });
