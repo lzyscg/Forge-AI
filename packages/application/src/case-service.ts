@@ -89,6 +89,72 @@ export class CaseService {
     });
   }
 
+  acquireExecutionLease(
+    caseId: string,
+    runnerToken: string,
+    runnerPid: number,
+  ): boolean {
+    const now = this.clock.now();
+    return this.repo.acquireExecutionLease(caseId, {
+      runner_token_sha256: sha256(runnerToken),
+      runner_pid: runnerPid,
+      runner_started_at: now,
+      heartbeat_at: now,
+    });
+  }
+
+  validateExecutionLease(caseId: string, runnerToken: string): boolean {
+    return this.repo.validateExecutionLease(caseId, sha256(runnerToken));
+  }
+
+  transferExecutionLease(
+    caseId: string,
+    oldRunnerToken: string,
+    newRunnerToken: string,
+    runnerPid: number,
+  ): boolean {
+    const now = this.clock.now();
+    return this.repo.transferExecutionLease(
+      caseId,
+      sha256(oldRunnerToken),
+      {
+        runner_token_sha256: sha256(newRunnerToken),
+        runner_pid: runnerPid,
+        runner_started_at: now,
+        heartbeat_at: now,
+      },
+    );
+  }
+
+  heartbeatExecutionLease(caseId: string, runnerToken: string): boolean {
+    return this.repo.heartbeatExecutionLease(
+      caseId,
+      sha256(runnerToken),
+      this.clock.now(),
+    );
+  }
+
+  abortCase(caseId: string, runnerToken: string): 'stopped' {
+    const result = this.repo.abortCaseWithExecutionLease(
+      caseId,
+      sha256(runnerToken),
+      this.clock.now(),
+      ['running', 'repairing', 'waiting_review', 'waiting_human'],
+    );
+    if (result.ok) return result.status;
+
+    if (result.reason === 'case_not_found') {
+      throw new Error(`Case not found: ${caseId}`);
+    }
+    if (result.reason === 'invalid_token') {
+      throw new Error('Execution lease authorization failed');
+    }
+    if (result.reason === 'terminal_status') {
+      throw new Error(`Cannot abort terminal case: ${result.status}`);
+    }
+    throw new Error(`Cannot abort case in status: ${result.status}`);
+  }
+
   transitionCaseStatus(caseId: string, to: CaseStatus): void {
     const record = this.repo.getCase(caseId);
     if (!record) throw new Error(`Case not found: ${caseId}`);
@@ -103,6 +169,10 @@ export class CaseService {
       fields.completed_at = this.clock.now();
     }
 
+    if (to === 'approved' || to === 'failed' || to === 'stopped') {
+      this.repo.updateCaseAndClearExecutionLease(caseId, fields);
+      return;
+    }
     this.repo.updateCase(caseId, fields);
   }
 

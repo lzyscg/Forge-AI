@@ -5,7 +5,12 @@
 
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
-import type { RepositoryPort } from '@forge-ai/contracts';
+import type {
+  CaseStatus,
+  ExecutionLease,
+  ExecutionLeaseAbortResult,
+  RepositoryPort,
+} from '@forge-ai/contracts';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cases (
@@ -25,6 +30,19 @@ CREATE TABLE IF NOT EXISTS cases (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS execution_leases (
+  case_id TEXT PRIMARY KEY,
+  runner_token_sha256 TEXT NOT NULL,
+  runner_pid INTEGER NOT NULL,
+  runner_started_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS case_stop_authorizations (
+  case_id TEXT PRIMARY KEY,
+  runner_token_sha256 TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS agent_sessions (
@@ -288,6 +306,139 @@ export class SqliteRepository implements RepositoryPort {
 
   getCasesByStatus(status: string): Record<string, unknown>[] {
     return this.db.prepare('SELECT * FROM cases WHERE status = ?').all(status) as Record<string, unknown>[];
+  }
+
+  acquireExecutionLease(caseId: string, lease: ExecutionLease): boolean {
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO execution_leases (
+        case_id, runner_token_sha256, runner_pid, runner_started_at, heartbeat_at
+      )
+      SELECT @case_id, @runner_token_sha256, @runner_pid, @runner_started_at, @heartbeat_at
+      WHERE EXISTS (SELECT 1 FROM cases WHERE case_id = @case_id)
+    `).run({ case_id: caseId, ...lease });
+    return result.changes === 1;
+  }
+
+  getExecutionLease(caseId: string): ExecutionLease | null {
+    const lease = this.db.prepare(`
+      SELECT runner_token_sha256, runner_pid, runner_started_at, heartbeat_at
+      FROM execution_leases
+      WHERE case_id = ?
+    `).get(caseId) as ExecutionLease | undefined;
+    return lease ?? null;
+  }
+
+  validateExecutionLease(caseId: string, runnerTokenSha256: string): boolean {
+    const row = this.db.prepare(`
+      SELECT 1
+      FROM execution_leases
+      WHERE case_id = ? AND runner_token_sha256 = ?
+    `).get(caseId, runnerTokenSha256);
+    return row !== undefined;
+  }
+
+  transferExecutionLease(
+    caseId: string,
+    oldRunnerTokenSha256: string,
+    lease: ExecutionLease,
+  ): boolean {
+    const result = this.db.prepare(`
+      UPDATE execution_leases
+      SET runner_token_sha256 = @runner_token_sha256,
+          runner_pid = @runner_pid,
+          runner_started_at = @runner_started_at,
+          heartbeat_at = @heartbeat_at
+      WHERE case_id = @case_id
+        AND runner_token_sha256 = @old_runner_token_sha256
+    `).run({
+      case_id: caseId,
+      old_runner_token_sha256: oldRunnerTokenSha256,
+      ...lease,
+    });
+    return result.changes === 1;
+  }
+
+  heartbeatExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    heartbeatAt: string,
+  ): boolean {
+    const result = this.db.prepare(`
+      UPDATE execution_leases
+      SET heartbeat_at = ?
+      WHERE case_id = ? AND runner_token_sha256 = ?
+    `).run(heartbeatAt, caseId, runnerTokenSha256);
+    return result.changes === 1;
+  }
+
+  abortCaseWithExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    stoppedAt: string,
+    abortableStatuses: readonly CaseStatus[],
+  ): ExecutionLeaseAbortResult {
+    const abort = this.db.transaction((): ExecutionLeaseAbortResult => {
+      const caseRow = this.db.prepare(
+        'SELECT status FROM cases WHERE case_id = ?',
+      ).get(caseId) as { status: CaseStatus } | undefined;
+      if (!caseRow) return { ok: false, reason: 'case_not_found' };
+
+      if (caseRow.status === 'stopped') {
+        const authorization = this.db.prepare(`
+          SELECT 1
+          FROM case_stop_authorizations
+          WHERE case_id = ? AND runner_token_sha256 = ?
+        `).get(caseId, runnerTokenSha256);
+        return authorization
+          ? { ok: true, status: 'stopped' }
+          : { ok: false, reason: 'invalid_token', status: caseRow.status };
+      }
+
+      if (caseRow.status === 'approved' || caseRow.status === 'failed') {
+        return { ok: false, reason: 'terminal_status', status: caseRow.status };
+      }
+      if (!abortableStatuses.includes(caseRow.status)) {
+        return { ok: false, reason: 'invalid_status', status: caseRow.status };
+      }
+
+      const lease = this.db.prepare(`
+        SELECT 1
+        FROM execution_leases
+        WHERE case_id = ? AND runner_token_sha256 = ?
+      `).get(caseId, runnerTokenSha256);
+      if (!lease) {
+        return { ok: false, reason: 'invalid_token', status: caseRow.status };
+      }
+
+      this.db.prepare(`
+        UPDATE cases
+        SET status = 'stopped', updated_at = ?, completed_at = ?
+        WHERE case_id = ?
+      `).run(stoppedAt, stoppedAt, caseId);
+      this.db.prepare(`
+        INSERT INTO case_stop_authorizations (case_id, runner_token_sha256)
+        VALUES (?, ?)
+        ON CONFLICT(case_id) DO UPDATE SET runner_token_sha256 = excluded.runner_token_sha256
+      `).run(caseId, runnerTokenSha256);
+      this.db.prepare('DELETE FROM execution_leases WHERE case_id = ?').run(caseId);
+      return { ok: true, status: 'stopped' };
+    });
+    return abort.immediate();
+  }
+
+  clearExecutionLease(caseId: string): void {
+    this.db.prepare('DELETE FROM execution_leases WHERE case_id = ?').run(caseId);
+  }
+
+  updateCaseAndClearExecutionLease(
+    caseId: string,
+    fields: Record<string, unknown>,
+  ): void {
+    const update = this.db.transaction(() => {
+      this.updateCase(caseId, fields);
+      this.clearExecutionLease(caseId);
+    });
+    update.immediate();
   }
 
   // === Turns ===

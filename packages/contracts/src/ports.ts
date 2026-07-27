@@ -4,6 +4,11 @@
 
 import type { DeliveryValidatorConfig, ScenarioConfig } from './scenario.js';
 import type { ToolName } from './tools.js';
+import type {
+  CaseStatus,
+  ExecutionLease,
+  ExecutionLeaseAbortResult,
+} from './case.js';
 
 // === Pi 端口 ===
 export interface PiSessionOptions {
@@ -86,6 +91,30 @@ export interface RepositoryPort {
   updateCase(caseId: string, fields: Record<string, unknown>): void;
   getCase(caseId: string): Record<string, unknown> | null;
   getCasesByStatus(status: string): Record<string, unknown>[];
+  acquireExecutionLease(caseId: string, lease: ExecutionLease): boolean;
+  getExecutionLease(caseId: string): ExecutionLease | null;
+  validateExecutionLease(caseId: string, runnerTokenSha256: string): boolean;
+  transferExecutionLease(
+    caseId: string,
+    oldRunnerTokenSha256: string,
+    lease: ExecutionLease,
+  ): boolean;
+  heartbeatExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    heartbeatAt: string,
+  ): boolean;
+  abortCaseWithExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    stoppedAt: string,
+    abortableStatuses: readonly CaseStatus[],
+  ): ExecutionLeaseAbortResult;
+  clearExecutionLease(caseId: string): void;
+  updateCaseAndClearExecutionLease(
+    caseId: string,
+    fields: Record<string, unknown>,
+  ): void;
 
   // Turns
   insertTurn(record: Record<string, unknown>): void;

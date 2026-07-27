@@ -13,6 +13,21 @@ export type CaseStatus =
   | 'stopped'
   | 'failed';
 
+export interface ExecutionLease {
+  runner_token_sha256: string;
+  runner_pid: number;
+  runner_started_at: string;
+  heartbeat_at: string;
+}
+
+export type ExecutionLeaseAbortResult =
+  | { ok: true; status: 'stopped' }
+  | {
+      ok: false;
+      reason: 'case_not_found' | 'invalid_token' | 'terminal_status' | 'invalid_status';
+      status?: CaseStatus;
+    };
+
 export interface CaseRunBinding {
   run_id: string | null;
   story_id: string | null;
