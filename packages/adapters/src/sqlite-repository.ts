@@ -3,13 +3,16 @@
  * 启用 WAL 模式 + busy-timeout（worker 写、web 回放页轮询读会同时访问同一个数据库文件）
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
-  copyFileSync,
+  chmodSync,
   existsSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
   rmdirSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +23,132 @@ import type {
   ExecutionLeaseAbortResult,
   RepositoryPort,
 } from '@forge-ai/contracts';
+
+const READONLY_SNAPSHOT_PREFIX = 'forge-readonly-db-';
+const READONLY_SNAPSHOT_ATTEMPTS = 12;
+
+interface SnapshotFile {
+  bytes: Buffer;
+  length: number;
+  sha256: string;
+}
+
+interface SQLiteSourceImage {
+  database: SnapshotFile;
+  wal: SnapshotFile | null;
+}
+
+function snapshotFile(path: string): SnapshotFile {
+  const bytes = readFileSync(path);
+  return {
+    bytes,
+    length: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  };
+}
+
+function optionalSnapshotFile(path: string): SnapshotFile | null {
+  try {
+    return snapshotFile(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function sourceImage(dbPath: string): SQLiteSourceImage {
+  return {
+    database: snapshotFile(dbPath),
+    wal: optionalSnapshotFile(`${dbPath}-wal`),
+  };
+}
+
+function sameSnapshotFile(
+  left: SnapshotFile | null,
+  right: SnapshotFile | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return left.length === right.length && left.sha256 === right.sha256;
+}
+
+function sameSourceImage(
+  left: SQLiteSourceImage,
+  right: SQLiteSourceImage,
+): boolean {
+  return sameSnapshotFile(left.database, right.database)
+    && sameSnapshotFile(left.wal, right.wal);
+}
+
+function removeSnapshotFiles(directory: string): void {
+  if (!existsSync(directory)) return;
+  for (const name of readdirSync(directory)) {
+    rmSync(join(directory, name), { force: true });
+  }
+}
+
+function cleanupSnapshotDirectory(directory: string): void {
+  if (!existsSync(directory)) return;
+  removeSnapshotFiles(directory);
+  rmdirSync(directory);
+}
+
+function openStableReadonlySnapshot(
+  sourcePath: string,
+  directory: string,
+): Database.Database {
+  const snapshotPath = join(directory, 'forge.db');
+  let lastError: unknown;
+  for (
+    let attempt = 1;
+    attempt <= READONLY_SNAPSHOT_ATTEMPTS;
+    attempt += 1
+  ) {
+    let database: Database.Database | null = null;
+    try {
+      removeSnapshotFiles(directory);
+      const before = sourceImage(sourcePath);
+      writeFileSync(snapshotPath, before.database.bytes);
+      chmodSync(snapshotPath, 0o600);
+      if (before.wal) {
+        writeFileSync(`${snapshotPath}-wal`, before.wal.bytes);
+        chmodSync(`${snapshotPath}-wal`, 0o600);
+      }
+      const after = sourceImage(sourcePath);
+      const copied = sourceImage(snapshotPath);
+      if (
+        !sameSourceImage(before, after)
+        || !sameSourceImage(before, copied)
+      ) {
+        continue;
+      }
+
+      database = new Database(snapshotPath, { fileMustExist: true });
+      database.pragma('busy_timeout = 5000');
+      database.pragma('query_only = ON');
+      const quickCheck = database.pragma('quick_check') as Array<
+        Record<string, unknown>
+      >;
+      if (
+        quickCheck.length !== 1
+        || Object.values(quickCheck[0]!)[0] !== 'ok'
+      ) {
+        throw new Error('SQLite quick_check rejected the snapshot');
+      }
+      return database;
+    } catch (error) {
+      lastError = error;
+      try {
+        database?.close();
+      } finally {
+        removeSnapshotFiles(directory);
+      }
+    }
+  }
+  throw new Error(
+    'could not capture a stable read-only SQLite snapshot',
+    { cause: lastError },
+  );
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cases (
@@ -244,50 +373,38 @@ export class SqliteRepository implements RepositoryPort {
     options: { readonly?: boolean } = {},
   ) {
     const readonly = options.readonly === true;
-    let openPath = dbPath;
+    const openPath = dbPath;
     if (readonly) {
-      this.readonlySnapshotDirectory = mkdtempSync(
-        join(tmpdir(), 'forge-readonly-db-'),
+      const snapshotDirectory = mkdtempSync(
+        join(tmpdir(), READONLY_SNAPSHOT_PREFIX),
       );
-      openPath = join(this.readonlySnapshotDirectory, 'forge.db');
-      copyFileSync(dbPath, openPath);
-      for (const suffix of ['-wal']) {
-        if (existsSync(`${dbPath}${suffix}`)) {
-          copyFileSync(`${dbPath}${suffix}`, `${openPath}${suffix}`);
-        }
+      try {
+        chmodSync(snapshotDirectory, 0o700);
+        this.db = openStableReadonlySnapshot(dbPath, snapshotDirectory);
+        this.readonlySnapshotDirectory = snapshotDirectory;
+        return;
+      } catch (error) {
+        cleanupSnapshotDirectory(snapshotDirectory);
+        throw error;
       }
     }
-    this.db = new Database(
-      openPath,
-      readonly ? { fileMustExist: true } : undefined,
-    );
+    this.db = new Database(openPath);
     // 启用 WAL 模式 + busy-timeout
     this.db.pragma('busy_timeout = 5000');
-    if (readonly) {
-      this.db.pragma('query_only = ON');
-    } else {
-      this.db.pragma('journal_mode = WAL');
-      this.db.exec(SCHEMA);
-      this.migrateIdentitySchema();
-    }
+    this.db.pragma('journal_mode = WAL');
+    this.db.exec(SCHEMA);
+    this.migrateIdentitySchema();
   }
 
   close(): void {
-    this.db.close();
-    if (this.readonlySnapshotDirectory) {
-      const snapshotPath = join(
-        this.readonlySnapshotDirectory,
-        'forge.db',
-      );
-      for (const path of [
-        `${snapshotPath}-shm`,
-        `${snapshotPath}-wal`,
-        snapshotPath,
-      ]) {
-        rmSync(path, { force: true });
+    try {
+      this.db.close();
+    } finally {
+      if (this.readonlySnapshotDirectory) {
+        const snapshotDirectory = this.readonlySnapshotDirectory;
+        this.readonlySnapshotDirectory = null;
+        cleanupSnapshotDirectory(snapshotDirectory);
       }
-      rmdirSync(this.readonlySnapshotDirectory);
-      this.readonlySnapshotDirectory = null;
     }
   }
 
