@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -236,6 +237,9 @@ function fixture() {
     sha256(JSON.stringify(draftA5Input)),
     'inputs/draft-a5.json', 'draft-template-a5', 'interrupted',
   );
+  // Real schema-2.0 orphan Attempts had no Stage Record from which to
+  // migrate parent_record_ids.
+  draftA5.parent_record_ids = [];
   const draftA6 = attempt(
     'draft-a6', 'draft-b001', 'case-draft-a6',
     sha256(JSON.stringify(draftA6Input)),
@@ -447,8 +451,27 @@ describe('append-only historical recovery', () => {
         outline: state.validate,
         'packet-b001': state.validate,
       },
-      validator_for_attempt: (selected) => {
+      validator_for_attempt: (selected, recoveryManifest) => {
         validatorAttempts.push(selected.attempt_id);
+        if (selected.stage_key === 'draft-b001') {
+          const invalidated = new Set(
+            recoveryManifest.invalidations.map(({ record_id }) => record_id),
+          );
+          const activePacket = recoveryManifest.stages.find(
+            (record) =>
+              record.stage_key === 'packet-b001'
+              && !invalidated.has(record.record_id),
+          );
+          const oldPacket = state.manifest.stages.find(
+            (record) => record.record_id === 'packet-b001-v1',
+          )!;
+          expect(selected.parent_record_ids).toEqual(['packet-b001-v2']);
+          expect(activePacket).toMatchObject({
+            record_id: 'packet-b001-v2',
+            case_id: oldPacket.case_id,
+            artifact_sha256: oldPacket.artifact_sha256,
+          });
+        }
         return state.validate;
       },
       now: '2026-07-27T00:00:00.000Z',
@@ -457,7 +480,7 @@ describe('append-only historical recovery', () => {
     expect(validatorAttempts).toEqual([
       'outline-a1',
       'packet-a1',
-      'draft-a5',
+      'draft-a5-adoption',
     ]);
     expect(applied.ambiguous).toEqual([]);
     expect(applied.next_stage).toBe('ledger-b001');
@@ -551,6 +574,36 @@ describe('append-only historical recovery', () => {
       },
     })).toThrow('legacy Case scenario does not match the historical Attempt');
     expect(JSON.stringify(state.manifest)).toBe(before);
+  });
+
+  it('keeps failure zero-write when the projected draft parent cannot be validated', () => {
+    const state = fixture();
+    const before = JSON.stringify(state.manifest);
+
+    expect(() => recoverLegacyHistory({
+      run_dir: state.runDir,
+      manifest: state.manifest,
+      chapter_ids: ['B001'],
+      snapshots: state.snapshots,
+      apply: true,
+      adopt_case: 'case-draft-a5',
+      attest_template_compatibility: true,
+      legacy_case_bindings: ['case-draft-a5:draft-b001'],
+      attestation_reason:
+        'operator compared immutable DB input and file evidence',
+      validators: {
+        outline: state.validate,
+        'packet-b001': state.validate,
+      },
+      validator_for_attempt: (selected) => {
+        if (selected.stage_key === 'draft-b001') {
+          throw new Error('projected draft parent rejected');
+        }
+        return state.validate;
+      },
+    })).toThrow('projected draft parent rejected');
+    expect(JSON.stringify(state.manifest)).toBe(before);
+    expect(existsSync(join(state.runDir, 'materialized'))).toBe(false);
   });
 
   it('reconcileRun commits the attested recovery once without creating or running a Case', async () => {

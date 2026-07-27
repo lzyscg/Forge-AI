@@ -1743,11 +1743,11 @@ export async function reconcileRun(
       attestation_reason: options.attestationReason,
       validators,
       validator_for_attempt: pendingLegacyReinstatement
-        ? (attempt) =>
+        ? (attempt, recoveryManifest) =>
             validators[attempt.stage_key]
             ?? recoveryValidatorFromEvidence(
               config,
-              initialManifest,
+              recoveryManifest,
               attempt,
               options.runDir,
             )

@@ -67,6 +67,7 @@ export interface HistoricalRecoveryOptions {
   validators: Record<string, (content: string) => ValidationResult>;
   validator_for_attempt?: (
     attempt: StageAttemptV21,
+    manifest: PipelineManifestV21,
   ) => (content: string) => ValidationResult;
   now?: string;
 }
@@ -424,8 +425,9 @@ export function recoverLegacyHistory(
 
   const validatorForAttempt = (
     attempt: StageAttemptV21,
+    manifest: PipelineManifestV21,
   ): ((content: string) => ValidationResult) | undefined =>
-    options.validator_for_attempt?.(attempt)
+    options.validator_for_attempt?.(attempt, manifest)
       ?? options.validators[attempt.stage_key];
 
   for (const oldRecord of pendingReinstatements) {
@@ -473,7 +475,7 @@ export function recoverLegacyHistory(
       oldRecord.artifact_type,
       oldRecord.raw_artifact_sha256,
     );
-    const validator = validatorForAttempt(historicalAttempt);
+    const validator = validatorForAttempt(historicalAttempt, working);
     if (!validator) {
       throw new Error(`historical validator is missing: ${oldRecord.stage_key}`);
     }
@@ -783,7 +785,7 @@ export function recoverLegacyHistory(
     parent_record_ids: [packetRecord.record_id],
     template_identity: afterIdentity,
   };
-  const validator = validatorForAttempt(selected);
+  const validator = validatorForAttempt(projection, working);
   if (!validator) throw new Error(`historical validator is missing: ${draftStageKey}`);
   const record = materializeDeliveredArtifact({
     run_dir: options.run_dir,
