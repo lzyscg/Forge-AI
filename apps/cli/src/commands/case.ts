@@ -4,7 +4,12 @@
 import { Command } from 'commander';
 import { dirname, basename } from 'node:path';
 import { existsSync } from 'node:fs';
-import { CaseRunner, ConcurrentCaseError, type Logger } from '@forge-ai/application';
+import {
+  CaseRunner,
+  CaseService,
+  ConcurrentCaseError,
+  type Logger,
+} from '@forge-ai/application';
 import { resolveFromRoot, FakePiAdapter, ScriptArtifactValidator } from '@forge-ai/adapters';
 import type { ResultJson } from '@forge-ai/contracts';
 import { writeFirstLine, writeResultLine, writeErrorLine, writeStdoutLine } from '../output.js';
@@ -83,6 +88,7 @@ export function registerCaseCommand(program: Command): void {
   // forge case run <id>
   caseCmd
     .command('run <id>')
+    .requiredOption('--runner-token <uuid>', 'Execution lease token')
     .description('运行 Case（默认阻塞到终态）')
     .option('--wait', '阻塞等待完成（默认）', true)
     .option('--max-turns <n>', '最大 Turn 数', '20')
@@ -91,6 +97,7 @@ export function registerCaseCommand(program: Command): void {
     .option('--mode <mode>', 'Pi 模式 (fake|real)')
     .option('--human', '人类可读格式输出')
     .action(async (id: string, opts) => {
+      let repo: ReturnType<typeof initInfra>['repo'] | undefined;
       try {
         // resolveWriteDbPath/resolveMode 必须在 try 内：--env all 会抛错，
         // 需走 writeErrorLine（stdout errorJson + exit 非 0），不能漏到 stderr 堆栈（坑 19）。
@@ -99,7 +106,9 @@ export function registerCaseCommand(program: Command): void {
         const logPath = resolveFromRoot('data', `case-${id}.log`);
         const logger = createFileLogger(logPath);
 
-        const { repo, clock, idGen, configLoader } = initInfra(dbPath);
+        const infra = initInfra(dbPath);
+        repo = infra.repo;
+        const { clock, idGen, configLoader } = infra;
 
         // 从 case 记录获取 scenario 信息
         const caseRecord = repo.getCase(id);
@@ -140,7 +149,11 @@ export function registerCaseCommand(program: Command): void {
         runner.assertNoConcurrentCase(id); // 先检查并发
         writeFirstLine(id);                // 通过后才写第一行
 
-        const result = await runner.runCase(id, { maxTurns });
+        const result = await runner.runCase(id, {
+          maxTurns,
+          runnerToken: opts.runnerToken,
+          runnerPid: process.pid,
+        });
         writeResultLine(result);
         repo.close();
       } catch (e) {
@@ -150,6 +163,7 @@ export function registerCaseCommand(program: Command): void {
           const msg = e instanceof Error ? e.message : String(e);
           writeErrorLine(msg);
         }
+        repo?.close();
         process.exit(1);
       }
     });
@@ -275,6 +289,7 @@ export function registerCaseCommand(program: Command): void {
   // forge case resume <id>
   caseCmd
     .command('resume <id>')
+    .requiredOption('--runner-token <uuid>', 'Execution lease token')
     .description('人工输入后续跑 Case')
     .requiredOption('--answer <text>', '人工回答')
     .option('--db <path>', '数据库路径（显式覆盖，优先级最高）')
@@ -282,6 +297,7 @@ export function registerCaseCommand(program: Command): void {
     .option('--mode <mode>', 'Pi 模式 (fake|real)')
     .option('--human', '人类可读格式输出')
     .action(async (id: string, opts) => {
+      let repo: ReturnType<typeof initInfra>['repo'] | undefined;
       try {
         // resolveWriteDbPath/resolveMode 必须在 try 内：--env all 会抛错，
         // 需走 writeErrorLine（stdout errorJson + exit 非 0），不能漏到 stderr 堆栈（坑 19）。
@@ -290,7 +306,9 @@ export function registerCaseCommand(program: Command): void {
         const logPath = resolveFromRoot('data', `case-${id}.log`);
         const logger = createFileLogger(logPath);
 
-        const { repo, clock, idGen, configLoader } = initInfra(dbPath);
+        const infra = initInfra(dbPath);
+        repo = infra.repo;
+        const { clock, idGen, configLoader } = infra;
 
         const caseRecord = repo.getCase(id);
         if (!caseRecord) {
@@ -324,7 +342,11 @@ export function registerCaseCommand(program: Command): void {
 
         runner.assertNoConcurrentCase(id); // 先检查并发
         writeFirstLine(id);                // 通过后才写第一行
-        const result = await runner.resumeCaseWithHumanInput(id, opts.answer);
+        const result = await runner.resumeCaseWithHumanInput(
+          id,
+          opts.answer,
+          { runnerToken: opts.runnerToken },
+        );
         writeResultLine(result);
         repo.close();
       } catch (e) {
@@ -334,6 +356,78 @@ export function registerCaseCommand(program: Command): void {
           const msg = e instanceof Error ? e.message : String(e);
           writeErrorLine(msg);
         }
+        repo?.close();
+        process.exit(1);
+      }
+    });
+
+  // forge case abort <id>
+  caseCmd
+    .command('abort <id>')
+    .description('Abort a Case with execution lease authorization')
+    .requiredOption('--runner-token <uuid>', 'Execution lease token')
+    .option('--db <path>', 'Database path')
+    .option('--env <production|test|all>', 'Database environment')
+    .option('--human', 'Human-readable output')
+    .action((id: string, opts) => {
+      let repo: ReturnType<typeof initInfra>['repo'] | undefined;
+      try {
+        const dbPath = resolveWriteDbPath(opts.db, opts.env);
+        const infra = initInfra(dbPath);
+        repo = infra.repo;
+        const service = new CaseService(repo, infra.clock, infra.idGen);
+        const status = service.abortCase(id, opts.runnerToken);
+
+        if (opts.human) {
+          process.stdout.write(`Case ${id} aborted (${status})\n`);
+        } else {
+          writeStdoutLine({ case_id: id, status });
+        }
+        repo.close();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        writeErrorLine(msg);
+        repo?.close();
+        process.exit(1);
+      }
+    });
+
+  // forge case transfer-lease <id>
+  caseCmd
+    .command('transfer-lease <id>')
+    .description('Atomically transfer a Case execution lease')
+    .requiredOption('--old-runner-token <uuid>', 'Current execution lease token')
+    .requiredOption('--new-runner-token <uuid>', 'Replacement execution lease token')
+    .option('--db <path>', 'Database path')
+    .option('--env <production|test|all>', 'Database environment')
+    .option('--human', 'Human-readable output')
+    .action((id: string, opts) => {
+      let repo: ReturnType<typeof initInfra>['repo'] | undefined;
+      try {
+        const dbPath = resolveWriteDbPath(opts.db, opts.env);
+        const infra = initInfra(dbPath);
+        repo = infra.repo;
+        const service = new CaseService(repo, infra.clock, infra.idGen);
+        const transferred = service.transferExecutionLease(
+          id,
+          opts.oldRunnerToken,
+          opts.newRunnerToken,
+          process.pid,
+        );
+        if (!transferred) {
+          throw new Error('Execution lease authorization failed');
+        }
+
+        if (opts.human) {
+          process.stdout.write(`Case ${id} lease transferred\n`);
+        } else {
+          writeStdoutLine({ case_id: id, lease_transferred: true });
+        }
+        repo.close();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        writeErrorLine(msg);
+        repo?.close();
         process.exit(1);
       }
     });
@@ -361,6 +455,13 @@ export function registerCaseCommand(program: Command): void {
         const terminalStatuses = ['approved', 'failed', 'stopped'];
         if (terminalStatuses.includes(status)) {
           writeErrorLine(`Case already in terminal state: ${status}`);
+          repo.close();
+          process.exit(1);
+        }
+        if (repo.getExecutionLease(id)) {
+          writeErrorLine(
+            'Cannot stop a leased case. Use case abort with the matching runner token.',
+          );
           repo.close();
           process.exit(1);
         }
