@@ -15,6 +15,10 @@ import {
 import type { ScenarioConfig } from '@forge-ai/contracts';
 
 const IGNORED_DIRECTORIES = new Set(['__pycache__', '.pytest_cache']);
+const IGNORED_SCENARIO_ROOT_FILES = new Set([
+  'fake-pi-script.json',
+  'input.example.json',
+]);
 
 export interface ScenarioBundleFileSystem {
   lstatSync(path: string): Stats;
@@ -124,6 +128,12 @@ export function computeScenarioBundleSha256(
     for (const name of fileSystem.readdirSync(realDirectory).sort()) {
       const target = resolve(realDirectory, name);
       const stat = lstatWithoutSymlink(target, description);
+      if (
+        relative(root, realDirectory) === ''
+        && IGNORED_SCENARIO_ROOT_FILES.has(name)
+      ) {
+        continue;
+      }
       if (IGNORED_DIRECTORIES.has(name) || isIgnoredFile(name)) continue;
       if (stat.isDirectory()) {
         visitDirectory(target, description);

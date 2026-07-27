@@ -210,6 +210,46 @@ describe('scenario bundle identity', () => {
       fileSystemTreatingAsSymlink(promptDirectory),
     )).toThrow(/symbolic link/i);
   });
+
+  it('excludes root runtime fixtures while tracking root validator helper and data files', () => {
+    const root = temporaryRoot('forge-root-validator-bundle-');
+    const scenarioPath = join(root, 'scenario.yaml');
+    writeFileSync(scenarioPath, 'scenario: identity\n', 'utf8');
+    writeFileSync(join(root, 'validator.py'), 'from helper import VALUE\n', 'utf8');
+    writeFileSync(join(root, 'helper.py'), 'VALUE = "v1"\n', 'utf8');
+    writeFileSync(join(root, 'rules.json'), '{"minimum":1}\n', 'utf8');
+    writeFileSync(join(root, 'input.example.json'), '{"sample":"v1"}\n', 'utf8');
+    writeFileSync(join(root, 'fake-pi-script.json'), '{"turns":[]}\n', 'utf8');
+    const config = {
+      scenario: { id: 'identity', name: 'Identity', version: 1 },
+      input_fields: [],
+      agents: [],
+      start_agent: 'validator',
+      routes: [],
+      context_rules: {},
+      artifact_types: [{ type: 'draft', diff: 'line' }],
+      delivery: {
+        deliverable_artifact_type: 'draft',
+        validators: [{
+          id: 'surface',
+          command: 'python',
+          entrypoint: 'validator.py',
+        }],
+      },
+    } satisfies ScenarioConfig;
+    const original = computeScenarioBundleSha256(scenarioPath, config);
+
+    writeFileSync(join(root, 'input.example.json'), '{"sample":"v2"}\n', 'utf8');
+    writeFileSync(join(root, 'fake-pi-script.json'), '{"turns":[{"runtime":true}]}\n', 'utf8');
+    expect(computeScenarioBundleSha256(scenarioPath, config)).toBe(original);
+
+    writeFileSync(join(root, 'helper.py'), 'VALUE = "v2"\n', 'utf8');
+    expect(computeScenarioBundleSha256(scenarioPath, config)).not.toBe(original);
+
+    writeFileSync(join(root, 'helper.py'), 'VALUE = "v1"\n', 'utf8');
+    writeFileSync(join(root, 'rules.json'), '{"minimum":2}\n', 'utf8');
+    expect(computeScenarioBundleSha256(scenarioPath, config)).not.toBe(original);
+  });
 });
 
 describe('SQLite identity migration', () => {
