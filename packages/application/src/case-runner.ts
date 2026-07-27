@@ -4,6 +4,7 @@
  * 铁律 1：不硬编码业务角色名，所有角色来自配置。
  */
 
+import { createHash } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import type {
   RepositoryPort,
@@ -62,6 +63,16 @@ export interface CaseRunnerOptions {
   artifactValidator?: ArtifactValidatorPort;
   templateBundleSha256?: string | null;
   maxTurns?: number; // 默认 20
+}
+
+export interface RunCaseOptions {
+  maxTurns?: number;
+  runnerToken?: string;
+  runnerPid?: number;
+}
+
+export interface ResumeCaseOptions {
+  runnerToken?: string;
 }
 
 export class CaseRunner {
@@ -133,24 +144,52 @@ export class CaseRunner {
       inputPayload: input.inputPayload,
       runBinding: input.runBinding,
     });
-    this.caseService.startCase(caseId);
     return caseId;
   }
 
   /**
    * 运行 Case（含崩溃恢复 + 并发守卫 + Turn 循环）
    */
-  async runCase(caseId: string, opts?: { maxTurns?: number }): Promise<ResultJson> {
+  async runCase(caseId: string, opts?: RunCaseOptions): Promise<ResultJson> {
     const maxTurns = opts?.maxTurns ?? this.maxTurns;
+    const runnerToken = opts?.runnerToken;
 
     // 1. 终态 case → 幂等返回（不报错）
     const caseRecord = this.repo.getCase(caseId);
     if (!caseRecord) {
       throw new Error(`Case not found: ${caseId}`);
     }
-    const status = caseRecord.status as string;
+    let status = caseRecord.status as string;
     if (status === 'approved' || status === 'failed' || status === 'stopped') {
       return this.buildResultJson(caseId);
+    }
+
+    let lease = this.repo.getExecutionLease(caseId);
+    if (status === 'created' && !lease && runnerToken !== undefined) {
+      const acquired = this.caseService.acquireExecutionLease(
+        caseId,
+        runnerToken,
+        opts?.runnerPid ?? process.pid,
+      );
+      if (!acquired) {
+        throw new Error('Execution lease acquisition failed');
+      }
+      lease = this.repo.getExecutionLease(caseId);
+    }
+    if (lease) {
+      if (
+        runnerToken === undefined
+        || !this.caseService.validateExecutionLease(caseId, runnerToken)
+      ) {
+        throw new Error('Execution lease authorization failed');
+      }
+    } else if (runnerToken !== undefined) {
+      throw new Error('Execution lease authorization failed');
+    }
+
+    if (status === 'created') {
+      this.caseService.startCase(caseId, runnerToken);
+      status = 'running';
     }
 
     // 2. waiting_human → 返回 JSON + action_required hint
@@ -164,7 +203,12 @@ export class CaseRunner {
     this.assertNoConcurrentCase(caseId);
 
     // 4. RecoveryService.recoverCase（只恢复传入 caseId）
-    const recoveryResult = this.recoveryService.recoverCase(caseId);
+    const recoveryResult = this.recoveryService.recoverCase(
+      caseId,
+      runnerToken === undefined
+        ? undefined
+        : createHash('sha256').update(runnerToken).digest('hex'),
+    );
     this.logger.info(`[Recovery] ${caseId}: ${recoveryResult.detail}`);
 
     // 4.5 一致性修复扩展到恢复路径：清理"关联 Issue 已全 verified 但仍 submitted"
@@ -227,7 +271,7 @@ export class CaseRunner {
     }
 
     // 7. runTurnLoop
-    await this.runTurnLoop(caseId, agentKey, message, maxTurns);
+    await this.runTurnLoop(caseId, agentKey, message, maxTurns, runnerToken);
 
     // 8. 返回 buildResultJson
     return this.buildResultJson(caseId);
@@ -236,12 +280,20 @@ export class CaseRunner {
   /**
    * 人工输入后续跑
    */
-  async resumeCaseWithHumanInput(caseId: string, answer: string): Promise<ResultJson> {
+  async resumeCaseWithHumanInput(
+    caseId: string,
+    answer: string,
+    opts?: ResumeCaseOptions,
+  ): Promise<ResultJson> {
     // 并发守卫
     this.assertNoConcurrentCase(caseId);
 
     // 1. transitionCase(waiting_human → running)
-    this.caseService.transitionCaseStatus(caseId, 'running');
+    this.caseService.transitionCaseStatus(
+      caseId,
+      'running',
+      opts?.runnerToken,
+    );
 
     // 2. 找最后 Turn 的 tool_actions 中 request_human_input 的 agent
     const lastTurn = this.repo.getLastCompletedTurn(caseId);
@@ -271,7 +323,13 @@ export class CaseRunner {
     const message = `用户对你提出的问题'${question}'的回答：\n${answer}`;
 
     // 5. runTurnLoop（不 recover）
-    await this.runTurnLoop(caseId, targetAgent, message, this.maxTurns);
+    await this.runTurnLoop(
+      caseId,
+      targetAgent,
+      message,
+      this.maxTurns,
+      opts?.runnerToken,
+    );
 
     // 6. 返回 buildResultJson
     return this.buildResultJson(caseId);
@@ -280,7 +338,13 @@ export class CaseRunner {
   /**
    * Turn 循环（核心路由逻辑，从 main.ts 原样搬迁）
    */
-  private async runTurnLoop(caseId: string, agentKey: string, message: string, maxTurns: number): Promise<void> {
+  private async runTurnLoop(
+    caseId: string,
+    agentKey: string,
+    message: string,
+    maxTurns: number,
+    runnerToken?: string,
+  ): Promise<void> {
     let currentAgentKey = agentKey;
     let currentMessage = message;
     let consecutiveErrors = 0;
@@ -384,7 +448,7 @@ export class CaseRunner {
         this.logger.info(`  [失败] ${result.error}`);
         if (consecutiveErrors >= maxConsecutiveErrors) {
           this.logger.error(`\n[停止] 连续 ${maxConsecutiveErrors} 次异常，停下汇报`);
-          this.caseService.transitionCaseStatus(caseId, 'failed');
+          this.caseService.transitionCaseStatus(caseId, 'failed', runnerToken);
           break;
         }
         continue;
@@ -408,11 +472,11 @@ export class CaseRunner {
 
             // 更新 Case 状态
             if (args.scope?.issue_ids?.length > 0) {
-              this.caseService.transitionCaseStatus(caseId, 'repairing');
+              this.caseService.transitionCaseStatus(caseId, 'repairing', runnerToken);
             } else {
               const cr = this.repo.getCase(caseId);
               if (cr && cr.status === 'running') {
-                this.caseService.transitionCaseStatus(caseId, 'waiting_review');
+                this.caseService.transitionCaseStatus(caseId, 'waiting_review', runnerToken);
               }
             }
             break;
@@ -422,13 +486,13 @@ export class CaseRunner {
         if (action.tool_name === 'approve_delivery' && action.result) {
           const deliveryOutput = JSON.parse(action.result as string);
           if (deliveryOutput.gate_passed) {
-            this.caseService.transitionCaseStatus(caseId, 'approved');
+            this.caseService.transitionCaseStatus(caseId, 'approved', runnerToken);
             this.repo.closeSessionsByCase(caseId);
             this.logger.info(`\n[交付] 门禁通过，Case 已交付！`);
           } else if (deliveryOutput.error_code === 'INTERNAL_STATE_INCONSISTENT') {
             // 5.6：一致性修复后仍无法通过门禁，且无法确定性路由 -> 内部错误，转 failed
             this.logger.error(`\n[门禁] 内部状态不一致，Case 转 failed: ${deliveryOutput.error}`);
-            this.caseService.transitionCaseStatus(caseId, 'failed');
+            this.caseService.transitionCaseStatus(caseId, 'failed', runnerToken);
             routed = true;
           } else if (deliveryOutput.route_to) {
             // 5.6：按指令状态确定性路由（submitted -> 审核 Agent；issued/in_progress -> 返修 Agent）
@@ -455,7 +519,7 @@ export class CaseRunner {
             routed = true;
             const cr = this.repo.getCase(caseId);
             if (cr && (cr.status === 'repairing' || cr.status === 'waiting_review')) {
-              this.caseService.transitionCaseStatus(caseId, 'running');
+              this.caseService.transitionCaseStatus(caseId, 'running', runnerToken);
             }
           } else {
             // 审核不通过，回到总控
@@ -477,7 +541,7 @@ export class CaseRunner {
             routed = true;
             const cr = this.repo.getCase(caseId);
             if (cr && cr.status === 'waiting_review') {
-              this.caseService.transitionCaseStatus(caseId, 'running');
+              this.caseService.transitionCaseStatus(caseId, 'running', runnerToken);
             }
           }
         }
@@ -509,7 +573,7 @@ export class CaseRunner {
                   // 返修版发布：repairing -> waiting_review（否则 case 卡在 repairing，
                   // 后续 reviewer 再判 repair、supervisor 再发返修会触发 repairing->repairing 非法转换）
                   if (cr && (cr.status === 'running' || cr.status === 'repairing')) {
-                    this.caseService.transitionCaseStatus(caseId, 'waiting_review');
+                    this.caseService.transitionCaseStatus(caseId, 'waiting_review', runnerToken);
                   }
                 }
               }
@@ -518,7 +582,7 @@ export class CaseRunner {
         }
 
         if (action.tool_name === 'request_human_input') {
-          this.caseService.transitionCaseStatus(caseId, 'waiting_human');
+          this.caseService.transitionCaseStatus(caseId, 'waiting_human', runnerToken);
           this.logger.info(`  [人工] Case 进入 waiting_human 状态`);
         }
       }
@@ -535,7 +599,7 @@ export class CaseRunner {
           if (consecutiveNoAction >= 2) {
             // 连续第二次仍无动作：转 failed，记录原因
             this.logger.error(`\n[停止] 非终态 Case(${cr?.status}) 连续 ${consecutiveNoAction} 次无工具调用，转为 failed`);
-            this.caseService.transitionCaseStatus(caseId, 'failed');
+            this.caseService.transitionCaseStatus(caseId, 'failed', runnerToken);
             this.repo.insertControlEvent({
               event_id: this.idGen.generate('evt'),
               case_id: caseId,

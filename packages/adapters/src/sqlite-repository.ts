@@ -448,7 +448,11 @@ export class SqliteRepository implements RepositoryPort {
         .map((key) => `${key} = @${key}`)
         .join(', ');
       const tokenCondition = options?.runnerTokenSha256 === undefined
-        ? ''
+        ? `AND NOT EXISTS (
+            SELECT 1
+            FROM execution_leases
+            WHERE execution_leases.case_id = cases.case_id
+          )`
         : `AND EXISTS (
             SELECT 1
             FROM execution_leases

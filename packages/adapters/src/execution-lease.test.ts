@@ -268,6 +268,36 @@ describe('SQLite execution lease', () => {
     expect(repo.getExecutionLease('case-1')).not.toBeNull();
   });
 
+  it('rejects an omitted token when an active lease exists', () => {
+    const repo = openRepository(':memory:');
+    insertCase(repo);
+    repo.acquireExecutionLease('case-1', {
+      runner_token_sha256: 'a'.repeat(64),
+      runner_pid: 101,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+
+    expect(repo.compareAndSetCaseStatus(
+      'case-1',
+      'created',
+      { status: 'running' },
+    )).toBe(false);
+    expect(repo.getCase('case-1')?.status).toBe('created');
+  });
+
+  it('allows a legacy no-token transition only when no active lease exists', () => {
+    const repo = openRepository(':memory:');
+    insertCase(repo);
+
+    expect(repo.compareAndSetCaseStatus(
+      'case-1',
+      'created',
+      { status: 'running' },
+    )).toBe(true);
+    expect(repo.getCase('case-1')?.status).toBe('running');
+  });
+
   it('allows only abort or a normal terminal transition to win a simultaneous race', async () => {
     const root = mkdtempSync(join(tmpdir(), 'forge-execution-state-race-'));
     roots.push(root);
@@ -305,6 +335,7 @@ describe('SQLite execution lease', () => {
           updated_at: '2026-07-27T00:00:04.000Z',
           completed_at: '2026-07-27T00:00:04.000Z',
         },
+        runnerTokenSha256: hash,
         clearExecutionLease: true,
       },
     ]) as [

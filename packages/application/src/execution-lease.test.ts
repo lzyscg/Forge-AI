@@ -53,9 +53,9 @@ describe('CaseService execution lease', () => {
     (status) => {
     const { repo, service } = buildService();
     service.acquireExecutionLease('case-1', 'runner-token', 101);
-    service.startCase('case-1');
+    service.startCase('case-1', 'runner-token');
 
-    service.transitionCaseStatus('case-1', status);
+    service.transitionCaseStatus('case-1', status, 'runner-token');
 
     expect(repo.getExecutionLease('case-1')).toBeNull();
     repo.close();
@@ -67,9 +67,9 @@ describe('CaseService execution lease', () => {
     (status) => {
       const { repo, service } = buildService();
       service.acquireExecutionLease('case-1', 'runner-token', 101);
-      service.startCase('case-1');
+      service.startCase('case-1', 'runner-token');
 
-      service.transitionCaseStatus('case-1', status);
+      service.transitionCaseStatus('case-1', status, 'runner-token');
 
       expect(service.validateExecutionLease('case-1', 'runner-token')).toBe(true);
       repo.close();
@@ -79,7 +79,7 @@ describe('CaseService execution lease', () => {
   it('transfers, heartbeats, and aborts only with the authorized plaintext token', () => {
     const { repo, service } = buildService();
     service.acquireExecutionLease('case-1', 'old-token', 101);
-    service.startCase('case-1');
+    service.startCase('case-1', 'old-token');
 
     expect(service.transferExecutionLease(
       'case-1',
@@ -105,7 +105,7 @@ describe('CaseService execution lease', () => {
   it('requires a matching lease token when one is supplied for a state commit', () => {
     const { repo, service } = buildService();
     service.acquireExecutionLease('case-1', 'runner-token', 101);
-    service.startCase('case-1');
+    service.startCase('case-1', 'runner-token');
 
     expect(() => service.transitionCaseStatus(
       'case-1',
@@ -115,6 +115,25 @@ describe('CaseService execution lease', () => {
     expect(repo.getCase('case-1')?.status).toBe('running');
 
     service.transitionCaseStatus('case-1', 'waiting_review', 'runner-token');
+    expect(repo.getCase('case-1')?.status).toBe('waiting_review');
+    repo.close();
+  });
+
+  it('accepts only the new token after an explicit lease transfer', () => {
+    const { repo, service } = buildService();
+    service.acquireExecutionLease('case-1', 'old-token', 101);
+    service.startCase('case-1', 'old-token');
+    service.transferExecutionLease('case-1', 'old-token', 'new-token', 202);
+
+    expect(() => service.transitionCaseStatus('case-1', 'waiting_review'))
+      .toThrow('Case state changed concurrently or lease authorization failed');
+    expect(() => service.transitionCaseStatus(
+      'case-1',
+      'waiting_review',
+      'old-token',
+    )).toThrow('Case state changed concurrently or lease authorization failed');
+    service.transitionCaseStatus('case-1', 'waiting_review', 'new-token');
+
     expect(repo.getCase('case-1')?.status).toBe('waiting_review');
     repo.close();
   });

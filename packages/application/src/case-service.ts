@@ -78,7 +78,7 @@ export class CaseService {
     return caseId;
   }
 
-  startCase(caseId: string): void {
+  startCase(caseId: string, runnerToken?: string): void {
     const record = this.repo.getCase(caseId);
     if (!record) throw new Error(`Case not found: ${caseId}`);
 
@@ -89,6 +89,11 @@ export class CaseService {
       {
         status: newStatus,
         updated_at: this.clock.now(),
+      },
+      {
+        runnerTokenSha256: runnerToken === undefined
+          ? undefined
+          : sha256(runnerToken),
       },
     );
     if (!committed) {

@@ -13,6 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { resolve, dirname } from 'node:path';
 import { mkdirSync, rmSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import {
   SqliteRepository,
   FakePiAdapter,
@@ -187,11 +188,82 @@ describe('7.4 非终态无工具调用（5.4）', () => {
       title: '纠错测试',
       inputPayload: { reference_lyrics: '参考', fixed_phrase: '金句' },
     });
-    const result = await runner.runCase(caseId, { maxTurns: 2 });
+    const runnerToken = 'revision-e2e-runner-token';
+    expect(repo.getCase(caseId)?.status).toBe('created');
+    const result = await runner.runCase(caseId, {
+      maxTurns: 2,
+      runnerToken,
+      runnerPid: 101,
+    });
 
     // 第一次无动作被纠错而非失败；路由后进入 waiting_review
     expect(result.status).not.toBe('failed');
     expect(repo.getControlEventsByCase(caseId).some((e) => e.event_type === 'agent_no_action_in_nonterminal_state')).toBe(false);
+    expect(repo.validateExecutionLease(
+      caseId,
+      createHash('sha256').update(runnerToken).digest('hex'),
+    )).toBe(true);
+  });
+
+  it('carries the runner token through a human-input resume transition', async () => {
+    const runner = makeRunner(repo, new FakePiAdapter(), scenarioConfig, 0);
+    const caseId = runner.createCase({
+      title: 'resume lease test',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+    repo.updateCase(caseId, { status: 'created' });
+    const runnerToken = 'resume-runner-token';
+    repo.acquireExecutionLease(caseId, {
+      runner_token_sha256: createHash('sha256').update(runnerToken).digest('hex'),
+      runner_pid: 101,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+    repo.updateCase(caseId, { status: 'waiting_human' });
+
+    const result = await runner.resumeCaseWithHumanInput(
+      caseId,
+      'continue',
+      { runnerToken },
+    );
+
+    expect(result.status).toBe('running');
+  });
+
+  it('accepts only the new runner token after a CaseRunner lease transfer', async () => {
+    const runner = makeRunner(repo, new FakePiAdapter(), scenarioConfig, 0);
+    const caseId = runner.createCase({
+      title: 'runner transfer test',
+      inputPayload: { reference_lyrics: 'reference', fixed_phrase: 'phrase' },
+    });
+    await runner.runCase(caseId, {
+      maxTurns: 0,
+      runnerToken: 'old-runner-token',
+      runnerPid: 101,
+    });
+    expect(repo.transferExecutionLease(
+      caseId,
+      createHash('sha256').update('old-runner-token').digest('hex'),
+      {
+        runner_token_sha256: createHash('sha256')
+          .update('new-runner-token')
+          .digest('hex'),
+        runner_pid: 202,
+        runner_started_at: '2026-07-27T00:00:02.000Z',
+        heartbeat_at: '2026-07-27T00:00:02.000Z',
+      },
+    )).toBe(true);
+
+    await expect(runner.runCase(caseId, { maxTurns: 0 }))
+      .rejects.toThrow('Execution lease authorization failed');
+    await expect(runner.runCase(caseId, {
+      maxTurns: 0,
+      runnerToken: 'old-runner-token',
+    })).rejects.toThrow('Execution lease authorization failed');
+    await expect(runner.runCase(caseId, {
+      maxTurns: 0,
+      runnerToken: 'new-runner-token',
+    })).resolves.toMatchObject({ status: 'running' });
   });
 });
 
@@ -420,4 +492,3 @@ describe('7.7 真实形态回归（v1 -> repair -> v2 -> repair -> v3 -> approve
     expect(result.gate?.checks.every((c) => c.passed)).toBe(true);
   });
 });
-
