@@ -21,7 +21,10 @@ import {
 } from './quality.js';
 import {
   materializeDeliveredArtifact,
+  reconcileStage,
   requireScenarioSnapshotIdentity,
+  type ReconciliationAction,
+  type StagePlan,
 } from './reconciliation.js';
 import { descendantClosure } from './invalidation.js';
 import {
@@ -45,6 +48,7 @@ import {
   type ForgeCaseSnapshot,
   type ForgeClient,
 } from './forge-client.js';
+import { acquireStageLock } from './run-lock.js';
 import { sliceChapterSource } from './source-slice.js';
 import {
   compareTemplateIdentity,
@@ -86,7 +90,22 @@ interface InvalidateOptions {
   reason: string;
 }
 
-type CliOptions = RunOptions | InvalidateOptions;
+export interface ReconcileOptions {
+  command: 'reconcile';
+  configPath: string;
+  runDir: string;
+  dbPath: string;
+  dryRun: boolean;
+  adoptCase?: string;
+  attestTemplateCompatibility: boolean;
+  attestLegacyCaseBindings: string[];
+}
+
+export interface ReconcileRunResult {
+  actions: ReconciliationAction[];
+}
+
+type CliOptions = RunOptions | InvalidateOptions | ReconcileOptions;
 
 interface StageSpec {
   key: string;
@@ -126,7 +145,85 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
-function parseArgs(argv: string[]): CliOptions {
+function parseReconcileArgs(argv: string[]): ReconcileOptions {
+  const valueNames = new Set([
+    'config',
+    'run-dir',
+    'db',
+    'adopt-case',
+    'attest-legacy-case-binding',
+  ]);
+  const booleanNames = new Set([
+    'dry-run',
+    'apply',
+    'attest-template-compatibility',
+  ]);
+  const values = new Map<string, string>();
+  const booleans = new Set<string>();
+  for (let index = 0; index < argv.length; index += 1) {
+    const key = argv[index];
+    if (!key?.startsWith('--')) {
+      throw new Error(`invalid reconcile option: ${key ?? '(empty)'}`);
+    }
+    const name = key.slice(2);
+    if (booleanNames.has(name)) {
+      if (booleans.has(name)) {
+        throw new Error(`duplicate reconcile option: ${key}`);
+      }
+      booleans.add(name);
+      continue;
+    }
+    if (!valueNames.has(name)) {
+      throw new Error(`unknown reconcile option: ${key}`);
+    }
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith('--')) {
+      throw new Error(`reconcile option requires a value: ${key}`);
+    }
+    if (values.has(name)) {
+      throw new Error(`duplicate reconcile option: ${key}`);
+    }
+    values.set(name, value);
+    index += 1;
+  }
+  const config = values.get('config');
+  const runDir = values.get('run-dir');
+  const db = values.get('db');
+  if (!config || !runDir || !db) {
+    throw new Error('reconcile requires --config, --run-dir, and --db');
+  }
+  const dryRun = booleans.has('dry-run');
+  const apply = booleans.has('apply');
+  if (dryRun === apply) {
+    throw new Error('reconcile requires exactly one of --dry-run or --apply');
+  }
+  if (
+    dryRun
+    && (
+      values.has('adopt-case')
+      || values.has('attest-legacy-case-binding')
+      || booleans.has('attest-template-compatibility')
+    )
+  ) {
+    throw new Error('reconcile attestation and adoption flags require --apply');
+  }
+  return {
+    command: 'reconcile',
+    configPath: resolve(process.cwd(), config),
+    runDir: resolve(process.cwd(), runDir),
+    dbPath: resolve(process.cwd(), db),
+    dryRun,
+    adoptCase: values.get('adopt-case'),
+    attestTemplateCompatibility: booleans.has(
+      'attest-template-compatibility',
+    ),
+    attestLegacyCaseBindings: values.has('attest-legacy-case-binding')
+      ? [values.get('attest-legacy-case-binding')!]
+      : [],
+  };
+}
+
+function parseLegacyArgs(argv: string[]): CliOptions {
   if (argv[0] !== 'run' && argv[0] !== 'invalidate') {
     throw new Error(
       '用法: story-pipeline run --config <file> [--mode fake|real] [--run-dir <dir>] [--db <file>]；或 invalidate --run-dir <dir> --from <stage-key> --reason <text>',
@@ -180,6 +277,12 @@ function parseArgs(argv: string[]): CliOptions {
     runId: config.run_id,
     storyId: config.story_id,
   };
+}
+
+function parseArgs(argv: string[]): CliOptions {
+  return argv[0] === 'reconcile'
+    ? parseReconcileArgs(argv.slice(1))
+    : parseLegacyArgs(argv);
 }
 
 function loadConfig(path: string): PipelineConfig {
@@ -496,6 +599,36 @@ async function executeStage(
   forgeClient: ForgeClient,
   signal: AbortSignal,
 ): Promise<StageRecord> {
+  const stageLock = acquireStageLock({
+    run_dir: options.runDir,
+    run_id: options.runId,
+    stage_key: spec.key,
+    owner_token: randomUUID(),
+  });
+  try {
+    Object.assign(
+      manifest,
+      loadManifest(join(options.runDir, 'manifest.json')),
+    );
+    return await executeStageUnlocked(
+      manifest,
+      spec,
+      options,
+      forgeClient,
+      signal,
+    );
+  } finally {
+    stageLock.release();
+  }
+}
+
+async function executeStageUnlocked(
+  manifest: PipelineManifest,
+  spec: StageSpec,
+  options: RunOptions,
+  forgeClient: ForgeClient,
+  signal: AbortSignal,
+): Promise<StageRecord> {
   const resumed = existingStage(manifest, spec, options.runDir);
   if (resumed) {
     process.stdout.write(`[skip] ${spec.key} -> ${resumed.record_id} / ${resumed.case_id}\n`);
@@ -608,25 +741,6 @@ async function executeStage(
     saveManifest(options.runDir, manifest);
   }
 
-  if (signal.aborted) {
-    if (attempt.outcome === 'running') {
-      const beforeOutcome = attempt.outcome;
-      attempt.outcome = 'interrupted';
-      attempt.updated_at = new Date().toISOString();
-      attempt.detail = 'Pipeline cancellation requested before Forge run';
-      appendAttemptEvent(
-        manifest,
-        'stage_interrupted',
-        attempt,
-        beforeOutcome,
-        attempt.outcome,
-        attempt.detail,
-      );
-      saveManifest(options.runDir, manifest);
-    }
-    throw new DOMException('The operation was aborted', 'AbortError');
-  }
-
   let result: ForgeCaseSnapshot | undefined;
   try {
     if (attempt.runner_credential_path === null) {
@@ -643,6 +757,9 @@ async function executeStage(
       runnerCredentialPath,
     }, signal);
   } catch (error) {
+    if (signal.aborted) {
+      result = await forgeClient.getCaseStatus(caseId, options.dbPath);
+    } else {
     const beforeOutcome = attempt.outcome;
     attempt.outcome = 'interrupted';
     attempt.updated_at = new Date().toISOString();
@@ -657,6 +774,7 @@ async function executeStage(
     );
     saveManifest(options.runDir, manifest);
     throw error;
+    }
   }
 
   if (!result || result.case_id !== caseId) {
@@ -677,13 +795,37 @@ async function executeStage(
   }
   if (!result.success || result.status !== 'approved' || !result.final_artifact) {
     const beforeOutcome = attempt.outcome;
-    attempt.outcome = result.status === 'waiting_human'
-      ? 'blocked'
-      : ['failed', 'stopped'].includes(result.status)
+    const plan: StagePlan = {
+      run_id: options.runId,
+      story_id: options.storyId,
+      stage_key: spec.key,
+      stage: spec.stage,
+      chapter_id: spec.chapterId,
+      expected_artifact_type: spec.expectedArtifactType,
+      expected_scenario_snapshot_sha256:
+        attempt.expected_scenario_snapshot_sha256,
+      input_sha256: inputHash,
+      parent_record_ids: spec.parents.map((parent) => parent.record_id),
+      template_identity: spec.templateIdentity,
+    };
+    const reconciled = reconcileStage(
+      plan,
+      [attempt],
+      new Map([[caseId, result]]),
+      caseId,
+    );
+    const finalAction = reconciled.at(-1);
+    attempt.outcome = finalAction?.action === 'close'
+      ? finalAction.outcome
+      : finalAction?.action === 'reject'
         ? 'failed'
-        : 'interrupted';
+        : result.status === 'waiting_human'
+          ? 'blocked'
+          : 'interrupted';
     attempt.updated_at = new Date().toISOString();
-    attempt.detail = result.error ?? `Forge status=${result.status}`;
+    attempt.detail = finalAction && 'reason' in finalAction
+      ? finalAction.reason
+      : result.error ?? `Forge status=${result.status}`;
     if (attempt.outcome === 'failed') {
       clearRunnerCredential(options.runDir, attempt);
     }
@@ -767,6 +909,379 @@ function endingExcerpt(content: string, maxChars = 500): string {
   return content.length <= maxChars ? content : content.slice(-maxChars);
 }
 
+function stagePlanFromAttempts(
+  config: PipelineConfig,
+  manifest: PipelineManifest,
+  attempts: StageAttempt[],
+): StagePlan {
+  const first = attempts[0];
+  if (!first) throw new Error('cannot build a stage plan without attempts');
+  const expectedStages = new Map<string, {
+    stage: string;
+    chapterId: string | null;
+    template: string;
+    artifactType: string;
+  }>();
+  expectedStages.set('outline', {
+    stage: 'outline',
+    chapterId: null,
+    template: 'zhihu-story-outline',
+    artifactType: 'blueprint_bundle',
+  });
+  expectedStages.set('final', {
+    stage: 'final_review',
+    chapterId: null,
+    template: 'zhihu-story-final',
+    artifactType: 'final_manuscript',
+  });
+  for (const chapter of config.chapters) {
+    const chapterKey = chapter.id.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+    expectedStages.set(`packet-${chapterKey}`, {
+      stage: 'chapter_packet',
+      chapterId: chapter.id,
+      template: 'zhihu-chapter-packet',
+      artifactType: 'chapter_packet',
+    });
+    expectedStages.set(`draft-${chapterKey}`, {
+      stage: 'chapter_draft',
+      chapterId: chapter.id,
+      template: 'zhihu-chapter-draft',
+      artifactType: 'chapter_draft',
+    });
+    expectedStages.set(`ledger-${chapterKey}`, {
+      stage: 'ledger_update',
+      chapterId: chapter.id,
+      template: 'zhihu-story-ledger',
+      artifactType: 'state_ledger',
+    });
+  }
+  const expected = expectedStages.get(first.stage_key);
+  if (
+    !expected
+    || first.stage !== expected.stage
+    || first.chapter_id !== expected.chapterId
+    || first.template !== expected.template
+    || first.expected_artifact_type !== expected.artifactType
+  ) {
+    throw new Error(
+      `manifest cannot reconstruct a config-backed StagePlan for ${first.stage_key}`,
+    );
+  }
+  const planIdentity = canonicalJson({
+    stage: first.stage,
+    chapter_id: first.chapter_id,
+    expected_artifact_type: first.expected_artifact_type,
+    expected_scenario_snapshot_sha256:
+      first.expected_scenario_snapshot_sha256,
+    input_sha256: first.input_sha256,
+    parent_record_ids: first.parent_record_ids,
+    template_identity: first.template_identity,
+  });
+  if (attempts.some((attempt) => canonicalJson({
+    stage: attempt.stage,
+    chapter_id: attempt.chapter_id,
+    expected_artifact_type: attempt.expected_artifact_type,
+    expected_scenario_snapshot_sha256:
+      attempt.expected_scenario_snapshot_sha256,
+    input_sha256: attempt.input_sha256,
+    parent_record_ids: attempt.parent_record_ids,
+    template_identity: attempt.template_identity,
+  }) !== planIdentity)) {
+    throw new Error(
+      `manifest cannot reconstruct one StagePlan for ${first.stage_key}`,
+    );
+  }
+  return {
+    run_id: manifest.run_id,
+    story_id: manifest.story_id,
+    stage_key: first.stage_key,
+    stage: first.stage,
+    chapter_id: first.chapter_id,
+    expected_artifact_type: first.expected_artifact_type,
+    expected_scenario_snapshot_sha256:
+      first.expected_scenario_snapshot_sha256,
+    input_sha256: first.input_sha256,
+    parent_record_ids: [...first.parent_record_ids],
+    template_identity: { ...first.template_identity },
+  };
+}
+
+function transportValidator(
+  attempt: StageAttempt,
+): (rawContent: string) => ValidationResult {
+  const artifactKind = ({
+    blueprint_bundle: 'outline',
+    chapter_packet: 'packet',
+    chapter_draft: 'draft',
+    state_ledger: 'ledger',
+    final_manuscript: 'final',
+  } as const)[attempt.expected_artifact_type as
+    | 'blueprint_bundle'
+    | 'chapter_packet'
+    | 'chapter_draft'
+    | 'state_ledger'
+    | 'final_manuscript'];
+  if (!artifactKind) {
+    throw new Error(
+      `no transport validator for ${attempt.expected_artifact_type}`,
+    );
+  }
+  return (rawContent) => {
+    const canonicalContent = `${rawContent.trim()}\n`;
+    const artifactSha256 = sha256(canonicalContent);
+    return {
+      canonicalContent,
+      report: {
+        schema_version: '1.0',
+        stage_key: attempt.stage_key,
+        artifact_kind: artifactKind,
+        artifact_sha256: artifactSha256,
+        valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        metrics: {},
+      },
+      sidecar: {
+        schema_version: '1.0',
+        artifact_kind: attempt.expected_artifact_type,
+        artifact_sha256: artifactSha256,
+      },
+    };
+  };
+}
+
+export async function reconcileRun(
+  options: ReconcileOptions,
+  forgeClient: ForgeClient,
+  signal: AbortSignal,
+  validators: Record<string, (rawContent: string) => ValidationResult> = {},
+  resumeMode: PiMode = 'real',
+): Promise<ReconcileRunResult> {
+  const configText = readFileSync(options.configPath, 'utf8');
+  const config = loadConfig(options.configPath);
+  const manifestPath = join(options.runDir, 'manifest.json');
+  if (!existsSync(manifestPath)) {
+    throw new Error(`run manifest does not exist: ${manifestPath}`);
+  }
+  let initialManifest = loadManifest(manifestPath);
+  validateManifestChain(initialManifest);
+  if (
+    initialManifest.run_id !== config.run_id
+    || initialManifest.story_id !== config.story_id
+    || initialManifest.config_sha256 !== sha256(configText)
+  ) {
+    throw new Error('production config does not match the run manifest');
+  }
+  if (
+    !options.dryRun
+    && (
+      options.attestTemplateCompatibility
+      || options.attestLegacyCaseBindings.length > 0
+    )
+  ) {
+    if (options.attestTemplateCompatibility) {
+      appendManifestEvent(initialManifest, {
+        at: new Date().toISOString(),
+        type: 'operator_attestation',
+        stage_key: 'manifest',
+        attempt_id: null,
+        before_outcome: null,
+        after_outcome: null,
+        case_id: null,
+        artifact_id: null,
+        artifact_version: null,
+        version_id: null,
+        record_id: null,
+        reason: 'operator attested template compatibility',
+        actor: 'operator',
+      });
+    }
+    for (const binding of options.attestLegacyCaseBindings) {
+      const separator = binding.lastIndexOf(':');
+      const caseId = separator > 0 ? binding.slice(0, separator) : '';
+      const stageKey = separator > 0 ? binding.slice(separator + 1) : '';
+      if (!caseId || !stageKey) {
+        throw new Error(
+          '--attest-legacy-case-binding requires <case-id>:<stage-key>',
+        );
+      }
+      appendManifestEvent(initialManifest, {
+        at: new Date().toISOString(),
+        type: 'operator_attestation',
+        stage_key: stageKey,
+        attempt_id: null,
+        before_outcome: null,
+        after_outcome: null,
+        case_id: caseId,
+        artifact_id: null,
+        artifact_version: null,
+        version_id: null,
+        record_id: null,
+        reason: 'operator attested legacy case binding',
+        actor: 'operator',
+      });
+    }
+    saveManifest(options.runDir, initialManifest);
+    initialManifest = loadManifest(manifestPath);
+  }
+
+  const nonterminal = initialManifest.attempts.filter((attempt) =>
+    ['running', 'interrupted', 'blocked'].includes(attempt.outcome)
+  );
+  const attemptsByStage = new Map<string, StageAttempt[]>();
+  for (const attempt of nonterminal) {
+    const stageAttempts = attemptsByStage.get(attempt.stage_key) ?? [];
+    stageAttempts.push(attempt);
+    attemptsByStage.set(attempt.stage_key, stageAttempts);
+  }
+  const actions: ReconciliationAction[] = [];
+  for (const initialStageAttempts of attemptsByStage.values()) {
+    const initialPlan = stagePlanFromAttempts(
+      config,
+      initialManifest,
+      initialStageAttempts,
+    );
+    const stageLock = options.dryRun
+      ? null
+      : acquireStageLock({
+          run_dir: options.runDir,
+          run_id: initialManifest.run_id,
+          stage_key: initialPlan.stage_key,
+          owner_token: randomUUID(),
+        });
+    try {
+      const manifest = options.dryRun
+        ? initialManifest
+        : loadManifest(manifestPath);
+      const stageAttempts = manifest.attempts.filter((attempt) =>
+        initialStageAttempts.some(
+          (initial) => initial.attempt_id === attempt.attempt_id,
+        )
+        && ['running', 'interrupted', 'blocked'].includes(attempt.outcome)
+      );
+      if (stageAttempts.length === 0) continue;
+      const plan = stagePlanFromAttempts(config, manifest, stageAttempts);
+    const snapshots = new Map<string, ForgeCaseSnapshot>();
+    for (const attempt of stageAttempts) {
+      snapshots.set(
+        attempt.case_id,
+        await forgeClient.getCaseStatus(attempt.case_id, options.dbPath),
+      );
+    }
+      const stageActions = reconcileStage(
+      plan,
+      stageAttempts,
+      snapshots,
+      options.adoptCase,
+      );
+      actions.push(...stageActions);
+      if (options.dryRun) continue;
+
+      const pending = [...stageActions];
+      while (pending.length > 0) {
+        const action = pending.shift()!;
+        if (action.action === 'ambiguous') {
+          throw new Error(
+            `stage ${action.stage_key} is ambiguous: ${action.candidates.join(', ')}`,
+          );
+        }
+        const attempt = manifest.attempts.find(
+          (candidate) => candidate.attempt_id === action.attempt_id,
+        );
+        if (!attempt) {
+          throw new Error(`reconciliation attempt is missing: ${action.attempt_id}`);
+        }
+        if (action.action === 'close' || action.action === 'reject') {
+          const outcome = action.action === 'close'
+            ? action.outcome
+            : 'failed';
+          const beforeOutcome = attempt.outcome;
+          attempt.outcome = outcome;
+          attempt.updated_at = new Date().toISOString();
+          attempt.detail = action.reason;
+          if (outcome === 'failed') {
+            clearRunnerCredential(options.runDir, attempt);
+          }
+          appendAttemptEvent(
+            manifest,
+            outcome === 'failed' ? 'stage_failed' : 'stage_interrupted',
+            attempt,
+            beforeOutcome,
+            outcome,
+            action.reason,
+          );
+          saveManifest(options.runDir, manifest);
+          continue;
+        }
+        if (action.action === 'adopt') {
+          const snapshot = snapshots.get(action.case_id);
+          if (!snapshot) {
+            throw new Error(`Forge snapshot is missing: ${action.case_id}`);
+          }
+          materializeDeliveredArtifact({
+            run_dir: options.runDir,
+            manifest,
+            plan,
+            attempt,
+            snapshot,
+            validate: validators[plan.stage_key]
+              ?? transportValidator(attempt),
+          });
+          clearRunnerCredential(options.runDir, attempt);
+          saveManifest(options.runDir, manifest);
+          continue;
+        }
+
+        if (attempt.runner_credential_path === null) {
+          throw new Error(
+            `Attempt ${attempt.attempt_id} has no runner credential`,
+          );
+        }
+        const runnerCredentialPath = resolve(
+          options.runDir,
+          attempt.runner_credential_path,
+        );
+        ensureInsideRunDir(options.runDir, runnerCredentialPath);
+        const resumedSnapshot = await forgeClient.runCase(
+          action.case_id,
+          {
+            dbPath: options.dbPath,
+            mode: resumeMode,
+            runnerCredentialPath,
+          },
+          signal,
+        );
+        snapshots.set(action.case_id, resumedSnapshot);
+        const followup = reconcileStage(
+          plan,
+          [attempt],
+          new Map([[action.case_id, resumedSnapshot]]),
+          action.case_id,
+        );
+        actions.push(...followup);
+        pending.push(...followup);
+      }
+    } finally {
+      stageLock?.release();
+    }
+  }
+  return { actions };
+}
+
+async function runReconcile(
+  options: ReconcileOptions,
+  forgeClient: ForgeClient,
+  signal: AbortSignal,
+): Promise<void> {
+  const result = await reconcileRun(options, forgeClient, signal);
+  process.stdout.write(`${JSON.stringify({
+    success: true,
+    dry_run: options.dryRun,
+    actions: result.actions,
+  })}\n`);
+}
+
 async function runPipeline(
   options: RunOptions,
   forgeClient: ForgeClient,
@@ -790,6 +1305,19 @@ async function runPipeline(
     sha256(configText),
     boundary.path,
     boundary.hash,
+  );
+  await reconcileRun({
+    command: 'reconcile',
+    configPath: options.configPath,
+    runDir: options.runDir,
+    dbPath: options.dbPath,
+    dryRun: false,
+    attestTemplateCompatibility: false,
+    attestLegacyCaseBindings: [],
+  }, forgeClient, signal, {}, options.mode);
+  Object.assign(
+    manifest,
+    loadManifest(join(options.runDir, 'manifest.json')),
   );
   const outlineTemplateIdentity = templateIdentity('zhihu-story-outline');
 
@@ -1043,6 +1571,20 @@ async function main(): Promise<void> {
     runInvalidate(options);
     return;
   }
+  if (options.command === 'reconcile') {
+    const controller = new AbortController();
+    const removeSignalHandlers = installAbortSignalHandlers(controller);
+    try {
+      await runReconcile(
+        options,
+        new ForgeCliClient({ repoRoot }),
+        controller.signal,
+      );
+    } finally {
+      removeSignalHandlers();
+    }
+    return;
+  }
 
   const controller = new AbortController();
   const removeSignalHandlers = installAbortSignalHandlers(controller);
@@ -1057,7 +1599,14 @@ async function main(): Promise<void> {
   }
 }
 
-void main().catch((error: unknown) => {
-  process.stderr.write(`[story-pipeline] ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+if (
+  process.argv[1]
+  && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+) {
+  void main().catch((error: unknown) => {
+    process.stderr.write(
+      `[story-pipeline] ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exitCode = 1;
+  });
+}
