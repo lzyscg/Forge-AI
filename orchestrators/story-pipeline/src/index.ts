@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -22,8 +23,10 @@ import {
 import { descendantClosure } from './invalidation.js';
 import {
   appendManifestEvent,
+  clearRunnerCredential,
   initializeManifest,
   loadManifest,
+  persistRunnerCredential,
   saveManifestCas,
   validateManifestChain,
   type AttemptOutcome,
@@ -33,6 +36,11 @@ import {
   type StageRecordV21 as StageRecord,
   type TemplateIdentity,
 } from './manifest.js';
+import {
+  ForgeCliClient,
+  type ForgeCaseSnapshot,
+  type ForgeClient,
+} from './forge-client.js';
 import { sliceChapterSource } from './source-slice.js';
 import {
   compareTemplateIdentity,
@@ -66,13 +74,7 @@ interface ForgeArtifact {
   version_id: string;
 }
 
-interface ForgeResult {
-  case_id: string;
-  status: string;
-  success: boolean;
-  final_artifact: ForgeArtifact | null;
-  error: string | null;
-}
+type ForgeResult = ForgeCaseSnapshot & { final_artifact: ForgeArtifact | null };
 
 interface RunOptions {
   command: 'run';
@@ -80,6 +82,8 @@ interface RunOptions {
   runDir: string;
   dbPath: string;
   mode: PiMode;
+  runId: string;
+  storyId: string;
 }
 
 interface InvalidateOptions {
@@ -105,7 +109,6 @@ interface StageSpec {
 }
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const forgeBin = join(repoRoot, 'apps', 'cli', 'bin.js');
 const packetController = join(
   repoRoot,
   'scenarios',
@@ -175,7 +178,15 @@ function parseArgs(argv: string[]): CliOptions {
   if (mode !== 'fake' && mode !== 'real') {
     throw new Error(`不支持的 --mode: ${mode}`);
   }
-  return { command: 'run', configPath, runDir, dbPath, mode };
+  return {
+    command: 'run',
+    configPath,
+    runDir,
+    dbPath,
+    mode,
+    runId: config.run_id,
+    storyId: config.story_id,
+  };
 }
 
 function loadConfig(path: string): PipelineConfig {
@@ -367,42 +378,6 @@ function invalidateStageAndDescendants(
   return affected;
 }
 
-function parseJsonLines(stdout: string): Record<string, unknown>[] {
-  const results: Record<string, unknown>[] = [];
-  for (const line of stdout.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) continue;
-    try {
-      const value = JSON.parse(trimmed);
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
-        results.push(value as Record<string, unknown>);
-      }
-    } catch {
-      // CLI 的非 JSON 人类日志只进入 stderr；这里忽略偶发的普通文本。
-    }
-  }
-  return results;
-}
-
-function runForge(args: string[], envExtra: Record<string, string>): Record<string, unknown>[] {
-  const result = spawnSync(process.execPath, [forgeBin, ...args], {
-    cwd: repoRoot,
-    env: { ...process.env, ...envExtra },
-    encoding: 'utf8',
-    maxBuffer: 100 * 1024 * 1024,
-    windowsHide: true,
-  });
-  if (result.stderr) process.stderr.write(result.stderr);
-  const parsed = parseJsonLines(result.stdout ?? '');
-  if (result.status !== 0) {
-    const last = parsed.at(-1);
-    throw new Error(
-      `Forge CLI 失败 (${args.join(' ')}): ${String(last?.error ?? result.error?.message ?? result.stdout ?? 'unknown error')}`,
-    );
-  }
-  return parsed;
-}
-
 function templateIdentity(template: string): TemplateIdentity {
   const templatePath = join(repoRoot, 'scenarios', template);
   if (!existsSync(templatePath)) throw new Error(`场景模板不存在: ${templatePath}`);
@@ -521,11 +496,13 @@ function existingStage(
   return record;
 }
 
-function executeStage(
+async function executeStage(
   manifest: PipelineManifest,
   spec: StageSpec,
   options: RunOptions,
-): StageRecord {
+  forgeClient: ForgeClient,
+  signal: AbortSignal,
+): Promise<StageRecord> {
   const resumed = existingStage(manifest, spec, options.runDir);
   if (resumed) {
     process.stdout.write(`[skip] ${spec.key} -> ${resumed.record_id} / ${resumed.case_id}\n`);
@@ -575,13 +552,17 @@ function executeStage(
     ensureInsideRunDir(options.runDir, inputPath);
     writeJson(inputPath, spec.input);
     process.stdout.write(`[run] ${spec.key} (${spec.template})\n`);
-    const env = { FORGE_INPUT_FILE: inputPath };
-    const createLines = runForge(
-      ['case', 'create', '--template', spec.template, '--db', options.dbPath, '--mode', options.mode, '--title', spec.title],
-      env,
-    );
-    const createResult = createLines.at(-1);
-    caseId = String(createResult?.case_id ?? '');
+    caseId = await forgeClient.createCase({
+      template: spec.template,
+      dbPath: options.dbPath,
+      mode: options.mode,
+      title: spec.title,
+      inputFile: inputPath,
+      runId: options.runId,
+      storyId: options.storyId,
+      stageKey: spec.key,
+      chapterId: spec.chapterId,
+    }, signal);
     if (!caseId) throw new Error(`阶段 ${spec.key} 未返回 case_id`);
     const now = new Date().toISOString();
     attempt = {
@@ -605,6 +586,7 @@ function executeStage(
       updated_at: now,
       detail: null,
     };
+    persistRunnerCredential(options.runDir, attempt, randomUUID());
     manifest.attempts.push(attempt);
     appendAttemptEvent(
       manifest,
@@ -619,11 +601,19 @@ function executeStage(
 
   let result: ForgeResult | undefined;
   try {
-    const runLines = runForge(
-      ['case', 'run', caseId, '--wait', '--db', options.dbPath, '--mode', options.mode],
-      {},
+    if (attempt.runner_credential_path === null) {
+      throw new Error(`Attempt ${attempt.attempt_id} has no runner credential`);
+    }
+    const runnerCredentialPath = resolve(
+      options.runDir,
+      attempt.runner_credential_path,
     );
-    result = runLines.at(-1) as unknown as ForgeResult | undefined;
+    ensureInsideRunDir(options.runDir, runnerCredentialPath);
+    result = await forgeClient.runCase(caseId, {
+      dbPath: options.dbPath,
+      mode: options.mode,
+      runnerCredentialPath,
+    }, signal) as ForgeResult;
   } catch (error) {
     const beforeOutcome = attempt.outcome;
     attempt.outcome = 'interrupted';
@@ -666,6 +656,9 @@ function executeStage(
         : 'interrupted';
     attempt.updated_at = new Date().toISOString();
     attempt.detail = result.error ?? `Forge status=${result.status}`;
+    if (attempt.outcome === 'failed') {
+      clearRunnerCredential(options.runDir, attempt);
+    }
     appendAttemptEvent(
       manifest,
       attempt.outcome === 'blocked'
@@ -743,6 +736,7 @@ function executeStage(
     attempt.outcome = 'validation_failed';
     attempt.updated_at = new Date().toISOString();
     attempt.detail = validation.report.errors.join('；');
+    clearRunnerCredential(options.runDir, attempt);
     appendAttemptEvent(
       manifest,
       'stage_validation_failed',
@@ -805,6 +799,7 @@ function executeStage(
   attempt.outcome = 'delivered';
   attempt.updated_at = record.completed_at;
   attempt.detail = null;
+  clearRunnerCredential(options.runDir, attempt);
   manifest.stages.push(record);
   appendAttemptEvent(
     manifest,
@@ -835,7 +830,11 @@ function endingExcerpt(content: string, maxChars = 500): string {
   return content.length <= maxChars ? content : content.slice(-maxChars);
 }
 
-function runPipeline(options: RunOptions): void {
+async function runPipeline(
+  options: RunOptions,
+  forgeClient: ForgeClient,
+  signal: AbortSignal,
+): Promise<void> {
   const configText = readFileSync(options.configPath, 'utf8');
   const config = loadConfig(options.configPath);
   const sourcePath = resolve(dirname(options.configPath), config.source_file);
@@ -857,7 +856,7 @@ function runPipeline(options: RunOptions): void {
   );
   const outlineTemplateIdentity = templateIdentity('zhihu-story-outline');
 
-  const outline = executeStage(
+  const outline = await executeStage(
     manifest,
     {
       key: 'outline',
@@ -877,6 +876,8 @@ function runPipeline(options: RunOptions): void {
       validate: (rawContent) => validateOutline('outline', rawContent, boundary.map),
     },
     options,
+    forgeClient,
+    signal,
   );
   const blueprint = readArtifact(options.runDir, outline);
   const outlineSidecar = readSidecar(options.runDir, outline);
@@ -901,7 +902,7 @@ function runPipeline(options: RunOptions): void {
       ? endingExcerpt(readArtifact(options.runDir, previousDraft))
       : '这是第一章，尚无上一章结尾。';
 
-    const packet = executeStage(
+    const packet = await executeStage(
       manifest,
       {
         key: `packet-${chapterKey}`,
@@ -930,11 +931,13 @@ function runPipeline(options: RunOptions): void {
         ),
       },
       options,
+      forgeClient,
+      signal,
     );
     const packetContent = readArtifact(options.runDir, packet);
     const packetSidecar = readSidecar(options.runDir, packet);
 
-    const draft = executeStage(
+    const draft = await executeStage(
       manifest,
       {
         key: `draft-${chapterKey}`,
@@ -961,10 +964,12 @@ function runPipeline(options: RunOptions): void {
         ),
       },
       options,
+      forgeClient,
+      signal,
     );
     drafts.push(draft);
 
-    const ledger = executeStage(
+    const ledger = await executeStage(
       manifest,
       {
         key: `ledger-${chapterKey}`,
@@ -990,6 +995,8 @@ function runPipeline(options: RunOptions): void {
         ),
       },
       options,
+      forgeClient,
+      signal,
     );
     previousDraft = draft;
     previousLedger = ledger;
@@ -998,7 +1005,7 @@ function runPipeline(options: RunOptions): void {
   const assembledManuscript = drafts
     .map((draft) => readArtifact(options.runDir, draft).trim())
     .join('\n\n');
-  const finalStage = executeStage(
+  const finalStage = await executeStage(
     manifest,
     {
       key: 'final',
@@ -1032,6 +1039,8 @@ function runPipeline(options: RunOptions): void {
       ),
     },
     options,
+    forgeClient,
+    signal,
   );
 
   if (manifest.final_artifact_path !== finalStage.artifact_path) {
@@ -1091,11 +1100,30 @@ function runInvalidate(options: InvalidateOptions): void {
   })}\n`);
 }
 
-try {
+async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
-  if (options.command === 'run') runPipeline(options);
-  else runInvalidate(options);
-} catch (error) {
+  if (options.command === 'invalidate') {
+    runInvalidate(options);
+    return;
+  }
+
+  const controller = new AbortController();
+  const abort = (): void => controller.abort();
+  process.once('SIGINT', abort);
+  process.once('SIGTERM', abort);
+  try {
+    await runPipeline(
+      options,
+      new ForgeCliClient({ repoRoot }),
+      controller.signal,
+    );
+  } finally {
+    process.removeListener('SIGINT', abort);
+    process.removeListener('SIGTERM', abort);
+  }
+}
+
+void main().catch((error: unknown) => {
   process.stderr.write(`[story-pipeline] ${error instanceof Error ? error.message : String(error)}\n`);
   process.exitCode = 1;
-}
+});
