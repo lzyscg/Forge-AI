@@ -175,10 +175,20 @@ git commit -m "refactor(story-pipeline): add versioned manifest identity and CAS
 ### Task 2: Forge 不可变 Case 身份协议
 
 **Files:**
+- Modify: `packages/contracts/src/case.ts`
+- Modify: `packages/contracts/src/ports.ts`
 - Modify: `packages/contracts/src/result.ts`
+- Modify: `packages/application/src/case-service.ts`
 - Modify: `packages/application/src/case-runner.ts`
+- Modify: `packages/application/src/tool-executor.ts`
+- Modify: `packages/application/src/turn-executor.ts`
+- Modify: `packages/adapters/src/sqlite-repository.ts`
+- Create: `packages/adapters/src/scenario-bundle-identity.ts`
+- Modify: `packages/adapters/src/index.ts`
 - Modify: `apps/cli/src/commands/case.ts`
+- Modify: `apps/cli/src/setup.ts`
 - Create: `packages/application/src/case-identity.test.ts`
+- Create: `packages/adapters/src/scenario-bundle-identity.test.ts`
 
 **Interfaces:**
 
@@ -215,6 +225,8 @@ export interface ResultGate {
 - 每次 run/resume 对实际使用的 scenario、prompt、skill、validator bundle 计算 `template_bundle_sha256`。
 - artifact version 和 delivery gate 保存该 bundle 身份；status 返回最终 artifact version 对应的执行身份。
 - `case status` 必须基于 Case 的不可变 snapshot 构造结果，不能优先用当前磁盘 scenario 解释历史 Case。
+- SQLite 必须原地迁移旧数据库：为 Case、artifact version 和 gate 增加身份字段，并用单行 metadata 记录稳定、不可暴露路径的 `db_instance_id`；旧记录缺失身份时返回 `null/unknown`，不得伪造。
+- bundle 身份由 Adapter 对 scenario 目录源文件计算，Application 只接收字符串身份，不反向依赖文件系统。
 
 - [ ] 写失败测试：
 
