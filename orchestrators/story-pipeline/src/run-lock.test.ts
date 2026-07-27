@@ -472,6 +472,87 @@ describe('stage run locks', () => {
     expect(existsSync(cleanupPath)).toBe(false);
     expect(tempRemoveAttempts).toBe(3);
   });
+
+  it('transfers failed reclaim-guard cleanup to the published successor handle', () => {
+    const runDir = temporaryRun();
+    const stageDirectory = join(runDir, '.locks', 'stages');
+    const staleDirectory = join(stageDirectory, 'stale');
+    mkdirSync(staleDirectory, { recursive: true });
+    const lockPath = join(
+      stageDirectory,
+      `${sha256('run-1\0draft-b001')}.lock`,
+    );
+    const guardPath = `${lockPath}.reclaim`;
+    writeFileSync(lockPath, `${JSON.stringify({
+      pid: 999_999,
+      process_started_at: '2020-01-01T00:00:00.000Z',
+      hostname: 'dead-worker',
+      nonce: 'stale-lock',
+      owner_token_sha256: sha256('dead-owner'),
+    }, null, 2)}\n`);
+
+    const guardTempPaths = new Set<string>();
+    const successorTempPaths = new Set<string>();
+    let guardTempRemoveAttempts = 0;
+    let successorTempRemoveAttempts = 0;
+    const busy = (): NodeJS.ErrnoException => {
+      const error = new Error('injected cleanup busy') as NodeJS.ErrnoException;
+      error.code = 'EBUSY';
+      return error;
+    };
+    const lock = acquireStageLock({
+      run_dir: runDir,
+      run_id: 'run-1',
+      stage_key: 'draft-b001',
+      owner_token: 'new-owner',
+      nonce: 'new-lock',
+      process_inspector: inspector(),
+      fs_ops: {
+        remove: (path) => {
+          const isTemporary = path.endsWith('.tmp');
+          if (isTemporary && path.includes('.reclaim.')) {
+            guardTempPaths.add(path);
+            guardTempRemoveAttempts += 1;
+            if (guardTempRemoveAttempts <= 6) throw busy();
+          } else if (
+            isTemporary
+            && readdirSync(staleDirectory).length > 0
+          ) {
+            successorTempPaths.add(path);
+            successorTempRemoveAttempts += 1;
+            if (successorTempRemoveAttempts <= 3) throw busy();
+          }
+          rmSync(path);
+        },
+      },
+    });
+
+    expect(existsSync(lock.path)).toBe(true);
+    expect(guardTempRemoveAttempts).toBe(6);
+    expect(successorTempRemoveAttempts).toBe(3);
+    expect(lock.cleanup_paths).toEqual(expect.arrayContaining([
+      ...guardTempPaths,
+      ...successorTempPaths,
+    ]));
+    expect(lock.warnings).toContain(
+      'stage lock temp cleanup deferred until release',
+    );
+    expect(() => acquireStageLock({
+      run_dir: runDir,
+      run_id: 'run-1',
+      stage_key: 'draft-b001',
+      owner_token: 'other-owner',
+      process_inspector: inspector(),
+    })).toThrow('stage lock is held by a live process');
+
+    lock.release();
+
+    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(guardPath)).toBe(false);
+    expect([...guardTempPaths, ...successorTempPaths].every(
+      (path) => !existsSync(path),
+    )).toBe(true);
+  });
 });
 
 function waitForOutput(

@@ -485,6 +485,7 @@ export function acquireStageLock(
 
   const cleanupPaths: string[] = [];
   const warnings: string[] = [];
+  const deferredGuardReleases: StageLock[] = [];
   for (;;) {
     try {
       const publication = publishExclusiveJson(
@@ -520,6 +521,7 @@ export function acquireStageLock(
       guardPayload,
       fsOps,
     );
+    let successorPublished = false;
     try {
       let currentLock: StageLockPayload;
       try {
@@ -555,12 +557,29 @@ export function acquireStageLock(
           cleanupPaths.push(publication.deferred_cleanup_path);
         }
         if (publication.warning) warnings.push(publication.warning);
+        successorPublished = true;
         break;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       }
     } finally {
-      guard.release();
+      try {
+        guard.release();
+      } catch (error) {
+        if (!successorPublished) throw error;
+        deferredGuardReleases.push(guard);
+        for (const cleanupPath of guard.cleanup_paths) {
+          if (!cleanupPaths.includes(cleanupPath)) {
+            cleanupPaths.push(cleanupPath);
+          }
+        }
+        for (const warning of guard.warnings) {
+          if (!warnings.includes(warning)) warnings.push(warning);
+        }
+        const warning =
+          'reclaim guard cleanup deferred until stage lock release';
+        if (!warnings.includes(warning)) warnings.push(warning);
+      }
     }
   }
 
@@ -578,6 +597,7 @@ export function acquireStageLock(
         fsOps,
       );
       if (!finalReleased) return;
+      for (const guard of deferredGuardReleases) guard.release();
       for (const cleanupPath of cleanupPaths) {
         ensureSafeLeafPath(runDirectory, cleanupPath, fsOps);
         removeWithRetry(cleanupPath, fsOps);
