@@ -4,6 +4,15 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import {
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  rmdirSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import type {
   CaseStatus,
@@ -228,18 +237,58 @@ CREATE INDEX IF NOT EXISTS idx_revision_instructions_case ON revision_instructio
 
 export class SqliteRepository implements RepositoryPort {
   private db: Database.Database;
+  private readonlySnapshotDirectory: string | null = null;
 
-  constructor(dbPath: string) {
-    this.db = new Database(dbPath);
+  constructor(
+    dbPath: string,
+    options: { readonly?: boolean } = {},
+  ) {
+    const readonly = options.readonly === true;
+    let openPath = dbPath;
+    if (readonly) {
+      this.readonlySnapshotDirectory = mkdtempSync(
+        join(tmpdir(), 'forge-readonly-db-'),
+      );
+      openPath = join(this.readonlySnapshotDirectory, 'forge.db');
+      copyFileSync(dbPath, openPath);
+      for (const suffix of ['-wal']) {
+        if (existsSync(`${dbPath}${suffix}`)) {
+          copyFileSync(`${dbPath}${suffix}`, `${openPath}${suffix}`);
+        }
+      }
+    }
+    this.db = new Database(
+      openPath,
+      readonly ? { fileMustExist: true } : undefined,
+    );
     // 启用 WAL 模式 + busy-timeout
-    this.db.pragma('journal_mode = WAL');
     this.db.pragma('busy_timeout = 5000');
-    this.db.exec(SCHEMA);
-    this.migrateIdentitySchema();
+    if (readonly) {
+      this.db.pragma('query_only = ON');
+    } else {
+      this.db.pragma('journal_mode = WAL');
+      this.db.exec(SCHEMA);
+      this.migrateIdentitySchema();
+    }
   }
 
   close(): void {
     this.db.close();
+    if (this.readonlySnapshotDirectory) {
+      const snapshotPath = join(
+        this.readonlySnapshotDirectory,
+        'forge.db',
+      );
+      for (const path of [
+        `${snapshotPath}-shm`,
+        `${snapshotPath}-wal`,
+        snapshotPath,
+      ]) {
+        rmSync(path, { force: true });
+      }
+      rmdirSync(this.readonlySnapshotDirectory);
+      this.readonlySnapshotDirectory = null;
+    }
   }
 
   // === 事务支持 ===

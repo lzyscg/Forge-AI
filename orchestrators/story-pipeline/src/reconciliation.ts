@@ -376,7 +376,8 @@ function legacyAdoptionRejectionReason(
 ): string | null {
   const evidence = snapshot.legacy_case_evidence;
   if (
-    snapshot.case_identity !== null
+    snapshot.identity_protocol_version !== null
+    || snapshot.case_identity !== null
     || snapshot.execution_identity !== null
     || !evidence
     || evidence.protocol_identity_absent !== true
@@ -414,6 +415,7 @@ function legacyAdoptionRejectionReason(
     || attestation.stage_key !== attempt.stage_key
     || attestation.chapter_id !== attempt.chapter_id
     || attestation.input_sha256 !== attempt.input_sha256
+    || attestation.input_file_sha256.length === 0
     || attestation.attempt_id !== attempt.attempt_id
     || canonicalJson(attestation.template_identity_before)
       !== canonicalJson(attempt.template_identity)
@@ -692,14 +694,24 @@ export function materializeDeliveredArtifact(
   if (!fsOps.exists(inputPath)) {
     throw new Error(`attempt input evidence is missing: ${attempt.input_path}`);
   }
+  const inputBytes = fsOps.readFile(inputPath);
   let input: unknown;
   try {
-    input = JSON.parse(fsOps.readFile(inputPath).toString('utf8'));
+    input = JSON.parse(inputBytes.toString('utf8'));
   } catch {
     throw new Error(`attempt input evidence is not valid JSON: ${attempt.input_path}`);
   }
   if (sha256(canonicalJson(input)) !== plan.input_sha256) {
     throw new Error('attempt input evidence SHA-256 does not match the stage plan');
+  }
+  if (
+    options.legacy_binding_attestation
+    && sha256(inputBytes)
+      !== options.legacy_binding_attestation.input_file_sha256
+  ) {
+    throw new Error(
+      'attempt input file SHA-256 does not match the attestation',
+    );
   }
 
   const validation = validate(snapshot.final_artifact!.content);
@@ -857,6 +869,7 @@ export function materializeDeliveredArtifact(
     status: 'delivered',
     input_path: attempt.input_path,
     input_sha256: plan.input_sha256,
+    input_file_sha256: sha256(inputBytes),
     raw_artifact_path: rawArtifactPath,
     raw_artifact_sha256: evidence[0]!.expectedSha256,
     artifact_path: artifactPath,

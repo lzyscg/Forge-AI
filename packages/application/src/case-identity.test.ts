@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -48,6 +54,17 @@ function canonicalJson(value: unknown): string {
       .join(',')}}`;
   }
   return JSON.stringify(value) ?? 'null';
+}
+
+function directoryEvidence(root: string) {
+  return readdirSync(root).sort().map((name) => {
+    const bytes = readFileSync(join(root, name));
+    return {
+      name,
+      length: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+  });
 }
 
 afterEach(() => {
@@ -159,6 +176,7 @@ describe('immutable Forge Case identity', () => {
     const status = runner(repo, CHANGED_DISK_SCENARIO, changedBundleHash, scenarioPath)
       .buildResultJson(caseId);
 
+    expect(status.identity_protocol_version).toBe('case-identity-v1');
     expect(status.case_identity?.input_payload_sha256).toBe(createdInputHash);
     expect(status.case_identity?.scenario_snapshot_sha256).toBe(createdSnapshotHash);
     expect(status.case_identity?.scenario_id).toBe('identity-scenario');
@@ -197,6 +215,7 @@ describe('immutable Forge Case identity', () => {
     const status = runner(repo, CHANGED_DISK_SCENARIO, '4'.repeat(64))
       .buildResultJson('legacy-case');
 
+    expect(status.identity_protocol_version).toBeNull();
     expect(status.case_identity).toBeNull();
     expect(status.execution_identity).toBeNull();
     expect(status.legacy_case_evidence).toEqual({
@@ -211,5 +230,59 @@ describe('immutable Forge Case identity', () => {
       protocol_identity_absent: true,
     });
     repo.close();
+  });
+
+  it('keeps the creation protocol marker when a new Case identity row is damaged', () => {
+    const repo = new SqliteRepository(':memory:');
+    const createdRunner = runner(
+      repo,
+      ORIGINAL_SCENARIO,
+      '5'.repeat(64),
+    );
+    const caseId = createdRunner.createCase({
+      title: 'damaged identity',
+      inputPayload: { a: 1, z: 2 },
+    });
+    repo.updateCase(caseId, {
+      scenario_id: null,
+      scenario_snapshot_sha256: null,
+      input_payload_sha256: null,
+    });
+
+    const status = createdRunner.buildResultJson(caseId);
+
+    expect(status.identity_protocol_version).toBe('case-identity-v1');
+    expect(status.case_identity).toBeNull();
+    expect(status.legacy_case_evidence).toBeNull();
+    repo.close();
+  });
+
+  it('builds historical status through a read-only repository without changing DB sidecars', () => {
+    const root = mkdtempSync(join(tmpdir(), 'forge-status-readonly-'));
+    temporaryDirectories.push(root);
+    const dbPath = join(root, 'forge.db');
+    const writable = new SqliteRepository(dbPath);
+    writable.insertCase({
+      case_id: 'legacy-status-case',
+      title: 'legacy',
+      status: 'created',
+      current_stage: 'init',
+      scenario_snapshot: JSON.stringify(ORIGINAL_SCENARIO),
+      input_payload: '{"a":1,"z":2}',
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+      completed_at: null,
+    });
+    writable.close();
+    const before = directoryEvidence(root);
+
+    const readonly = new SqliteRepository(dbPath, { readonly: true });
+    const status = runner(readonly, ORIGINAL_SCENARIO, '6'.repeat(64))
+      .buildResultJson('legacy-status-case');
+    readonly.close();
+
+    expect(status.identity_protocol_version).toBeNull();
+    expect(status.legacy_case_evidence?.protocol_identity_absent).toBe(true);
+    expect(directoryEvidence(root)).toEqual(before);
   });
 });

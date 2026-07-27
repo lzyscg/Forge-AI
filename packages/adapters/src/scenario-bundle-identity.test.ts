@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
   lstatSync,
@@ -30,6 +31,17 @@ function temporaryRoot(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), prefix));
   roots.push(root);
   return root;
+}
+
+function directoryEvidence(root: string) {
+  return readdirSync(root).sort().map((name) => {
+    const bytes = readFileSync(join(root, name));
+    return {
+      name,
+      length: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+  });
 }
 
 function fileSystemTreatingAsSymlink(targetPath: string) {
@@ -249,6 +261,42 @@ describe('scenario bundle identity', () => {
     writeFileSync(join(root, 'helper.py'), 'VALUE = "v1"\n', 'utf8');
     writeFileSync(join(root, 'rules.json'), '{"minimum":2}\n', 'utf8');
     expect(computeScenarioBundleSha256(scenarioPath, config)).not.toBe(original);
+  });
+});
+
+describe('read-only historical database access', () => {
+  it('does not migrate an old database or create WAL/SHM sidecars', () => {
+    const root = temporaryRoot('forge-readonly-legacy-db-');
+    const dbPath = join(root, 'forge.db');
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE cases (
+        case_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_stage TEXT NOT NULL DEFAULT 'init',
+        scenario_snapshot TEXT NOT NULL,
+        input_payload TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      INSERT INTO cases VALUES (
+        'legacy-case', 'legacy', 'created', 'init', '{}', '{}',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', NULL
+      );
+    `);
+    legacy.close();
+    const before = directoryEvidence(root);
+
+    const repo = new SqliteRepository(dbPath, { readonly: true });
+    try {
+      expect(repo.getCase('legacy-case')?.case_id).toBe('legacy-case');
+    } finally {
+      repo.close();
+    }
+
+    expect(directoryEvidence(root)).toEqual(before);
   });
 });
 

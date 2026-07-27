@@ -12,6 +12,7 @@ import type {
   CaseStatus,
   CaseRunBinding,
 } from '@forge-ai/contracts';
+import { CASE_IDENTITY_PROTOCOL_VERSION } from '@forge-ai/contracts';
 import { transitionCase } from '@forge-ai/domain';
 
 export interface CreateCaseInput {
@@ -56,23 +57,33 @@ export class CaseService {
       chapter_id: null,
     };
 
-    this.repo.insertCase({
-      case_id: caseId,
-      title: input.title,
-      status: 'created' satisfies CaseStatus,
-      current_stage: 'init',
-      scenario_id: input.scenarioConfig.scenario.id,
-      scenario_snapshot: scenarioSnapshot,
-      input_payload: inputPayload,
-      scenario_snapshot_sha256: sha256(canonicalJson(input.scenarioConfig)),
-      input_payload_sha256: sha256(canonicalJson(input.inputPayload)),
-      run_id: runBinding.run_id,
-      story_id: runBinding.story_id,
-      stage_key: runBinding.stage_key,
-      chapter_id: runBinding.chapter_id,
-      created_at: now,
-      updated_at: now,
-      completed_at: null,
+    this.repo.runInTransaction(() => {
+      this.repo.insertCase({
+        case_id: caseId,
+        title: input.title,
+        status: 'created' satisfies CaseStatus,
+        current_stage: 'init',
+        scenario_id: input.scenarioConfig.scenario.id,
+        scenario_snapshot: scenarioSnapshot,
+        input_payload: inputPayload,
+        scenario_snapshot_sha256: sha256(canonicalJson(input.scenarioConfig)),
+        input_payload_sha256: sha256(canonicalJson(input.inputPayload)),
+        run_id: runBinding.run_id,
+        story_id: runBinding.story_id,
+        stage_key: runBinding.stage_key,
+        chapter_id: runBinding.chapter_id,
+        created_at: now,
+        updated_at: now,
+        completed_at: null,
+      });
+      this.repo.insertControlEvent({
+        event_id: `identity-protocol-${caseId}`,
+        case_id: caseId,
+        event_type: 'case_identity_protocol',
+        actor: 'case-service',
+        detail: CASE_IDENTITY_PROTOCOL_VERSION,
+        created_at: now,
+      });
     });
 
     return caseId;

@@ -37,6 +37,7 @@ export interface LegacyBindingAttestation {
   stage_key: string;
   chapter_id: string | null;
   input_sha256: string;
+  input_file_sha256: string;
   scenario_snapshot_sha256: string;
   attempt_id: string;
   historical_attempt_id: string;
@@ -61,6 +62,7 @@ export interface StageRecordV21 {
   status: 'delivered';
   input_path: string;
   input_sha256: string;
+  input_file_sha256?: string;
   raw_artifact_path: string;
   raw_artifact_sha256: string;
   artifact_path: string;
@@ -250,6 +252,48 @@ function legacyIdentity(contentSha256: string): TemplateIdentity {
   };
 }
 
+function inferLegacyAttemptMetadata(stageKey: string): Pick<
+  StageAttemptV21,
+  'stage' | 'chapter_id' | 'template' | 'expected_artifact_type'
+> {
+  if (stageKey === 'outline') {
+    return {
+      stage: 'outline',
+      chapter_id: null,
+      template: 'zhihu-story-outline',
+      expected_artifact_type: 'blueprint_bundle',
+    };
+  }
+  for (const [prefix, stage, template, artifactType] of [
+    ['packet-', 'chapter_packet', 'zhihu-chapter-packet', 'chapter_packet'],
+    ['draft-', 'chapter_draft', 'zhihu-chapter-draft', 'chapter_draft'],
+    ['ledger-', 'ledger_update', 'zhihu-story-ledger', 'story_ledger'],
+  ] as const) {
+    if (stageKey.startsWith(prefix)) {
+      return {
+        stage,
+        chapter_id: stageKey.slice(prefix.length).toUpperCase(),
+        template,
+        expected_artifact_type: artifactType,
+      };
+    }
+  }
+  if (stageKey === 'final') {
+    return {
+      stage: 'final_review',
+      chapter_id: null,
+      template: 'zhihu-story-final',
+      expected_artifact_type: 'final_manuscript',
+    };
+  }
+  return {
+    stage: stageKey,
+    chapter_id: null,
+    template: '',
+    expected_artifact_type: '',
+  };
+}
+
 function migrateV20(manifest: PipelineManifestV20): PipelineManifestV21 {
   const stages = manifest.stages.map((stage): StageRecordV21 => {
     const { template_sha256: templateSha256, ...rest } = stage;
@@ -259,12 +303,14 @@ function migrateV20(manifest: PipelineManifestV20): PipelineManifestV21 {
   const attempts = (manifest.attempts ?? []).map((attempt): StageAttemptV21 => {
     const { template_sha256: templateSha256, ...rest } = attempt;
     const stage = stagesByKey.get(attempt.stage_key);
+    const inferred = inferLegacyAttemptMetadata(attempt.stage_key);
     return {
       ...rest,
-      stage: stage?.stage ?? attempt.stage_key,
-      chapter_id: stage?.chapter_id ?? null,
-      template: stage?.template ?? '',
-      expected_artifact_type: stage?.artifact_type ?? '',
+      stage: stage?.stage ?? inferred.stage,
+      chapter_id: stage?.chapter_id ?? inferred.chapter_id,
+      template: stage?.template ?? inferred.template,
+      expected_artifact_type:
+        stage?.artifact_type ?? inferred.expected_artifact_type,
       expected_scenario_snapshot_sha256: null,
       parent_record_ids: stage?.parent_record_ids ?? [],
       template_identity: legacyIdentity(templateSha256),
@@ -396,6 +442,7 @@ export function validateManifestChain(manifest: PipelineManifestV21): void {
       || attestation.stage_key !== record.stage_key
       || attestation.chapter_id !== record.chapter_id
       || attestation.input_sha256 !== record.input_sha256
+      || attestation.input_file_sha256 !== record.input_file_sha256
       || attestation.scenario_snapshot_sha256.length === 0
     ) {
       throw new Error('legacy binding attestation record identity does not match');

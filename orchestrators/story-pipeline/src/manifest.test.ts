@@ -264,6 +264,19 @@ describe('loadManifest', () => {
         started_at: '2026-07-27T00:00:00.000Z',
         updated_at: '2026-07-27T00:00:00.000Z',
         detail: null,
+      }, {
+        attempt_id: 'draft-b001-a6',
+        stage_key: 'draft-b001',
+        case_id: 'case-draft-b001',
+        input_sha256: 'draft-input-hash',
+        template_sha256: 'legacy-draft-template-hash',
+        outcome: 'running',
+        input_path: 'inputs/draft-b001-a6.json',
+        raw_artifact_path: null,
+        validation_report_path: null,
+        started_at: '2026-07-27T00:00:00.000Z',
+        updated_at: '2026-07-27T00:00:00.000Z',
+        detail: null,
       }],
       events: [legacyEvent],
     }, null, 2)}\n`, 'utf8');
@@ -286,6 +299,12 @@ describe('loadManifest', () => {
     expect(
       migrated.attempts[0]?.expected_scenario_snapshot_sha256,
     ).toBeNull();
+    expect(migrated.attempts[1]).toMatchObject({
+      stage: 'chapter_draft',
+      chapter_id: 'B001',
+      template: 'zhihu-chapter-draft',
+      expected_artifact_type: 'chapter_draft',
+    });
     expect(migrated.replacements).toEqual([]);
   });
 
@@ -514,6 +533,7 @@ describe('historical reinstatement invariants', () => {
         ...oldRecord.template_identity,
         equivalence: 'operator_attested' as const,
       },
+      input_file_sha256: 'historical-input-file-hash',
       legacy_binding_attestation: {
         proof: 'operator_attested' as const,
         case_id: oldRecord.case_id,
@@ -522,6 +542,7 @@ describe('historical reinstatement invariants', () => {
         stage_key: oldRecord.stage_key,
         chapter_id: oldRecord.chapter_id,
         input_sha256: oldRecord.input_sha256,
+        input_file_sha256: 'historical-input-file-hash',
         scenario_snapshot_sha256: 'legacy-scenario-hash',
         attempt_id: 'attempt-1',
         historical_attempt_id: 'attempt-1',
@@ -563,6 +584,16 @@ describe('historical reinstatement invariants', () => {
 
     expect(() => validateManifestChain(manifest)).toThrow(
       'legacy binding attestation historical event is missing',
+    );
+  });
+
+  it('rejects an attested record whose raw input file hash differs', () => {
+    const { manifest, restoredRecord } = historicalManifest();
+    restoredRecord.legacy_binding_attestation.input_file_sha256 =
+      'different-input-file-hash';
+
+    expect(() => validateManifestChain(manifest)).toThrow(
+      'legacy binding attestation record identity does not match',
     );
   });
 

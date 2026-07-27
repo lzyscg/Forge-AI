@@ -6,6 +6,7 @@
 
 import { createHash } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
+import { CASE_IDENTITY_PROTOCOL_VERSION } from '@forge-ai/contracts';
 import type {
   RepositoryPort,
   ClockPort,
@@ -943,10 +944,19 @@ export class CaseRunner {
     } catch {
       scenarioSnapshot = null;
     }
+    const identityProtocolVersion = caseRecord
+      && this.repo.getControlEventsByCase(caseId).some(
+        (event) =>
+          event.event_type === 'case_identity_protocol'
+          && event.detail === CASE_IDENTITY_PROTOCOL_VERSION,
+      )
+      ? CASE_IDENTITY_PROTOCOL_VERSION
+      : null;
 
     let caseIdentity: ResultCaseIdentity | null = null;
     if (
       caseRecord
+      && identityProtocolVersion === CASE_IDENTITY_PROTOCOL_VERSION
       && typeof caseRecord.scenario_id === 'string'
       && typeof caseRecord.scenario_snapshot_sha256 === 'string'
       && typeof caseRecord.input_payload_sha256 === 'string'
@@ -965,7 +975,12 @@ export class CaseRunner {
       };
     }
     let legacyCaseEvidence: ResultLegacyCaseEvidence | null = null;
-    if (caseRecord && caseIdentity === null && scenarioSnapshot) {
+    if (
+      caseRecord
+      && identityProtocolVersion === null
+      && caseIdentity === null
+      && scenarioSnapshot
+    ) {
       let inputPayload: unknown;
       try {
         inputPayload = JSON.parse(String(caseRecord.input_payload));
@@ -1074,6 +1089,7 @@ export class CaseRunner {
       case_id: caseId,
       status,
       success,
+      identity_protocol_version: identityProtocolVersion,
       final_artifact: finalArtifact,
       case_identity: caseIdentity,
       execution_identity: executionIdentity,

@@ -65,6 +65,9 @@ export interface HistoricalRecoveryOptions {
   legacy_case_bindings: string[];
   attestation_reason?: string;
   validators: Record<string, (content: string) => ValidationResult>;
+  validator_for_attempt?: (
+    attempt: StageAttemptV21,
+  ) => (content: string) => ValidationResult;
   now?: string;
 }
 
@@ -121,11 +124,12 @@ function verifyFile(
 function recoveryInput(
   runDirectory: string,
   attempt: StageAttemptV21,
-): Record<string, unknown> {
-  const bytes = verifyFile(
-    runDirectory,
-    attempt.input_path,
-    sha256(readFileSync(safeEvidencePath(runDirectory, attempt.input_path))),
+): {
+  input: Record<string, unknown>;
+  input_file_sha256: string;
+} {
+  const bytes = readFileSync(
+    safeEvidencePath(runDirectory, attempt.input_path),
   );
   let parsed: unknown;
   try {
@@ -139,7 +143,10 @@ function recoveryInput(
   if (sha256(canonicalJson(parsed)) !== attempt.input_sha256) {
     throw new Error('historical input SHA-256 does not match the Attempt');
   }
-  return parsed as Record<string, unknown>;
+  return {
+    input: parsed as Record<string, unknown>,
+    input_file_sha256: sha256(bytes),
+  };
 }
 
 function inferredStage(stageKey: string): {
@@ -215,6 +222,7 @@ function verifyLegacySnapshot(
   const evidence = snapshot.legacy_case_evidence;
   if (
     snapshot.case_id !== attempt.case_id
+    || snapshot.identity_protocol_version !== null
     || snapshot.case_identity !== null
     || snapshot.execution_identity !== null
     || !evidence
@@ -222,6 +230,11 @@ function verifyLegacySnapshot(
     || evidence.input_payload_sha256 !== attempt.input_sha256
   ) {
     throw new Error('legacy Case input evidence does not match');
+  }
+  if (evidence.scenario_id !== attempt.template) {
+    throw new Error(
+      'legacy Case scenario does not match the historical Attempt',
+    );
   }
   if (
     snapshot.status !== 'approved'
@@ -271,6 +284,7 @@ function attestation(
   snapshot: ForgeCaseSnapshot,
   after: TemplateIdentity,
   eventSha256: string,
+  inputFileSha256: string,
   reason: string,
   at: string,
 ): LegacyBindingAttestation {
@@ -282,6 +296,7 @@ function attestation(
     stage_key: projection.stage_key,
     chapter_id: projection.chapter_id,
     input_sha256: projection.input_sha256,
+    input_file_sha256: inputFileSha256,
     scenario_snapshot_sha256:
       snapshot.legacy_case_evidence!.scenario_snapshot_sha256,
     attempt_id: projection.attempt_id,
@@ -407,6 +422,12 @@ export function recoverLegacyHistory(
   const restoredIds = new Map<string, string>();
   const restoredRecords: StageRecordV21[] = [];
 
+  const validatorForAttempt = (
+    attempt: StageAttemptV21,
+  ): ((content: string) => ValidationResult) | undefined =>
+    options.validator_for_attempt?.(attempt)
+      ?? options.validators[attempt.stage_key];
+
   for (const oldRecord of pendingReinstatements) {
     const historicalAttempt = working.attempts.find((attempt) =>
       attempt.case_id === oldRecord.case_id
@@ -422,7 +443,10 @@ export function recoverLegacyHistory(
     if (!snapshot) {
       throw new Error(`historical Case snapshot is missing: ${oldRecord.case_id}`);
     }
-    recoveryInput(options.run_dir, historicalAttempt);
+    const historicalInput = recoveryInput(
+      options.run_dir,
+      historicalAttempt,
+    );
     verifyFile(
       options.run_dir,
       oldRecord.raw_artifact_path,
@@ -449,7 +473,7 @@ export function recoverLegacyHistory(
       oldRecord.artifact_type,
       oldRecord.raw_artifact_sha256,
     );
-    const validator = options.validators[oldRecord.stage_key];
+    const validator = validatorForAttempt(historicalAttempt);
     if (!validator) {
       throw new Error(`historical validator is missing: ${oldRecord.stage_key}`);
     }
@@ -467,7 +491,7 @@ export function recoverLegacyHistory(
       restoredIds.get(recordId) ?? recordId
     );
     if (oldRecord.stage.startsWith('chapter_packet')) {
-      const input = recoveryInput(options.run_dir, historicalAttempt);
+      const input = historicalInput.input;
       const parent = restoredRecords.find(
         (record) => record.record_id === parentRecordIds[0],
       );
@@ -513,6 +537,7 @@ export function recoverLegacyHistory(
         return parent.case_id;
       }),
       template_identity: afterIdentity,
+      input_file_sha256: historicalInput.input_file_sha256,
       legacy_binding_attestation: attestation(
         working,
         projection,
@@ -520,6 +545,7 @@ export function recoverLegacyHistory(
         snapshot,
         afterIdentity,
         event.event_sha256,
+        historicalInput.input_file_sha256,
         reason || 'operator attestation required',
         now,
       ),
@@ -715,7 +741,8 @@ export function recoverLegacyHistory(
     (record) => record.stage_key === `packet-${chapterKey}`,
   );
   if (!packetRecord) throw new Error('reinstated packet record is missing');
-  const draftInput = recoveryInput(options.run_dir, selected);
+  const draftInputEvidence = recoveryInput(options.run_dir, selected);
+  const draftInput = draftInputEvidence.input;
   if (
     typeof draftInput.chapter_packet !== 'string'
     || sha256(draftInput.chapter_packet) !== packetRecord.artifact_sha256
@@ -739,6 +766,7 @@ export function recoverLegacyHistory(
     selectedSnapshot,
     afterIdentity,
     event.event_sha256,
+    draftInputEvidence.input_file_sha256,
     reason,
     now,
   );
@@ -755,7 +783,7 @@ export function recoverLegacyHistory(
     parent_record_ids: [packetRecord.record_id],
     template_identity: afterIdentity,
   };
-  const validator = options.validators[draftStageKey];
+  const validator = validatorForAttempt(selected);
   if (!validator) throw new Error(`historical validator is missing: ${draftStageKey}`);
   const record = materializeDeliveredArtifact({
     run_dir: options.run_dir,

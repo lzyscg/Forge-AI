@@ -61,6 +61,10 @@ export interface ResultLegacyCaseEvidence {
   protocol_identity_absent: true;
 }
 
+export const CASE_IDENTITY_PROTOCOL_VERSION = 'case-identity-v1' as const;
+export type CaseIdentityProtocolVersion =
+  typeof CASE_IDENTITY_PROTOCOL_VERSION;
+
 export interface ResultDiff {
   from_version: number;
   to_version: number;
@@ -73,6 +77,7 @@ export interface ResultJson {
   case_id: string;
   status: string;
   success: boolean;
+  identity_protocol_version: CaseIdentityProtocolVersion | null;
   final_artifact: ResultArtifact | null;
   case_identity: ResultCaseIdentity | null;
   execution_identity: ResultExecutionIdentity | null;

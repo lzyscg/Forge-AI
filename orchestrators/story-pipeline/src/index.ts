@@ -1672,31 +1672,6 @@ export function historicalRecoveryAttempt(
   throw new Error(`unsupported historical recovery stage: ${stageKey}`);
 }
 
-function historicalRecoveryValidators(
-  config: PipelineConfig,
-  manifest: PipelineManifest,
-  runDir: string,
-  provided: Record<string, (rawContent: string) => ValidationResult>,
-): Record<string, (rawContent: string) => ValidationResult> {
-  const result = { ...provided };
-  const stageKeys = [
-    'outline',
-    ...config.chapters.flatMap((chapter) => {
-      const key = chapter.id.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
-      return [`packet-${key}`, `draft-${key}`];
-    }),
-  ];
-  for (const stageKey of stageKeys) {
-    result[stageKey] ??= recoveryValidatorFromEvidence(
-      config,
-      manifest,
-      historicalRecoveryAttempt(config, manifest, stageKey),
-      runDir,
-    );
-  }
-  return result;
-}
-
 export async function reconcileRun(
   options: ReconcileOptions,
   forgeClient: ForgeClient,
@@ -1766,14 +1741,17 @@ export async function reconcileRun(
         options.attestTemplateCompatibility,
       legacy_case_bindings: options.attestLegacyCaseBindings,
       attestation_reason: options.attestationReason,
-      validators: pendingLegacyReinstatement
-        ? historicalRecoveryValidators(
-            config,
-            initialManifest,
-            options.runDir,
-            validators,
-          )
-        : validators,
+      validators,
+      validator_for_attempt: pendingLegacyReinstatement
+        ? (attempt) =>
+            validators[attempt.stage_key]
+            ?? recoveryValidatorFromEvidence(
+              config,
+              initialManifest,
+              attempt,
+              options.runDir,
+            )
+        : undefined,
     });
     if (historical.applicable) {
       if (!options.dryRun && historical.ambiguous.length > 0) {

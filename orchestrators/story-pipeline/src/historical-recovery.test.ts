@@ -137,6 +137,7 @@ function snapshot(
     case_id: candidate.case_id,
     status,
     success: delivered,
+    identity_protocol_version: null,
     case_identity: null,
     execution_identity: null,
     legacy_case_evidence: {
@@ -175,15 +176,30 @@ function fixture() {
   const draftContent = '# draft\n';
   const outlineInput = { source_text: 'source' };
   const packetInput = { blueprint_bundle: outlineContent };
-  const draftInput = { chapter_packet: packetContent };
+  const draftA4Input = {
+    chapter_packet: packetContent,
+    reference_chapter_text: 'candidate a4',
+  };
+  const draftA5Input = {
+    chapter_packet: packetContent,
+    reference_chapter_text: 'selected a5',
+  };
+  const draftA6Input = {
+    chapter_packet: 'decoy packet',
+    reference_chapter_text: 'decoy a6',
+  };
+  const draftA2Input = {
+    chapter_packet: packetContent,
+    reference_chapter_text: 'waiting a2',
+  };
   const inputs = [
     ['inputs/outline.json', outlineInput],
     ['inputs/packet.json', packetInput],
     ['inputs/packet-failed.json', {}],
-    ['inputs/draft-a4.json', draftInput],
-    ['inputs/draft-a5.json', draftInput],
-    ['inputs/draft-a6.json', draftInput],
-    ['inputs/draft-a2.json', draftInput],
+    ['inputs/draft-a4.json', draftA4Input],
+    ['inputs/draft-a5.json', draftA5Input],
+    ['inputs/draft-a6.json', draftA6Input],
+    ['inputs/draft-a2.json', draftA2Input],
   ] as const;
   for (const [relativePath, input] of inputs) {
     const path = join(runDir, relativePath);
@@ -192,7 +208,6 @@ function fixture() {
   }
   const outlineInputSha = sha256(JSON.stringify(outlineInput));
   const packetInputSha = sha256(JSON.stringify(packetInput));
-  const draftInputSha = sha256(JSON.stringify(draftInput));
   const outlineAttempt = attempt(
     'outline-a1', 'outline', 'case-outline', outlineInputSha,
     'inputs/outline.json', 'outline-template', 'delivered',
@@ -207,19 +222,23 @@ function fixture() {
     'packet-template-old', 'validation_failed',
   );
   const draftA4 = attempt(
-    'draft-a4', 'draft-b001', 'case-draft-a4', draftInputSha,
+    'draft-a4', 'draft-b001', 'case-draft-a4',
+    sha256(JSON.stringify(draftA4Input)),
     'inputs/draft-a4.json', 'draft-template-a4', 'running',
   );
   const draftA2 = attempt(
-    'draft-a2', 'draft-b001', 'case-draft-a2', draftInputSha,
+    'draft-a2', 'draft-b001', 'case-draft-a2',
+    sha256(JSON.stringify(draftA2Input)),
     'inputs/draft-a2.json', 'draft-template-a2', 'blocked',
   );
   const draftA5 = attempt(
-    'draft-a5', 'draft-b001', 'case-draft-a5', draftInputSha,
+    'draft-a5', 'draft-b001', 'case-draft-a5',
+    sha256(JSON.stringify(draftA5Input)),
     'inputs/draft-a5.json', 'draft-template-a5', 'interrupted',
   );
   const draftA6 = attempt(
-    'draft-a6', 'draft-b001', 'case-draft-a6', draftInputSha,
+    'draft-a6', 'draft-b001', 'case-draft-a6',
+    sha256(JSON.stringify(draftA6Input)),
     'inputs/draft-a6.json', 'draft-template-a6', 'running',
   );
   const outlineRecord: StageRecordV21 = {
@@ -412,6 +431,7 @@ describe('append-only historical recovery', () => {
 
   it('applies one attested lineage and becomes a zero-action ledger handoff', () => {
     const state = fixture();
+    const validatorAttempts: string[] = [];
 
     const applied = recoverLegacyHistory({
       run_dir: state.runDir,
@@ -426,11 +446,19 @@ describe('append-only historical recovery', () => {
       validators: {
         outline: state.validate,
         'packet-b001': state.validate,
-        'draft-b001': state.validate,
+      },
+      validator_for_attempt: (selected) => {
+        validatorAttempts.push(selected.attempt_id);
+        return state.validate;
       },
       now: '2026-07-27T00:00:00.000Z',
     });
 
+    expect(validatorAttempts).toEqual([
+      'outline-a1',
+      'packet-a1',
+      'draft-a5',
+    ]);
     expect(applied.ambiguous).toEqual([]);
     expect(applied.next_stage).toBe('ledger-b001');
     expect(applied.manifest.invalidations.map(({ invalidation_id }) =>
@@ -499,6 +527,29 @@ describe('append-only historical recovery', () => {
         'draft-b001': state.validate,
       },
     })).toThrow('legacy Case input evidence does not match');
+    expect(JSON.stringify(state.manifest)).toBe(before);
+  });
+
+  it('rejects a legacy Case from a different scenario before mutating the Manifest', () => {
+    const state = fixture();
+    state.snapshots.get('case-outline')!.legacy_case_evidence!.scenario_id =
+      'zhihu-chapter-draft';
+    const before = JSON.stringify(state.manifest);
+
+    expect(() => recoverLegacyHistory({
+      run_dir: state.runDir,
+      manifest: state.manifest,
+      chapter_ids: ['B001'],
+      snapshots: state.snapshots,
+      apply: false,
+      attest_template_compatibility: false,
+      legacy_case_bindings: [],
+      validators: {
+        outline: state.validate,
+        'packet-b001': state.validate,
+        'draft-b001': state.validate,
+      },
+    })).toThrow('legacy Case scenario does not match the historical Attempt');
     expect(JSON.stringify(state.manifest)).toBe(before);
   });
 

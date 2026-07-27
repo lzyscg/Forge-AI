@@ -88,6 +88,7 @@ function approvedSnapshot(caseId: string): ForgeCaseSnapshot {
     case_id: caseId,
     status: 'approved',
     success: true,
+    identity_protocol_version: 'case-identity-v1',
     case_identity: {
       db_instance_id: 'db-1',
       scenario_id: 'zhihu-chapter-draft',
@@ -474,6 +475,7 @@ describe('stage reconciliation', () => {
     fixture.plan.expected_scenario_snapshot_sha256 = null;
     fixture.snapshot.case_identity = null;
     fixture.snapshot.execution_identity = null;
+    fixture.snapshot.identity_protocol_version = null;
     fixture.snapshot.legacy_case_evidence = {
       scenario_id: fixture.candidate.template,
       scenario_snapshot_sha256: 'legacy-scenario-hash',
@@ -504,6 +506,9 @@ describe('stage reconciliation', () => {
       stage_key: fixture.candidate.stage_key,
       chapter_id: fixture.candidate.chapter_id,
       input_sha256: fixture.candidate.input_sha256,
+      input_file_sha256: sha256(readFileSync(
+        join(fixture.runDirectory, fixture.candidate.input_path),
+      )),
       scenario_snapshot_sha256: 'legacy-scenario-hash',
       attempt_id: fixture.candidate.attempt_id,
       historical_attempt_id: fixture.candidate.attempt_id,
@@ -526,9 +531,20 @@ describe('stage reconciliation', () => {
 
     expect(record.legacy_binding_attestation).toEqual(attestation);
     expect(record.template_identity.equivalence).toBe('operator_attested');
+
+    fixture.snapshot.identity_protocol_version = 'case-identity-v1';
+    expect(() => materializeDeliveredArtifact({
+      run_dir: fixture.runDirectory,
+      manifest: fixture.manifest,
+      plan: fixture.plan,
+      attempt: fixture.candidate,
+      snapshot: fixture.snapshot,
+      validate: fixture.validate,
+      legacy_binding_attestation: attestation,
+    })).toThrow('legacy Case protocol evidence is unavailable');
   });
 
-  it('rejects legacy materialization when Case input evidence differs from the attestation', () => {
+  it('rejects legacy materialization when canonical-equal input bytes differ from the attestation', () => {
     const fixture = materializationFixture();
     fixture.candidate.template_identity = {
       algorithm: 'legacy-unversioned-v1',
@@ -543,10 +559,11 @@ describe('stage reconciliation', () => {
     fixture.plan.expected_scenario_snapshot_sha256 = null;
     fixture.snapshot.case_identity = null;
     fixture.snapshot.execution_identity = null;
+    fixture.snapshot.identity_protocol_version = null;
     fixture.snapshot.legacy_case_evidence = {
       scenario_id: fixture.candidate.template,
       scenario_snapshot_sha256: 'legacy-scenario-hash',
-      input_payload_sha256: 'different-input',
+      input_payload_sha256: fixture.plan.input_sha256,
       created_at: '2026-07-26T00:00:00.000Z',
       protocol_identity_absent: true,
     };
@@ -573,6 +590,9 @@ describe('stage reconciliation', () => {
       stage_key: fixture.candidate.stage_key,
       chapter_id: fixture.candidate.chapter_id,
       input_sha256: fixture.candidate.input_sha256,
+      input_file_sha256: sha256(readFileSync(
+        join(fixture.runDirectory, fixture.candidate.input_path),
+      )),
       scenario_snapshot_sha256: 'legacy-scenario-hash',
       attempt_id: fixture.candidate.attempt_id,
       historical_attempt_id: fixture.candidate.attempt_id,
@@ -582,6 +602,11 @@ describe('stage reconciliation', () => {
       attested_at: '2026-07-27T00:00:00.000Z',
       reason: 'operator reviewed the historical Case evidence',
     };
+    writeFileSync(
+      join(fixture.runDirectory, fixture.candidate.input_path),
+      '{"chapter":"one"}',
+      'utf8',
+    );
 
     expect(() => materializeDeliveredArtifact({
       run_dir: fixture.runDirectory,
@@ -591,7 +616,8 @@ describe('stage reconciliation', () => {
       snapshot: fixture.snapshot,
       validate: fixture.validate,
       legacy_binding_attestation: attestation,
-    })).toThrow('legacy Case input evidence does not match');
+    })).toThrow('attempt input file SHA-256 does not match the attestation');
+    expect(existsSync(join(fixture.runDirectory, 'materialized'))).toBe(false);
   });
 
   it('extracts the immutable scenario snapshot identity captured after create', () => {

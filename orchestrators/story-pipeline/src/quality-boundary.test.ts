@@ -69,6 +69,7 @@ function approvedSnapshot(content: string, inputSha256: string): ForgeCaseSnapsh
     case_id: 'case-draft',
     status: 'approved',
     success: true,
+    identity_protocol_version: 'case-identity-v1',
     case_identity: {
       db_instance_id: 'db-1',
       scenario_id: 'zhihu-chapter-draft',

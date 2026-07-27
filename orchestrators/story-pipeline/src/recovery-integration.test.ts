@@ -570,6 +570,7 @@ function approvedRecoverySnapshot(
     case_id: caseId,
     status: 'approved',
     success: true,
+    identity_protocol_version: 'case-identity-v1',
     case_identity: {
       db_instance_id: 'db-1',
       scenario_id: 'zhihu-story-outline',
