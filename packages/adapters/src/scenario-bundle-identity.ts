@@ -4,6 +4,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  type Stats,
 } from 'node:fs';
 import {
   dirname,
@@ -15,6 +16,20 @@ import type { ScenarioConfig } from '@forge-ai/contracts';
 
 const IGNORED_DIRECTORIES = new Set(['__pycache__', '.pytest_cache']);
 
+export interface ScenarioBundleFileSystem {
+  lstatSync(path: string): Stats;
+  readdirSync(path: string): string[];
+  readFileSync(path: string): Buffer;
+  realpathSync(path: string): string;
+}
+
+const NODE_FILE_SYSTEM: ScenarioBundleFileSystem = {
+  lstatSync,
+  readdirSync: (path) => readdirSync(path),
+  readFileSync: (path) => readFileSync(path),
+  realpathSync: (path) => realpathSync(path),
+};
+
 function isIgnoredFile(name: string): boolean {
   return name === '.DS_Store'
     || name.endsWith('.pyc')
@@ -23,9 +38,14 @@ function isIgnoredFile(name: string): boolean {
     || name.endsWith('~');
 }
 
-function assertInside(root: string, target: string, description: string): void {
+function assertInside(
+  root: string,
+  target: string,
+  description: string,
+  allowRoot = false,
+): void {
   const rel = relative(root, target);
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+  if ((!allowRoot && rel === '') || rel.startsWith('..') || isAbsolute(rel)) {
     throw new Error(`${description} must be inside the scenario directory`);
   }
 }
@@ -37,36 +57,74 @@ function assertInside(root: string, target: string, description: string): void {
 export function computeScenarioBundleSha256(
   scenarioPath: string,
   scenarioConfig: ScenarioConfig,
+  fileSystem: ScenarioBundleFileSystem = NODE_FILE_SYSTEM,
 ): string {
-  const root = realpathSync(dirname(resolve(scenarioPath)));
+  const requestedRoot = dirname(resolve(scenarioPath));
+  if (fileSystem.lstatSync(requestedRoot).isSymbolicLink()) {
+    throw new Error('Scenario bundle cannot contain a symbolic link (scenario directory)');
+  }
+  const root = fileSystem.realpathSync(requestedRoot);
   const entries = new Map<string, Buffer>();
 
-  const addFile = (path: string, description: string): void => {
-    const realPath = realpathSync(path);
-    assertInside(root, realPath, description);
-    if (!lstatSync(realPath).isFile()) {
-      throw new Error(`${description} is not a file`);
+  const lstatWithoutSymlink = (path: string, description: string) => {
+    const stat = fileSystem.lstatSync(path);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Scenario bundle cannot contain a symbolic link (${description})`);
     }
-    entries.set(relative(root, realPath).replaceAll('\\', '/'), readFileSync(realPath));
+    return stat;
   };
 
-  const addConfiguredFile = (configuredPath: string, description: string): void => {
+  const assertPathHasNoSymlink = (path: string, description: string): void => {
+    assertInside(root, path, description, true);
+    const rel = relative(root, path);
+    let current = root;
+    for (const segment of rel.split(/[\\/]/).filter(Boolean)) {
+      current = resolve(current, segment);
+      lstatWithoutSymlink(current, description);
+    }
+  };
+
+  const addFile = (path: string, description: string): void => {
+    assertPathHasNoSymlink(path, description);
+    const stat = lstatWithoutSymlink(path, description);
+    if (!stat.isFile()) {
+      throw new Error(`${description} is not a file`);
+    }
+    const realPath = fileSystem.realpathSync(path);
+    assertInside(root, realPath, description);
+    entries.set(
+      relative(root, realPath).replaceAll('\\', '/'),
+      fileSystem.readFileSync(realPath),
+    );
+  };
+
+  const resolveConfiguredPath = (configuredPath: string, description: string): string => {
     if (isAbsolute(configuredPath)) {
       throw new Error(`${description} must be relative to the scenario directory`);
     }
-    addFile(resolve(root, configuredPath), description);
+    const target = resolve(root, configuredPath);
+    assertInside(root, target, description);
+    return target;
+  };
+
+  const addConfiguredFile = (configuredPath: string, description: string): string => {
+    const target = resolveConfiguredPath(configuredPath, description);
+    addFile(target, description);
+    return target;
   };
 
   const visitDirectory = (directory: string, description: string): void => {
-    const realDirectory = realpathSync(directory);
-    assertInside(root, realDirectory, description);
-    if (!lstatSync(realDirectory).isDirectory()) {
+    assertPathHasNoSymlink(directory, description);
+    const directoryStat = lstatWithoutSymlink(directory, description);
+    if (!directoryStat.isDirectory()) {
       throw new Error(`${description} is not a directory`);
     }
-    for (const name of readdirSync(realDirectory).sort()) {
-      if (IGNORED_DIRECTORIES.has(name) || isIgnoredFile(name)) continue;
+    const realDirectory = fileSystem.realpathSync(directory);
+    assertInside(root, realDirectory, description, true);
+    for (const name of fileSystem.readdirSync(realDirectory).sort()) {
       const target = resolve(realDirectory, name);
-      const stat = lstatSync(target);
+      const stat = lstatWithoutSymlink(target, description);
+      if (IGNORED_DIRECTORIES.has(name) || isIgnoredFile(name)) continue;
       if (stat.isDirectory()) {
         visitDirectory(target, description);
       } else if (stat.isFile()) {
@@ -86,7 +144,11 @@ export function computeScenarioBundleSha256(
     }
   }
   for (const validator of scenarioConfig.delivery.validators ?? []) {
-    addConfiguredFile(validator.entrypoint, `Validator ${validator.id}`);
+    const entrypoint = addConfiguredFile(
+      validator.entrypoint,
+      `Validator ${validator.id}`,
+    );
+    visitDirectory(dirname(entrypoint), `Validator ${validator.id} bundle`);
   }
 
   const hash = createHash('sha256');

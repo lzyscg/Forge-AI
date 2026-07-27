@@ -1,7 +1,11 @@
 import Database from 'better-sqlite3';
 import {
+  lstatSync,
   mkdtempSync,
   mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -28,6 +32,26 @@ function temporaryRoot(prefix: string): string {
   return root;
 }
 
+function fileSystemTreatingAsSymlink(targetPath: string) {
+  const normalizedTarget = realpathSync(targetPath);
+  return {
+    lstatSync(path: string) {
+      const stat = lstatSync(path);
+      if (realpathSync(path) !== normalizedTarget) return stat;
+      return new Proxy(stat, {
+        get(target, property, receiver) {
+          if (property === 'isSymbolicLink') return () => true;
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
+    readdirSync,
+    readFileSync,
+    realpathSync,
+  };
+}
+
 describe('scenario bundle identity', () => {
   it('tracks scenario, prompt, skill, and validator sources but ignores runtime files', () => {
     const root = temporaryRoot('forge-scenario-bundle-');
@@ -39,6 +63,7 @@ describe('scenario bundle identity', () => {
     writeFileSync(join(root, 'skills', 'writer', 'SKILL.md'), 'skill v1\n', 'utf8');
     writeFileSync(join(root, 'skills', 'writer', 'scripts', 'validate.py'), 'print("v1")\n', 'utf8');
     writeFileSync(join(root, 'validators', 'surface.py'), 'print("surface v1")\n', 'utf8');
+    writeFileSync(join(root, 'validators', 'helper.py'), 'VALUE = "v1"\n', 'utf8');
     const config = {
       scenario: { id: 'identity', name: 'Identity', version: 1 },
       input_fields: [],
@@ -74,6 +99,12 @@ describe('scenario bundle identity', () => {
       'generated',
       'utf8',
     );
+    mkdirSync(join(root, 'validators', '__pycache__'));
+    writeFileSync(
+      join(root, 'validators', '__pycache__', 'helper.pyc'),
+      'generated validator cache',
+      'utf8',
+    );
     expect(computeScenarioBundleSha256(scenarioPath, config)).toBe(original);
 
     writeFileSync(join(root, 'prompts', 'writer.md'), 'prompt v2\n', 'utf8');
@@ -88,8 +119,96 @@ describe('scenario bundle identity', () => {
     expect(computeScenarioBundleSha256(scenarioPath, config)).not.toBe(original);
 
     writeFileSync(join(root, 'validators', 'surface.py'), 'print("surface v1")\n', 'utf8');
+    writeFileSync(join(root, 'validators', 'helper.py'), 'VALUE = "v2"\n', 'utf8');
+    expect(computeScenarioBundleSha256(scenarioPath, config)).not.toBe(original);
+
+    writeFileSync(join(root, 'validators', 'helper.py'), 'VALUE = "v1"\n', 'utf8');
     writeFileSync(join(root, 'scenario.yaml'), 'scenario: changed\n', 'utf8');
     expect(computeScenarioBundleSha256(scenarioPath, config)).not.toBe(original);
+  });
+
+  it.each([
+    { kind: 'file', relativeTarget: ['linked-source.md'] },
+    { kind: 'directory', relativeTarget: ['linked-directory'] },
+  ])('rejects a symbolic link $kind in a skill bundle', ({ kind, relativeTarget }) => {
+    const root = temporaryRoot(`forge-scenario-symlink-${kind}-`);
+    mkdirSync(join(root, 'prompts'));
+    const skillRoot = join(root, 'skills', 'writer');
+    mkdirSync(skillRoot, { recursive: true });
+    writeFileSync(join(root, 'scenario.yaml'), 'scenario: identity\n', 'utf8');
+    writeFileSync(join(root, 'prompts', 'writer.md'), 'prompt\n', 'utf8');
+    writeFileSync(join(skillRoot, 'SKILL.md'), 'skill\n', 'utf8');
+    const target = join(skillRoot, ...relativeTarget);
+    if (kind === 'directory') {
+      mkdirSync(target);
+      writeFileSync(join(target, 'secret.txt'), 'sensitive-content\n', 'utf8');
+    } else {
+      writeFileSync(target, 'sensitive-content\n', 'utf8');
+    }
+    const config = {
+      scenario: { id: 'identity', name: 'Identity', version: 1 },
+      input_fields: [],
+      agents: [{
+        key: 'writer',
+        name: 'Writer',
+        model: 'test',
+        session: { policy: 'persistent' },
+        prompt: 'prompts/writer.md',
+        skills: ['writer'],
+        tools: [],
+      }],
+      start_agent: 'writer',
+      routes: [],
+      context_rules: {},
+      artifact_types: [{ type: 'draft', diff: 'line' }],
+      delivery: { deliverable_artifact_type: 'draft' },
+    } satisfies ScenarioConfig;
+
+    let message = '';
+    try {
+      computeScenarioBundleSha256(
+        join(root, 'scenario.yaml'),
+        config,
+        fileSystemTreatingAsSymlink(target),
+      );
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/symbolic link/i);
+    expect(message).not.toContain(root);
+    expect(message).not.toContain('sensitive-content');
+  });
+
+  it('rejects a symbolic link directory in a configured prompt path', () => {
+    const root = temporaryRoot('forge-scenario-prompt-symlink-');
+    const promptDirectory = join(root, 'prompts');
+    mkdirSync(promptDirectory);
+    writeFileSync(join(root, 'scenario.yaml'), 'scenario: identity\n', 'utf8');
+    writeFileSync(join(promptDirectory, 'writer.md'), 'prompt\n', 'utf8');
+    const config = {
+      scenario: { id: 'identity', name: 'Identity', version: 1 },
+      input_fields: [],
+      agents: [{
+        key: 'writer',
+        name: 'Writer',
+        model: 'test',
+        session: { policy: 'persistent' },
+        prompt: 'prompts/writer.md',
+        skills: [],
+        tools: [],
+      }],
+      start_agent: 'writer',
+      routes: [],
+      context_rules: {},
+      artifact_types: [{ type: 'draft', diff: 'line' }],
+      delivery: { deliverable_artifact_type: 'draft' },
+    } satisfies ScenarioConfig;
+
+    expect(() => computeScenarioBundleSha256(
+      join(root, 'scenario.yaml'),
+      config,
+      fileSystemTreatingAsSymlink(promptDirectory),
+    )).toThrow(/symbolic link/i);
   });
 });
 
