@@ -19,7 +19,10 @@ import {
   validateOutline,
   validatePacket,
 } from './quality.js';
-import { materializeDeliveredArtifact } from './reconciliation.js';
+import {
+  materializeDeliveredArtifact,
+  requireScenarioSnapshotIdentity,
+} from './reconciliation.js';
 import { descendantClosure } from './invalidation.js';
 import {
   appendManifestEvent,
@@ -513,6 +516,13 @@ async function executeStage(
   )) {
     throw new Error(`阶段 ${spec.key} 的 Attempt 模板身份算法已变化，需要先完成显式身份迁移`);
   }
+  if (resumableAttempts.some(
+    (attempt) => attempt.expected_scenario_snapshot_sha256 === null,
+  )) {
+    throw new Error(
+      `阶段 ${spec.key} 的旧 Attempt 缺少 scenario snapshot 身份，需要 Task 8 显式证明`,
+    );
+  }
   const reusableAttempt = resumableAttempts.find(
     (attempt) =>
       compareTemplateIdentity(attempt.template_identity, spec.templateIdentity) === 'equal' &&
@@ -554,6 +564,14 @@ async function executeStage(
       chapterId: spec.chapterId,
     }, signal);
     if (!caseId) throw new Error(`阶段 ${spec.key} 未返回 case_id`);
+    const createdSnapshot = await forgeClient.getCaseStatus(
+      caseId,
+      options.dbPath,
+    );
+    const scenarioSnapshotSha256 = requireScenarioSnapshotIdentity(
+      createdSnapshot,
+      caseId,
+    );
     const now = new Date().toISOString();
     attempt = {
       attempt_id: attemptId,
@@ -562,6 +580,7 @@ async function executeStage(
       chapter_id: spec.chapterId,
       template: spec.template,
       expected_artifact_type: spec.expectedArtifactType,
+      expected_scenario_snapshot_sha256: scenarioSnapshotSha256,
       case_id: caseId,
       input_sha256: inputHash,
       parent_record_ids: spec.parents.map((parent) => parent.record_id),
@@ -698,6 +717,8 @@ async function executeStage(
         stage: spec.stage,
         chapter_id: spec.chapterId,
         expected_artifact_type: spec.expectedArtifactType,
+        expected_scenario_snapshot_sha256:
+          attempt.expected_scenario_snapshot_sha256,
         input_sha256: inputHash,
         parent_record_ids: spec.parents.map((parent) => parent.record_id),
         template_identity: spec.templateIdentity,

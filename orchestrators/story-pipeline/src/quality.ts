@@ -392,11 +392,6 @@ export function validateDraft(
   const content = normalizeNewlines(rawContent).trim();
   const checks: QualityCheck[] = [];
   const h1 = markdownSections(content, 1);
-  checks.push(makeCheck(
-    'draft_single_title',
-    h1.length === 1,
-    `一级标题数量 ${h1.length}`,
-  ));
 
   const lengthBudget = packetSidecar.length_budget as { lower?: number; upper?: number } | undefined;
   const lower = Number(lengthBudget?.lower ?? 0);
@@ -413,6 +408,7 @@ export function validateDraft(
   const paragraphs = content.split(/\n\s*\n/gu).filter((paragraph) => paragraph.trim());
   const report = finishReport(stageKey, 'draft', content, checks, [], {
     cjk_count: cjkCount,
+    h1_count: h1.length,
     paragraph_count: paragraphs.length,
     declared_length_lower: lower,
     declared_length_upper: upper,

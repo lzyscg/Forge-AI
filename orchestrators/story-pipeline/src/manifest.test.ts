@@ -85,6 +85,7 @@ function runningAttempt(): StageAttemptV21 {
     chapter_id: null,
     template: 'generic-template',
     expected_artifact_type: 'generic-artifact',
+    expected_scenario_snapshot_sha256: 'scenario-snapshot-hash',
     case_id: 'case-1',
     input_sha256: 'input-hash',
     parent_record_ids: [],
@@ -247,6 +248,25 @@ describe('loadManifest', () => {
       content_sha256: 'legacy-attempt-template-hash',
       equivalence: 'unknown',
     });
+    expect(
+      migrated.attempts[0]?.expected_scenario_snapshot_sha256,
+    ).toBeNull();
+  });
+
+  it('marks a pre-field schema 2.1 attempt scenario identity as unavailable', () => {
+    const { path } = tempManifestPath();
+    const persisted = emptyManifest();
+    const legacyAttempt = runningAttempt();
+    delete (legacyAttempt as Partial<StageAttemptV21>)
+      .expected_scenario_snapshot_sha256;
+    persisted.attempts.push(legacyAttempt);
+    writeFileSync(path, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+
+    const loaded = loadManifest(path);
+
+    expect(
+      loaded.attempts[0]?.expected_scenario_snapshot_sha256,
+    ).toBeNull();
   });
 });
 

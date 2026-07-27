@@ -63,6 +63,7 @@ export interface StageAttemptV21 {
   chapter_id: string | null;
   template: string;
   expected_artifact_type: string;
+  expected_scenario_snapshot_sha256: string | null;
   case_id: string;
   input_sha256: string;
   parent_record_ids: string[];
@@ -186,6 +187,7 @@ interface LegacyStageAttempt extends Omit<
   | 'chapter_id'
   | 'template'
   | 'expected_artifact_type'
+  | 'expected_scenario_snapshot_sha256'
   | 'parent_record_ids'
   | 'template_identity'
   | 'runner_token_sha256'
@@ -244,6 +246,7 @@ function migrateV20(manifest: PipelineManifestV20): PipelineManifestV21 {
       chapter_id: stage?.chapter_id ?? null,
       template: stage?.template ?? '',
       expected_artifact_type: stage?.artifact_type ?? '',
+      expected_scenario_snapshot_sha256: null,
       parent_record_ids: stage?.parent_record_ids ?? [],
       template_identity: legacyIdentity(templateSha256),
       runner_token_sha256: null,
@@ -278,6 +281,9 @@ export function loadManifest(path: string): PipelineManifestV21 {
     throw new Error(`unsupported manifest schema: ${String(version)}`);
   }
   manifest.attempts ??= [];
+  for (const attempt of manifest.attempts) {
+    attempt.expected_scenario_snapshot_sha256 ??= null;
+  }
   manifest.invalidations ??= [];
   manifest.reinstatements ??= [];
   manifest.replacements ??= [];
