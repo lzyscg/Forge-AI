@@ -6,7 +6,6 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
-  renameSync,
   rmSync,
   statSync,
   utimesSync,
@@ -242,11 +241,15 @@ function materializationFixture(): {
 
 function materializedEvidencePaths(runDirectory: string): string[] {
   return [
-    join(runDirectory, 'raw-artifacts/draft-b001/draft-b001-a1.md'),
-    join(runDirectory, 'artifacts/draft-b001-v1.md'),
-    join(runDirectory, 'structured/draft-b001-v1.json'),
-    join(runDirectory, 'validation/draft-b001/draft-b001-a1.json'),
+    join(runDirectory, 'materialized/draft-b001-v1/raw.md'),
+    join(runDirectory, 'materialized/draft-b001-v1/artifact.md'),
+    join(runDirectory, 'materialized/draft-b001-v1/sidecar.json'),
+    join(runDirectory, 'materialized/draft-b001-v1/validation.json'),
   ];
+}
+
+function stagingBundlePath(runDirectory: string): string {
+  return join(runDirectory, 'materialized/.draft-b001-v1.staging');
 }
 
 function allWorkspaceFiles(root: string): string[] {
@@ -746,7 +749,7 @@ describe('stage reconciliation', () => {
     )).toBe(false);
   });
 
-  it('rolls back already published finals when the third rename fails', () => {
+  it('leaves no final or manifest mutation when the bundle rename fails', () => {
     const fixture = materializationFixture();
     let renames = 0;
 
@@ -760,16 +763,17 @@ describe('stage reconciliation', () => {
       fs_ops: {
         rename: (from, to) => {
           renames += 1;
-          if (renames === 3) throw new Error('injected third rename failure');
-          renameSync(from, to);
+          throw new Error('injected bundle rename failure');
         },
       },
-    })).toThrow('injected third rename failure');
+    })).toThrow('injected bundle rename failure');
 
+    expect(renames).toBe(1);
     expect(fixture.manifest.stages).toEqual([parentRecord()]);
     expect(fixture.manifest.events).toEqual([]);
     expect(fixture.candidate.outcome).toBe('interrupted');
     expect(materializedEvidencePaths(fixture.runDirectory).some(existsSync)).toBe(false);
+    expect(existsSync(stagingBundlePath(fixture.runDirectory))).toBe(false);
     expect(allWorkspaceFiles(fixture.runDirectory).some(
       (path) => path.endsWith('.tmp'),
     )).toBe(false);
@@ -777,7 +781,7 @@ describe('stage reconciliation', () => {
 
   it('rejects a symlink or junction in any materialization path component', () => {
     const fixture = materializationFixture();
-    const artifactsDirectory = join(fixture.runDirectory, 'artifacts');
+    const artifactsDirectory = join(fixture.runDirectory, 'materialized');
     mkdirSync(artifactsDirectory, { recursive: true });
 
     expect(() => materializeDeliveredArtifact({
@@ -799,7 +803,7 @@ describe('stage reconciliation', () => {
 
   it('rejects a materialization component whose real path escapes the run', () => {
     const fixture = materializationFixture();
-    const artifactsDirectory = join(fixture.runDirectory, 'artifacts');
+    const artifactsDirectory = join(fixture.runDirectory, 'materialized');
     mkdirSync(artifactsDirectory, { recursive: true });
 
     expect(() => materializeDeliveredArtifact({
@@ -817,5 +821,98 @@ describe('stage reconciliation', () => {
     })).toThrow('materialization path resolves outside the run directory');
 
     expect(materializedEvidencePaths(fixture.runDirectory).some(existsSync)).toBe(false);
+  });
+
+  it('recovers an atomically published bundle missing only its manifest record', () => {
+    const fixture = materializationFixture();
+    const [rawPath, artifactPath, sidecarPath, validationPath] =
+      materializedEvidencePaths(fixture.runDirectory);
+    const validation = fixture.validate(
+      fixture.snapshot.final_artifact!.content,
+    );
+    mkdirSync(dirname(rawPath!), { recursive: true });
+    writeFileSync(rawPath!, fixture.snapshot.final_artifact!.content, 'utf8');
+    writeFileSync(artifactPath!, validation.canonicalContent, 'utf8');
+    writeFileSync(
+      sidecarPath!,
+      `${JSON.stringify(validation.sidecar, null, 2)}\n`,
+      'utf8',
+    );
+    writeFileSync(
+      validationPath!,
+      `${JSON.stringify(validation.report, null, 2)}\n`,
+      'utf8',
+    );
+    const preservedTime = new Date('2020-01-01T00:00:00.000Z');
+    utimesSync(artifactPath!, preservedTime, preservedTime);
+
+    const record = materializeDeliveredArtifact({
+      run_dir: fixture.runDirectory,
+      manifest: fixture.manifest,
+      plan: fixture.plan,
+      attempt: fixture.candidate,
+      snapshot: fixture.snapshot,
+      validate: fixture.validate,
+      completed_at: '2026-07-27T03:00:00.000Z',
+    });
+
+    expect(record.artifact_path).toBe(
+      'materialized/draft-b001-v1/artifact.md',
+    );
+    expect(statSync(artifactPath!).mtime.toISOString()).toBe(
+      preservedTime.toISOString(),
+    );
+    expect(fixture.manifest.stages.at(-1)).toBe(record);
+    expect(fixture.manifest.events.at(-1)).toMatchObject({
+      type: 'stage_delivered',
+      record_id: 'draft-b001-v1',
+    });
+  });
+
+  it('cleans a partial deterministic staging bundle before rebuilding', () => {
+    const fixture = materializationFixture();
+    const stagingPath = stagingBundlePath(fixture.runDirectory);
+    mkdirSync(stagingPath, { recursive: true });
+    writeFileSync(join(stagingPath, 'raw.md'), 'partial-crash-bytes', 'utf8');
+
+    const record = materializeDeliveredArtifact({
+      run_dir: fixture.runDirectory,
+      manifest: fixture.manifest,
+      plan: fixture.plan,
+      attempt: fixture.candidate,
+      snapshot: fixture.snapshot,
+      validate: fixture.validate,
+    });
+
+    expect(existsSync(stagingPath)).toBe(false);
+    expect(readFileSync(
+      join(fixture.runDirectory, record.raw_artifact_path),
+      'utf8',
+    )).toBe('# chapter');
+    expect(materializedEvidencePaths(fixture.runDirectory).every(existsSync))
+      .toBe(true);
+  });
+
+  it('fails closed when an orphaned final bundle does not match expected hashes', () => {
+    const fixture = materializationFixture();
+    const [rawPath, artifactPath, sidecarPath, validationPath] =
+      materializedEvidencePaths(fixture.runDirectory);
+    mkdirSync(dirname(rawPath!), { recursive: true });
+    writeFileSync(rawPath!, 'corrupt', 'utf8');
+    writeFileSync(artifactPath!, '# chapter\n', 'utf8');
+    writeFileSync(sidecarPath!, '{}\n', 'utf8');
+    writeFileSync(validationPath!, '{}\n', 'utf8');
+
+    expect(() => materializeDeliveredArtifact({
+      run_dir: fixture.runDirectory,
+      manifest: fixture.manifest,
+      plan: fixture.plan,
+      attempt: fixture.candidate,
+      snapshot: fixture.snapshot,
+      validate: fixture.validate,
+    })).toThrow('published materialization bundle does not match expected evidence');
+
+    expect(fixture.manifest.stages).toEqual([parentRecord()]);
+    expect(fixture.manifest.events).toEqual([]);
   });
 });

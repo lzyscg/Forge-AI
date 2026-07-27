@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import {
   closeSync,
   existsSync,
@@ -6,6 +5,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -13,7 +13,6 @@ import {
   writeFileSync,
 } from 'node:fs';
 import {
-  basename,
   dirname,
   isAbsolute,
   join,
@@ -80,8 +79,10 @@ export interface MaterializationFsOps {
   readFile(path: string): Buffer;
   writeFile(path: string, content: string): void;
   fsyncFile(path: string): void;
+  fsyncDirectory(path: string): void;
+  listDirectory(path: string): string[];
   rename(from: string, to: string): void;
-  remove(path: string): void;
+  removeTree(path: string): void;
 }
 
 const defaultMaterializationFsOps: MaterializationFsOps = {
@@ -105,8 +106,24 @@ const defaultMaterializationFsOps: MaterializationFsOps = {
       closeSync(descriptor);
     }
   },
+  fsyncDirectory: (path) => {
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(path, 'r');
+      fsyncSync(descriptor);
+    } catch (error) {
+      if (!['EINVAL', 'EPERM', 'EISDIR', 'EBADF'].includes(
+        (error as NodeJS.ErrnoException).code ?? '',
+      )) {
+        throw error;
+      }
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+    }
+  },
+  listDirectory: (path) => readdirSync(path),
   rename: renameSync,
-  remove: (path) => rmSync(path, { force: true }),
+  removeTree: (path) => rmSync(path, { recursive: true, force: true }),
 };
 
 function canonicalJson(value: unknown): string {
@@ -183,6 +200,48 @@ function verifyRecordFile(
   if (!fsOps.exists(absolute) || sha256(fsOps.readFile(absolute)) !== expectedSha256) {
     throw new Error(`materialized artifact evidence is missing or changed: ${path}`);
   }
+}
+
+interface BundleEvidence {
+  name: string;
+  content: string;
+  expectedSha256: string;
+}
+
+function verifyMaterializationBundle(
+  runDirectory: string,
+  bundlePath: string,
+  evidence: BundleEvidence[],
+  fsOps: MaterializationFsOps,
+): boolean {
+  const safeBundlePath = safeMaterializationPath(
+    runDirectory,
+    bundlePath,
+    fsOps,
+  );
+  if (!fsOps.exists(safeBundlePath)) return false;
+  const expectedNames = evidence.map((item) => item.name).sort();
+  const actualNames = fsOps.listDirectory(safeBundlePath).sort();
+  if (canonicalJson(actualNames) !== canonicalJson(expectedNames)) return false;
+  return evidence.every((item) => {
+    const path = safeMaterializationPath(
+      runDirectory,
+      join(safeBundlePath, item.name),
+      fsOps,
+    );
+    return fsOps.exists(path) &&
+      sha256(fsOps.readFile(path)) === item.expectedSha256;
+  });
+}
+
+function removeSafeTree(
+  runDirectory: string,
+  path: string,
+  fsOps: MaterializationFsOps,
+): void {
+  const safePath = safeMaterializationPath(runDirectory, path, fsOps);
+  if (!fsOps.exists(safePath)) return;
+  fsOps.removeTree(safePath);
 }
 
 function rejectionReason(
@@ -520,96 +579,126 @@ export function materializeDeliveredArtifact(
       .map((record) => record.revision),
   ) + 1;
   const recordId = `${plan.stage_key}-v${revision}`;
-  const rawArtifactPath = `raw-artifacts/${plan.stage_key}/${attempt.attempt_id}.md`;
-  const artifactPath = `artifacts/${recordId}.md`;
-  const sidecarPath = `structured/${recordId}.json`;
-  const validationReportPath = `validation/${plan.stage_key}/${attempt.attempt_id}.json`;
-  const rawArtifactAbsolute = safeMaterializationPath(
+  const bundleParentPath = safeMaterializationPath(
     runDirectory,
-    rawArtifactPath,
+    'materialized',
     fsOps,
   );
-  const artifactAbsolute = safeMaterializationPath(
+  const finalBundlePath = safeMaterializationPath(
     runDirectory,
-    artifactPath,
+    `materialized/${recordId}`,
     fsOps,
   );
-  const sidecarAbsolute = safeMaterializationPath(
+  const stagingBundlePath = safeMaterializationPath(
     runDirectory,
-    sidecarPath,
+    `materialized/.${recordId}.staging`,
     fsOps,
   );
-  const validationReportAbsolute = safeMaterializationPath(
-    runDirectory,
-    validationReportPath,
-    fsOps,
-  );
-
-  const evidence = [
+  const rawArtifactPath = `materialized/${recordId}/raw.md`;
+  const artifactPath = `materialized/${recordId}/artifact.md`;
+  const sidecarPath = `materialized/${recordId}/sidecar.json`;
+  const validationReportPath = `materialized/${recordId}/validation.json`;
+  const evidence: BundleEvidence[] = [
     {
-      finalPath: rawArtifactAbsolute,
+      name: 'raw.md',
       content: snapshot.final_artifact!.content,
     },
     {
-      finalPath: artifactAbsolute,
+      name: 'artifact.md',
       content: validation.canonicalContent,
     },
     {
-      finalPath: sidecarAbsolute,
+      name: 'sidecar.json',
       content: `${JSON.stringify(validation.sidecar, null, 2)}\n`,
     },
     {
-      finalPath: validationReportAbsolute,
+      name: 'validation.json',
       content: `${JSON.stringify(validation.report, null, 2)}\n`,
     },
   ].map((item) => ({
     ...item,
     expectedSha256: sha256(item.content),
-    temporaryPath: join(
-      dirname(item.finalPath),
-      `.${basename(item.finalPath)}.${randomUUID()}.tmp`,
-    ),
   }));
-  const published: string[] = [];
-  try {
-    for (const item of evidence) {
-      ensureSafeParentDirectory(runDirectory, item.finalPath, fsOps);
-      safeMaterializationPath(runDirectory, item.temporaryPath, fsOps);
-      fsOps.writeFile(item.temporaryPath, item.content);
-      fsOps.fsyncFile(item.temporaryPath);
-      if (sha256(fsOps.readFile(item.temporaryPath)) !== item.expectedSha256) {
-        throw new Error(`temporary evidence SHA-256 mismatch: ${item.finalPath}`);
-      }
+  ensureSafeParentDirectory(runDirectory, finalBundlePath, fsOps);
+  let publishedByThisRun = false;
+  if (fsOps.exists(finalBundlePath)) {
+    if (!verifyMaterializationBundle(
+      runDirectory,
+      finalBundlePath,
+      evidence,
+      fsOps,
+    )) {
+      throw new Error(
+        'published materialization bundle does not match expected evidence',
+      );
     }
-    for (const item of evidence) {
-      safeMaterializationPath(runDirectory, item.finalPath, fsOps);
-      safeMaterializationPath(runDirectory, item.temporaryPath, fsOps);
-      if (fsOps.exists(item.finalPath)) {
-        throw new Error(`materialization final already exists: ${item.finalPath}`);
-      }
-      fsOps.rename(item.temporaryPath, item.finalPath);
-      published.push(item.finalPath);
-      safeMaterializationPath(runDirectory, item.finalPath, fsOps);
-      if (sha256(fsOps.readFile(item.finalPath)) !== item.expectedSha256) {
-        throw new Error(`published evidence SHA-256 mismatch: ${item.finalPath}`);
-      }
+    if (fsOps.exists(stagingBundlePath)) {
+      removeSafeTree(runDirectory, stagingBundlePath, fsOps);
     }
-  } catch (error) {
-    for (const item of evidence) {
-      try {
-        fsOps.remove(item.temporaryPath);
-      } catch {
-        // Preserve the materialization failure.
-      }
+  } else {
+    if (fsOps.exists(stagingBundlePath)) {
+      removeSafeTree(runDirectory, stagingBundlePath, fsOps);
     }
-    for (const path of published) {
-      try {
-        fsOps.remove(path);
-      } catch {
-        // Preserve the materialization failure.
+    fsOps.mkdir(stagingBundlePath);
+    safeMaterializationPath(runDirectory, stagingBundlePath, fsOps);
+    try {
+      for (const item of evidence) {
+        const stagingFile = safeMaterializationPath(
+          runDirectory,
+          join(stagingBundlePath, item.name),
+          fsOps,
+        );
+        fsOps.writeFile(stagingFile, item.content);
+        fsOps.fsyncFile(stagingFile);
+        if (sha256(fsOps.readFile(stagingFile)) !== item.expectedSha256) {
+          throw new Error(`staging evidence SHA-256 mismatch: ${item.name}`);
+        }
       }
+      if (!verifyMaterializationBundle(
+        runDirectory,
+        stagingBundlePath,
+        evidence,
+        fsOps,
+      )) {
+        throw new Error('staging materialization bundle is incomplete');
+      }
+      fsOps.fsyncDirectory(stagingBundlePath);
+      fsOps.fsyncDirectory(bundleParentPath);
+      safeMaterializationPath(runDirectory, stagingBundlePath, fsOps);
+      safeMaterializationPath(runDirectory, finalBundlePath, fsOps);
+      if (fsOps.exists(finalBundlePath)) {
+        throw new Error(`materialization bundle already exists: ${recordId}`);
+      }
+      fsOps.rename(stagingBundlePath, finalBundlePath);
+      publishedByThisRun = true;
+      fsOps.fsyncDirectory(bundleParentPath);
+      if (!verifyMaterializationBundle(
+        runDirectory,
+        finalBundlePath,
+        evidence,
+        fsOps,
+      )) {
+        throw new Error(
+          'published materialization bundle does not match expected evidence',
+        );
+      }
+    } catch (error) {
+      if (fsOps.exists(stagingBundlePath)) {
+        try {
+          removeSafeTree(runDirectory, stagingBundlePath, fsOps);
+        } catch {
+          // Preserve the materialization failure.
+        }
+      }
+      if (publishedByThisRun && fsOps.exists(finalBundlePath)) {
+        try {
+          removeSafeTree(runDirectory, finalBundlePath, fsOps);
+        } catch {
+          // Preserve the materialization failure.
+        }
+      }
+      throw error;
     }
-    throw error;
   }
 
   const completedAt = options.completed_at ?? new Date().toISOString();
