@@ -271,4 +271,82 @@ describe('read-only SQLite snapshots', () => {
 
     expect(createdSnapshotDirectories(before)).toEqual([]);
   });
+
+  it('keeps the snapshot path retryable while a real query makes close busy', () => {
+    const root = temporaryRoot('forge-readonly-busy-close-');
+    const dbPath = join(root, 'forge.db');
+    const database = new Database(dbPath);
+    createCaseTable(database);
+    insertCase(database, 'case-1', 'one');
+    insertCase(database, 'case-2', 'two');
+    database.close();
+    const repo = new SqliteRepository(dbPath, { readonly: true });
+    const internals = repo as unknown as {
+      db: Database.Database;
+      readonlySnapshotDirectory: string | null;
+    };
+    const snapshotDirectory = internals.readonlySnapshotDirectory!;
+    const iterator = internals.db.prepare('SELECT * FROM cases').iterate();
+    iterator.next();
+
+    try {
+      expect(() => repo.close()).toThrow(
+        'This database connection is busy executing a query',
+      );
+      expect(internals.readonlySnapshotDirectory).toBe(snapshotDirectory);
+      expect(existsSync(snapshotDirectory)).toBe(true);
+
+      iterator.return?.();
+      expect(() => repo.close()).not.toThrow();
+      expect(internals.readonlySnapshotDirectory).toBeNull();
+      expect(existsSync(snapshotDirectory)).toBe(false);
+    } finally {
+      iterator.return?.();
+      try {
+        repo.close();
+      } catch {
+        // Preserve the assertion failure; the exact directory is removed below.
+      }
+      rmSync(snapshotDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('retains cleanup state after an injected close failure and succeeds on retry', () => {
+    const root = temporaryRoot('forge-readonly-injected-close-');
+    const dbPath = join(root, 'forge.db');
+    const database = new Database(dbPath);
+    createCaseTable(database);
+    database.close();
+    const repo = new SqliteRepository(dbPath, { readonly: true });
+    const internals = repo as unknown as {
+      db: Database.Database;
+      readonlySnapshotDirectory: string | null;
+    };
+    const snapshotDirectory = internals.readonlySnapshotDirectory!;
+    const realClose = internals.db.close.bind(internals.db);
+    let injected = true;
+    internals.db.close = () => {
+      if (injected) throw new Error('injected SQLite close failure');
+      return realClose();
+    };
+
+    try {
+      expect(() => repo.close()).toThrow('injected SQLite close failure');
+      expect(internals.readonlySnapshotDirectory).toBe(snapshotDirectory);
+      expect(existsSync(snapshotDirectory)).toBe(true);
+
+      injected = false;
+      expect(() => repo.close()).not.toThrow();
+      expect(internals.readonlySnapshotDirectory).toBeNull();
+      expect(existsSync(snapshotDirectory)).toBe(false);
+    } finally {
+      injected = false;
+      try {
+        repo.close();
+      } catch {
+        // Preserve the assertion failure; the exact directory is removed below.
+      }
+      rmSync(snapshotDirectory, { recursive: true, force: true });
+    }
+  });
 });

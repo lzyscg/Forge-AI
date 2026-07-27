@@ -26,6 +26,7 @@ import type {
 
 const READONLY_SNAPSHOT_PREFIX = 'forge-readonly-db-';
 const READONLY_SNAPSHOT_ATTEMPTS = 12;
+const CLOSE_ATTEMPTS = 3;
 
 interface SnapshotFile {
   bytes: Buffer;
@@ -366,6 +367,7 @@ CREATE INDEX IF NOT EXISTS idx_revision_instructions_case ON revision_instructio
 
 export class SqliteRepository implements RepositoryPort {
   private db: Database.Database;
+  private databaseClosed = false;
   private readonlySnapshotDirectory: string | null = null;
 
   constructor(
@@ -397,15 +399,34 @@ export class SqliteRepository implements RepositoryPort {
   }
 
   close(): void {
-    try {
-      this.db.close();
-    } finally {
-      if (this.readonlySnapshotDirectory) {
-        const snapshotDirectory = this.readonlySnapshotDirectory;
-        this.readonlySnapshotDirectory = null;
+    if (!this.databaseClosed) {
+      let closeError: unknown;
+      for (let attempt = 1; attempt <= CLOSE_ATTEMPTS; attempt += 1) {
+        try {
+          this.db.close();
+          this.databaseClosed = true;
+          closeError = undefined;
+          break;
+        } catch (error) {
+          closeError = error;
+        }
+      }
+      if (!this.databaseClosed) throw closeError;
+    }
+    if (!this.readonlySnapshotDirectory) return;
+
+    const snapshotDirectory = this.readonlySnapshotDirectory;
+    let cleanupError: unknown;
+    for (let attempt = 1; attempt <= CLOSE_ATTEMPTS; attempt += 1) {
+      try {
         cleanupSnapshotDirectory(snapshotDirectory);
+        this.readonlySnapshotDirectory = null;
+        return;
+      } catch (error) {
+        cleanupError = error;
       }
     }
+    throw cleanupError;
   }
 
   // === 事务支持 ===
