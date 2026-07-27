@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SqliteRepository } from './sqlite-repository.js';
 
@@ -36,7 +37,72 @@ function insertCase(repo: SqliteRepository, status = 'created'): void {
   });
 }
 
+async function runRace(
+  dbPath: string,
+  operations: Array<Record<string, unknown>>,
+): Promise<unknown[]> {
+  const workers: Worker[] = [];
+  for (const operation of operations) {
+    const worker = new Worker(
+      new URL('./execution-lease-race.worker.ts', import.meta.url),
+      {
+        execArgv: ['--import', 'tsx'],
+        workerData: { dbPath, operation },
+      },
+    );
+    workers.push(worker);
+    await new Promise<void>((resolve, reject) => {
+      worker.once('error', reject);
+      worker.once('message', (message: { type: string }) => {
+        if (message.type === 'ready') resolve();
+        else reject(new Error(`Worker failed before ready: ${message.type}`));
+      });
+    });
+  }
+
+  const outcomes = workers.map((worker) => new Promise<unknown>((resolve, reject) => {
+    worker.once('error', reject);
+    worker.once('message', (message: {
+      type: string;
+      outcome?: unknown;
+      error?: string;
+    }) => {
+      if (message.type === 'result') resolve(message.outcome);
+      else reject(new Error(message.error ?? `Worker failed: ${message.type}`));
+    });
+    worker.postMessage({ type: 'go' });
+  }));
+
+  try {
+    return await Promise.all(outcomes);
+  } finally {
+    await Promise.all(workers.map((worker) => worker.terminate()));
+  }
+}
+
 describe('SQLite execution lease', () => {
+  it.each([
+    'running',
+    'repairing',
+    'waiting_review',
+    'waiting_recovery',
+    'waiting_human',
+    'approved',
+    'failed',
+    'stopped',
+  ] as const)('does not acquire a fresh lease for a %s case', (status) => {
+    const repo = openRepository(':memory:');
+    insertCase(repo, status);
+
+    expect(repo.acquireExecutionLease('case-1', {
+      runner_token_sha256: 'a'.repeat(64),
+      runner_pid: 101,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    })).toBe(false);
+    expect(repo.getExecutionLease('case-1')).toBeNull();
+  });
+
   it('allows only one repository connection to acquire a case lease', () => {
     const root = mkdtempSync(join(tmpdir(), 'forge-execution-lease-'));
     roots.push(root);
@@ -58,6 +124,61 @@ describe('SQLite execution lease', () => {
       heartbeat_at: '2026-07-27T00:00:02.000Z',
     })).toBe(false);
 
+  });
+
+  it('allows only one simultaneous connection to acquire a fresh lease', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'forge-execution-lease-race-'));
+    roots.push(root);
+    const dbPath = join(root, 'forge.db');
+    const observer = openRepository(dbPath);
+    insertCase(observer);
+
+    const outcomes = await runRace(dbPath, [
+      {
+        kind: 'acquire',
+        caseId: 'case-1',
+        lease: {
+          runner_token_sha256: 'a'.repeat(64),
+          runner_pid: 101,
+          runner_started_at: '2026-07-27T00:00:01.000Z',
+          heartbeat_at: '2026-07-27T00:00:01.000Z',
+        },
+      },
+      {
+        kind: 'acquire',
+        caseId: 'case-1',
+        lease: {
+          runner_token_sha256: 'b'.repeat(64),
+          runner_pid: 202,
+          runner_started_at: '2026-07-27T00:00:02.000Z',
+          heartbeat_at: '2026-07-27T00:00:02.000Z',
+        },
+      },
+    ]);
+
+    expect(outcomes.filter((outcome) => outcome === true)).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome === false)).toHaveLength(1);
+  });
+
+  it('keeps an existing non-terminal lease valid instead of reacquiring it', () => {
+    const repo = openRepository(':memory:');
+    insertCase(repo);
+    const originalHash = 'a'.repeat(64);
+    expect(repo.acquireExecutionLease('case-1', {
+      runner_token_sha256: originalHash,
+      runner_pid: 101,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    })).toBe(true);
+    repo.updateCase('case-1', { status: 'waiting_review' });
+
+    expect(repo.acquireExecutionLease('case-1', {
+      runner_token_sha256: 'b'.repeat(64),
+      runner_pid: 202,
+      runner_started_at: '2026-07-27T00:00:02.000Z',
+      heartbeat_at: '2026-07-27T00:00:02.000Z',
+    })).toBe(false);
+    expect(repo.validateExecutionLease('case-1', originalHash)).toBe(true);
   });
 
   it('validates, transfers, and heartbeats only with the current token hash', () => {
@@ -104,11 +225,103 @@ describe('SQLite execution lease', () => {
     });
   });
 
+  it('commits a state change only for the expected status and matching lease token', () => {
+    const repo = openRepository(':memory:');
+    insertCase(repo);
+    const hash = 'a'.repeat(64);
+    repo.acquireExecutionLease('case-1', {
+      runner_token_sha256: hash,
+      runner_pid: 101,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+    repo.updateCase('case-1', { status: 'running' });
+
+    expect(repo.compareAndSetCaseStatus(
+      'case-1',
+      'running',
+      {
+        status: 'waiting_review',
+        updated_at: '2026-07-27T00:00:02.000Z',
+      },
+      { runnerTokenSha256: 'b'.repeat(64) },
+    )).toBe(false);
+    expect(repo.compareAndSetCaseStatus(
+      'case-1',
+      'running',
+      {
+        status: 'waiting_review',
+        updated_at: '2026-07-27T00:00:02.000Z',
+      },
+      { runnerTokenSha256: hash },
+    )).toBe(true);
+    expect(repo.compareAndSetCaseStatus(
+      'case-1',
+      'running',
+      {
+        status: 'approved',
+        updated_at: '2026-07-27T00:00:03.000Z',
+      },
+      { runnerTokenSha256: hash, clearExecutionLease: true },
+    )).toBe(false);
+    expect(repo.getCase('case-1')?.status).toBe('waiting_review');
+    expect(repo.getExecutionLease('case-1')).not.toBeNull();
+  });
+
+  it('allows only abort or a normal terminal transition to win a simultaneous race', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'forge-execution-state-race-'));
+    roots.push(root);
+    const dbPath = join(root, 'forge.db');
+    const observer = openRepository(dbPath);
+    insertCase(observer);
+    const hash = 'a'.repeat(64);
+    observer.acquireExecutionLease('case-1', {
+      runner_token_sha256: hash,
+      runner_pid: 101,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+    observer.updateCase('case-1', { status: 'running' });
+
+    const [abortOutcome, transitionOutcome] = await runRace(dbPath, [
+      {
+        kind: 'abort',
+        caseId: 'case-1',
+        runnerTokenSha256: hash,
+        stoppedAt: '2026-07-27T00:00:03.000Z',
+        abortableStatuses: [
+          'running',
+          'repairing',
+          'waiting_review',
+          'waiting_human',
+        ],
+      },
+      {
+        kind: 'transition',
+        caseId: 'case-1',
+        expectedStatus: 'running',
+        fields: {
+          status: 'approved',
+          updated_at: '2026-07-27T00:00:04.000Z',
+          completed_at: '2026-07-27T00:00:04.000Z',
+        },
+        clearExecutionLease: true,
+      },
+    ]) as [
+      { ok: boolean; status?: string; reason?: string },
+      boolean,
+    ];
+
+    expect(Number(abortOutcome.ok) + Number(transitionOutcome)).toBe(1);
+    expect(['stopped', 'approved']).toContain(observer.getCase('case-1')?.status);
+    expect(observer.getExecutionLease('case-1')).toBeNull();
+  });
+
   it.each(['running', 'repairing', 'waiting_review', 'waiting_human'] as const)(
     'atomically aborts %s, clears its lease, and accepts only the same token on retry',
     (status) => {
       const repo = openRepository(':memory:');
-      insertCase(repo, status);
+      insertCase(repo);
       const hash = 'a'.repeat(64);
       repo.acquireExecutionLease('case-1', {
         runner_token_sha256: hash,
@@ -116,6 +329,7 @@ describe('SQLite execution lease', () => {
         runner_started_at: '2026-07-27T00:00:01.000Z',
         heartbeat_at: '2026-07-27T00:00:01.000Z',
       });
+      repo.updateCase('case-1', { status });
 
       expect(repo.abortCaseWithExecutionLease(
         'case-1',
@@ -142,7 +356,7 @@ describe('SQLite execution lease', () => {
 
   it.each(['approved', 'failed'] as const)('rejects abort for %s', (status) => {
     const repo = openRepository(':memory:');
-    insertCase(repo, status);
+    insertCase(repo);
     const hash = 'a'.repeat(64);
     repo.acquireExecutionLease('case-1', {
       runner_token_sha256: hash,
@@ -150,6 +364,7 @@ describe('SQLite execution lease', () => {
       runner_started_at: '2026-07-27T00:00:01.000Z',
       heartbeat_at: '2026-07-27T00:00:01.000Z',
     });
+    repo.updateCase('case-1', { status });
 
     expect(repo.abortCaseWithExecutionLease(
       'case-1',

@@ -111,10 +111,15 @@ export interface RepositoryPort {
     abortableStatuses: readonly CaseStatus[],
   ): ExecutionLeaseAbortResult;
   clearExecutionLease(caseId: string): void;
-  updateCaseAndClearExecutionLease(
+  compareAndSetCaseStatus(
     caseId: string,
+    expectedStatus: CaseStatus,
     fields: Record<string, unknown>,
-  ): void;
+    options?: {
+      runnerTokenSha256?: string;
+      clearExecutionLease?: boolean;
+    },
+  ): boolean;
 
   // Turns
   insertTurn(record: Record<string, unknown>): void;

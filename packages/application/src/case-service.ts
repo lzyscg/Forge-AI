@@ -83,10 +83,17 @@ export class CaseService {
     if (!record) throw new Error(`Case not found: ${caseId}`);
 
     const newStatus = transitionCase(record.status as CaseStatus, 'running');
-    this.repo.updateCase(caseId, {
-      status: newStatus,
-      updated_at: this.clock.now(),
-    });
+    const committed = this.repo.compareAndSetCaseStatus(
+      caseId,
+      record.status as CaseStatus,
+      {
+        status: newStatus,
+        updated_at: this.clock.now(),
+      },
+    );
+    if (!committed) {
+      throw new Error('Case state changed concurrently');
+    }
   }
 
   acquireExecutionLease(
@@ -155,7 +162,11 @@ export class CaseService {
     throw new Error(`Cannot abort case in status: ${result.status}`);
   }
 
-  transitionCaseStatus(caseId: string, to: CaseStatus): void {
+  transitionCaseStatus(
+    caseId: string,
+    to: CaseStatus,
+    runnerToken?: string,
+  ): void {
     const record = this.repo.getCase(caseId);
     if (!record) throw new Error(`Case not found: ${caseId}`);
 
@@ -169,11 +180,23 @@ export class CaseService {
       fields.completed_at = this.clock.now();
     }
 
-    if (to === 'approved' || to === 'failed' || to === 'stopped') {
-      this.repo.updateCaseAndClearExecutionLease(caseId, fields);
-      return;
+    const committed = this.repo.compareAndSetCaseStatus(
+      caseId,
+      record.status as CaseStatus,
+      fields,
+      {
+        runnerTokenSha256: runnerToken === undefined
+          ? undefined
+          : sha256(runnerToken),
+        clearExecutionLease:
+          to === 'approved' || to === 'failed' || to === 'stopped',
+      },
+    );
+    if (!committed) {
+      throw new Error(
+        'Case state changed concurrently or lease authorization failed',
+      );
     }
-    this.repo.updateCase(caseId, fields);
   }
 
   getScenarioConfig(caseId: string): ScenarioConfig {

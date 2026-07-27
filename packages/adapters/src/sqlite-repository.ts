@@ -314,7 +314,11 @@ export class SqliteRepository implements RepositoryPort {
         case_id, runner_token_sha256, runner_pid, runner_started_at, heartbeat_at
       )
       SELECT @case_id, @runner_token_sha256, @runner_pid, @runner_started_at, @heartbeat_at
-      WHERE EXISTS (SELECT 1 FROM cases WHERE case_id = @case_id)
+      WHERE EXISTS (
+        SELECT 1
+        FROM cases
+        WHERE case_id = @case_id AND status = 'created'
+      )
     `).run({ case_id: caseId, ...lease });
     return result.changes === 1;
   }
@@ -430,15 +434,46 @@ export class SqliteRepository implements RepositoryPort {
     this.db.prepare('DELETE FROM execution_leases WHERE case_id = ?').run(caseId);
   }
 
-  updateCaseAndClearExecutionLease(
+  compareAndSetCaseStatus(
     caseId: string,
+    expectedStatus: CaseStatus,
     fields: Record<string, unknown>,
-  ): void {
-    const update = this.db.transaction(() => {
-      this.updateCase(caseId, fields);
-      this.clearExecutionLease(caseId);
+    options?: {
+      runnerTokenSha256?: string;
+      clearExecutionLease?: boolean;
+    },
+  ): boolean {
+    const compareAndSet = this.db.transaction(() => {
+      const sets = Object.keys(fields)
+        .map((key) => `${key} = @${key}`)
+        .join(', ');
+      const tokenCondition = options?.runnerTokenSha256 === undefined
+        ? ''
+        : `AND EXISTS (
+            SELECT 1
+            FROM execution_leases
+            WHERE execution_leases.case_id = cases.case_id
+              AND runner_token_sha256 = @runner_token_sha256
+          )`;
+      const result = this.db.prepare(`
+        UPDATE cases
+        SET ${sets}
+        WHERE case_id = @case_id
+          AND status = @expected_status
+          ${tokenCondition}
+      `).run({
+        ...fields,
+        case_id: caseId,
+        expected_status: expectedStatus,
+        runner_token_sha256: options?.runnerTokenSha256,
+      });
+      if (result.changes !== 1) return false;
+      if (options?.clearExecutionLease) {
+        this.clearExecutionLease(caseId);
+      }
+      return true;
     });
-    update.immediate();
+    return compareAndSet.immediate();
   }
 
   // === Turns ===
