@@ -11,7 +11,6 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   type ChapterBoundaryMap,
-  type QualityReport,
   type ValidationResult,
   sha256,
   validateDraft,
@@ -20,6 +19,7 @@ import {
   validateOutline,
   validatePacket,
 } from './quality.js';
+import { materializeDeliveredArtifact } from './reconciliation.js';
 import { descendantClosure } from './invalidation.js';
 import {
   appendManifestEvent,
@@ -65,17 +65,6 @@ interface PipelineConfig {
   requirements: string;
   chapters: ChapterConfig[];
 }
-
-interface ForgeArtifact {
-  type: string;
-  version: number;
-  status: string;
-  content: string;
-  artifact_id: string;
-  version_id: string;
-}
-
-type ForgeResult = ForgeCaseSnapshot & { final_artifact: ForgeArtifact | null };
 
 interface RunOptions {
   command: 'run';
@@ -619,7 +608,7 @@ async function executeStage(
     throw new DOMException('The operation was aborted', 'AbortError');
   }
 
-  let result: ForgeResult | undefined;
+  let result: ForgeCaseSnapshot | undefined;
   try {
     if (attempt.runner_credential_path === null) {
       throw new Error(`Attempt ${attempt.attempt_id} has no runner credential`);
@@ -633,7 +622,7 @@ async function executeStage(
       dbPath: options.dbPath,
       mode: options.mode,
       runnerCredentialPath,
-    }, signal) as ForgeResult;
+    }, signal);
   } catch (error) {
     const beforeOutcome = attempt.outcome;
     attempt.outcome = 'interrupted';
@@ -697,65 +686,32 @@ async function executeStage(
     );
   }
 
-  const rawArtifactPath = join(
-    options.runDir,
-    'raw-artifacts',
-    spec.key,
-    `${attempt.attempt_id}.md`,
-  );
-  const validationReportPath = join(
-    options.runDir,
-    'validation',
-    spec.key,
-    `${attempt.attempt_id}.json`,
-  );
-  ensureInsideRunDir(options.runDir, rawArtifactPath);
-  ensureInsideRunDir(options.runDir, validationReportPath);
-  mkdirSync(dirname(rawArtifactPath), { recursive: true });
-  writeFileSync(rawArtifactPath, result.final_artifact.content, 'utf8');
-  attempt.raw_artifact_path = relative(options.runDir, rawArtifactPath).replaceAll('\\', '/');
-
-  let validation: ValidationResult;
+  let record: StageRecord;
   try {
-    validation = spec.validate(result.final_artifact.content);
+    record = materializeDeliveredArtifact({
+      run_dir: options.runDir,
+      manifest,
+      plan: {
+        run_id: options.runId,
+        story_id: options.storyId,
+        stage_key: spec.key,
+        stage: spec.stage,
+        chapter_id: spec.chapterId,
+        expected_artifact_type: spec.expectedArtifactType,
+        input_sha256: inputHash,
+        parent_record_ids: spec.parents.map((parent) => parent.record_id),
+        template_identity: spec.templateIdentity,
+      },
+      attempt,
+      snapshot: result,
+      validate: spec.validate,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const report: QualityReport = {
-      schema_version: '1.0',
-      stage_key: spec.key,
-      artifact_kind: spec.stage === 'outline'
-        ? 'outline'
-        : spec.stage === 'chapter_packet'
-          ? 'packet'
-          : spec.stage === 'chapter_draft'
-            ? 'draft'
-            : spec.stage === 'ledger_update'
-              ? 'ledger'
-              : 'final',
-      artifact_sha256: sha256(result.final_artifact.content),
-      valid: false,
-      checks: [],
-      errors: [`validator_exception: ${message}`],
-      warnings: [],
-      metrics: {},
-    };
-    validation = {
-      canonicalContent: result.final_artifact.content,
-      report,
-      sidecar: {
-        schema_version: '1.0',
-        artifact_kind: report.artifact_kind,
-        artifact_sha256: report.artifact_sha256,
-      },
-    };
-  }
-  writeJson(validationReportPath, validation.report);
-  attempt.validation_report_path = relative(options.runDir, validationReportPath).replaceAll('\\', '/');
-  if (!validation.report.valid) {
     const beforeOutcome = attempt.outcome;
     attempt.outcome = 'validation_failed';
     attempt.updated_at = new Date().toISOString();
-    attempt.detail = validation.report.errors.join('；');
+    attempt.detail = message;
     clearRunnerCredential(options.runDir, attempt);
     appendAttemptEvent(
       manifest,
@@ -774,69 +730,9 @@ async function executeStage(
     saveManifest(options.runDir, manifest);
     throw new Error(`阶段 ${spec.key} 未通过机械门禁: ${attempt.detail}`);
   }
-
-  const revision = Math.max(
-    0,
-    ...manifest.stages.filter((item) => item.stage_key === spec.key).map((item) => item.revision),
-  ) + 1;
-  const recordId = `${spec.key}-v${revision}`;
-  const artifactPath = join(options.runDir, 'artifacts', `${recordId}.md`);
-  const sidecarPath = join(options.runDir, 'structured', `${recordId}.json`);
-  ensureInsideRunDir(options.runDir, artifactPath);
-  ensureInsideRunDir(options.runDir, sidecarPath);
-  mkdirSync(dirname(artifactPath), { recursive: true });
-  writeFileSync(artifactPath, validation.canonicalContent, 'utf8');
-  writeJson(sidecarPath, validation.sidecar);
-  const artifactHash = sha256(validation.canonicalContent);
-  const record: StageRecord = {
-    record_id: recordId,
-    revision,
-    stage_key: spec.key,
-    stage: spec.stage,
-    chapter_id: spec.chapterId,
-    template: spec.template,
-    template_identity: spec.templateIdentity,
-    case_id: caseId,
-    parent_record_ids: spec.parents.map((parent) => parent.record_id),
-    parent_case_ids: spec.parents.map((parent) => parent.case_id),
-    status: 'delivered',
-    input_path: relative(options.runDir, inputPath).replaceAll('\\', '/'),
-    input_sha256: inputHash,
-    raw_artifact_path: relative(options.runDir, rawArtifactPath).replaceAll('\\', '/'),
-    raw_artifact_sha256: sha256(result.final_artifact.content),
-    artifact_path: relative(options.runDir, artifactPath).replaceAll('\\', '/'),
-    artifact_sha256: artifactHash,
-    sidecar_path: relative(options.runDir, sidecarPath).replaceAll('\\', '/'),
-    sidecar_sha256: sha256(readFileSync(sidecarPath)),
-    validation_report_path: relative(options.runDir, validationReportPath).replaceAll('\\', '/'),
-    validation_report_sha256: sha256(readFileSync(validationReportPath)),
-    artifact_type: result.final_artifact.type,
-    artifact_version: result.final_artifact.version,
-    completed_at: new Date().toISOString(),
-  };
-
-  const beforeOutcome = attempt.outcome;
-  attempt.outcome = 'delivered';
-  attempt.updated_at = record.completed_at;
-  attempt.detail = null;
   clearRunnerCredential(options.runDir, attempt);
-  manifest.stages.push(record);
-  appendAttemptEvent(
-    manifest,
-    'stage_delivered',
-    attempt,
-    beforeOutcome,
-    attempt.outcome,
-    '机械门禁通过',
-    {
-      artifactId: result.final_artifact.artifact_id,
-      artifactVersion: result.final_artifact.version,
-      versionId: result.final_artifact.version_id,
-      recordId,
-    },
-  );
   saveManifest(options.runDir, manifest);
-  process.stdout.write(`[done] ${recordId} -> ${caseId}\n`);
+  process.stdout.write(`[done] ${record.record_id} -> ${caseId}\n`);
   return record;
 }
 

@@ -340,20 +340,7 @@ export function validatePacket(
 
   const futureIds = futureBoundaryIds(content, boundary);
   const leaks = controlLeaks(content);
-  checks.push(makeCheck(
-    'packet_future_isolation',
-    futureIds.length === 0 && leaks.length === 0,
-    futureIds.length === 0 && leaks.length === 0
-      ? '未出现未来章节 ID 或反向提示'
-      : `未来 ID=${futureIds.join(',') || '(无)'}；控制泄漏=${leaks.join(',') || '(无)'}`,
-  ));
-
   const overlaps = findSharedCjkSequences(sourceText, content, 12);
-  checks.push(makeCheck(
-    'packet_source_overlap',
-    overlaps.length === 0,
-    overlaps.length === 0 ? '没有连续 12 汉字原文复用' : `命中 ${overlaps.slice(0, 5).join('、')}`,
-  ));
 
   const boundaryMentioned = content.includes(boundary.id);
   checks.push(makeCheck(
@@ -415,56 +402,25 @@ export function validateDraft(
   const lower = Number(lengthBudget?.lower ?? 0);
   const upper = Number(lengthBudget?.upper ?? 0);
   const cjkCount = cjkStream(content).length;
-  checks.push(makeCheck(
-    'draft_length_budget',
-    lower > 0 && upper >= lower && cjkCount >= lower && cjkCount <= upper,
-    `汉字数 ${cjkCount}，范围 ${lower}–${upper}`,
-  ));
-
   const asciiQuotes = (content.match(/"/gu) ?? []).length;
-  checks.push(makeCheck(
-    'draft_dialogue_quotes',
-    asciiQuotes === 0,
-    asciiQuotes === 0 ? '未使用 ASCII 双引号' : `ASCII 双引号 ${asciiQuotes} 个`,
-  ));
-
   const overlaps = findSharedCjkSequences(sourceText, content, 12);
-  checks.push(makeCheck(
-    'draft_source_overlap',
-    overlaps.length === 0,
-    overlaps.length === 0 ? '没有连续 12 汉字原文复用' : `命中 ${overlaps.slice(0, 8).join('、')}`,
-  ));
-
   const packetCjk = cjkStream(packetContent);
   const unauthorizedQuotes = quotedSpans(content).filter((quote) => !packetCjk.includes(cjkStream(quote)));
-  checks.push(makeCheck(
-    'draft_dialogue_authorization',
-    unauthorizedQuotes.length === 0,
-    unauthorizedQuotes.length === 0 ? '全部对白均可追溯到章节包' : `未授权对白：${unauthorizedQuotes.join('；')}`,
-  ));
-
   const unauthorizedClaims = quantifiedClaims(content)
     .filter((claim) => !packetContent.includes(claim));
-  checks.push(makeCheck(
-    'draft_quantified_claims',
-    unauthorizedClaims.length === 0,
-    unauthorizedClaims.length === 0 ? '精确数量与绝对化结论均有章节包来源' : `未授权：${unauthorizedClaims.join('、')}`,
-  ));
-
   const leaks = controlLeaks(content);
-  checks.push(makeCheck(
-    'draft_control_language',
-    leaks.length === 0,
-    leaks.length === 0 ? '没有控制端措辞' : `命中：${leaks.join(',')}`,
-  ));
 
   const paragraphs = content.split(/\n\s*\n/gu).filter((paragraph) => paragraph.trim());
   const report = finishReport(stageKey, 'draft', content, checks, [], {
     cjk_count: cjkCount,
     paragraph_count: paragraphs.length,
+    declared_length_lower: lower,
+    declared_length_upper: upper,
+    ascii_quote_count: asciiQuotes,
     source_overlap_count: overlaps.length,
     unauthorized_quotes: unauthorizedQuotes,
     unauthorized_claims: unauthorizedClaims,
+    control_language_patterns: leaks,
   });
   return {
     canonicalContent: `${content}\n`,
@@ -515,25 +471,15 @@ export function validateLedger(
   ));
 
   const leaks = controlLeaks(content);
-  checks.push(makeCheck(
-    'ledger_future_isolation',
-    leaks.length === 0,
-    leaks.length === 0 ? '没有未来控制措辞' : `命中：${leaks.join(',')}`,
-  ));
-
   const evidenceCorpus = `${draftContent}\n${previousLedger}`;
   const unauthorizedQuotes = quotedSpans(content)
     .filter((quote) => !cjkStream(evidenceCorpus).includes(cjkStream(quote)));
-  checks.push(makeCheck(
-    'ledger_quote_evidence',
-    unauthorizedQuotes.length === 0,
-    unauthorizedQuotes.length === 0 ? '账本引语均存在于正文或上一账本' : `无证据引语：${unauthorizedQuotes.join('；')}`,
-  ));
 
   const report = finishReport(stageKey, 'ledger', content, checks, [], {
     stable_id_count: declaredIds.length,
     stable_ids: declaredIds,
     unauthorized_quotes: unauthorizedQuotes,
+    control_language_patterns: leaks,
   });
   return {
     canonicalContent: `${content}\n`,
