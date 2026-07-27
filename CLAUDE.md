@@ -6,14 +6,28 @@
 
 Forge AI 是一个**让多个 AI Agent 协作完成一次内容生产任务的运行平台**。核心不是"模型多强"，而是**在多个 Agent 之间搭一个可靠的中间层**：让它们安全交接工作成果，并让系统始终独立掌握"现在生产到哪了、哪些成果有效、什么问题没解决"。
 
-典型链路（歌词场景）：总控派任务 → 生成写初稿 v1 → 审核挑出问题 → 总控下发"只改第 4 行、其余冻结"的返修 → 生成改出 v2 → 复审通过 → 总控申请交付 → **系统独立核对门禁** → 正式交付。歌词只是示例，换"文案+质检"骨架不变。
+典型链路（歌词场景）：总控派任务 → 生成写初稿 v1 → 审核挑出问题 → 总控下发"只改第 4 行、其余冻结"的返修 → 生成改出 v2 → 复审通过 → 总控申请交付 → **系统独立核对门禁** → 正式交付。歌词只是平台示例；知乎短故事仿写使用下方的外部多 Case 编排器。
 
 ## 先读这些（按顺序）
 
 1. `AGENTS.md` — 六条铁律 + 已知失败模式提醒（**必读，不可违反**）
 2. `README.md` - 项目介绍 + 架构 + 使用说明（人读入口，含四支柱/运行时模型/命令速查/场景/核心概念）
+3. `orchestrators/story-pipeline/README.md` — 故事多 Case 编排器的职责、产物和机械门禁
+4. `orchestrators/story-pipeline/外部编排器从头生产使用说明.md` — 故事仿写从输入到终稿的可执行手册
 
-> 历史过程文档（需求文档 / PLAN / 交付标准 / 返修清单 / 使用说明 等）已归档至 `docs/archive/`，需要翻查历史细节时去那里。
+> 历史需求、计划、交付和返修文档已归档至 `docs/archive/`；当前故事生产以外部编排器使用说明、场景配置和代码为准。
+
+## 故事仿写生产
+
+生产 Agent 不应手工创建或串行驱动多个 Forge Case，而应调用 `orchestrators/story-pipeline/src/index.ts`。编排器负责流程、身份、血缘、Manifest、哈希、恢复和下游失效传播；各 Forge Case 的 Agent/skill 负责大纲、执行包、正文、账本和终稿的内容生成与审核。
+
+阶段顺序为：
+
+```text
+故事输入 → outline → packet → draft → ledger → final
+```
+
+从头生产必须使用新的 `run_id`、`run-dir` 和 Forge DB，不能复用历史恢复目录或手工修改 Manifest。完整准备、PowerShell 命令、验收条件和异常处理见 `orchestrators/story-pipeline/外部编排器从头生产使用说明.md`。如果只需要了解记录协议和机械校验，阅读同目录的 `README.md`。
 
 ## 四根支柱（每个功能必须服务至少一根）
 
@@ -51,7 +65,7 @@ contracts  ->  domain  ->  application  ->  adapters  ->  apps
 
 | 条款 | 状态 | 证据 |
 |---|---|---|
-| 4.1 check/test | ✅ | `npm run check` 0 错误；`npm run test` 9 文件 78 passed |
+| 4.1 check/test | ⚠️ | `npm run test` 最近验收为 364 passed；`npm run check` 当前会被历史归档文件 `docs/archive/forge-ai-mvp-report.canvas.tsx` 阻断，不属于运行代码 |
 | 2.1 Fake Pi 歌词全链路 | ✅ | 7 Turn→approved，门禁 5 项全 pass，blocking Issue=verified，generator persistent/reviewer cold_per_version，v1 superseded+v2 delivered |
 | 2.3 崩溃恢复 | ✅ 已修（Fake + Real Pi 双验证） | Fake Pi：`scripts/crash-recovery-e2e.cjs` 8 项全 YES。**Real Pi kill -9**：`scripts/crash-recovery-realpi-e2e.cjs` 9 项全 YES（taskkill /F 真实 kill、从 Turn N+1 续跑、已完成 Turn 哈希不变、persistent session `.jsonl` 跨进程 7->23 历史续跑、context_snapshot 含崩溃前产物、最终 approved+门禁 pass） |
 | 2.4 第二场景零代码 | ✅ | copywriting：writer/qc、artifact_type=copy、门禁 pass |
@@ -67,8 +81,8 @@ contracts  ->  domain  ->  application  ->  adapters  ->  apps
 ## 标准命令
 
 ```bash
-npm run check            # tsc --noEmit（0 错误）
-npm run test             # vitest 单元 + 集成（78 passed）
+npm run check            # tsc --noEmit；若只报 docs/archive/forge-ai-mvp-report.canvas.tsx，属于历史归档文件问题
+npm run test             # vitest 单元 + 集成（最近验收为 364 passed）
 npm run test:integration # 真实 PG（本项目用 SQLite，此命令可能为空配置）
 npm run dev              # tsx apps/worker/src/main.ts（默认 Fake Pi + songwriting）
 ```
@@ -107,7 +121,7 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 # 浏览器打开 http://localhost:3137
 ```
 
-**真实 Pi**（待凭证）：`PI_MODE=real DEEPSEEK_API_KEY=... PI_MODEL_ID=deepseek-v4-flash npm run dev`
+**真实 Pi**（需要仓库根目录 `.env` 中存在本机密钥）：`PI_MODE=real DEEPSEEK_API_KEY=... PI_MODEL_ID=deepseek-v4-flash npm run dev`
 
 ## 关键约束 / 坑（务必记住）
 
@@ -135,11 +149,11 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 
 ## 待办（新 Agent 接手后优先）
 
-1. ~~**真实 Pi 全链路验证（2.2）**~~ ✅ 已完成（见上"当前状态"表 + 坑 9-13）。凭证在 `deepseek_config.txt`，DB `data/real-pi-multi.db`（16 Case）。`npm run check` 0 错误、`npm run test` 78 passed、Fake Pi songwriting 7 Turn approved 无回归。
+1. ~~**真实 Pi 全链路验证（2.2）**~~ ✅ 已完成（见上"当前状态"表 + 坑 9-13）。凭证在 `deepseek_config.txt`，DB `data/real-pi-multi.db`（16 Case）。`npm run check` 0 错误、`npm run test` 364 passed、Fake Pi songwriting 7 Turn approved 无回归。
 2. ~~**真实 Pi kill -9 崩溃恢复 + persistent session 跨进程历史续跑（2.3 硬指标）**~~ ✅ 已完成（2026-07-25 续，见下"最近的改动"）。`scripts/crash-recovery-realpi-e2e.cjs` 9 项全 YES：真实 `taskkill /F /T`、从 Turn N+1 续跑、已完成 Turn/产物哈希不变（铁律 4）、persistent supervisor session `.jsonl` 7->23（跨进程历史续跑）、续跑后 context_snapshot 含崩溃前产物、最终 approved + 门禁 pass。修复要点：worker recovery 路径接上 `RealPiAdapter.resumeSession`（坑 15）、`resumeSession` 改用 `SessionManager.open` 显式定位文件 fail-loud（坑 16）、恢复消息附 Case 状态摘要（坑 17）。
 3. 真实 Pi 连续 3 次异常 Turn 需停下汇报（异常检测软规则，不是预算约束）。空响应重试已加（3 次），但连续异常 Turn 计数与停汇报尚未实现。
 
-## 最近的改动（2026-07-25，均未纳入 git）
+## 历史改动摘要（截至 2026-07-28；代码已纳入 git）
 
 ### 早期修复（依赖 + Fake Pi 链路）
 - 修复依赖（重装 + `.npmrc` allow-scripts + rebuild native）
@@ -150,7 +164,7 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 - 新增本 `CLAUDE.md`
 
 ### 真实 Pi 全链路验证（2.2）+ 5 个真实 bug 修复（2026-07-25 续）
-跑 16 个真实 Pi Case 过程中暴露并修复（`npm run check` 0 错误 / `npm run test` 78 passed / Fake Pi 无回归）：
+跑 16 个真实 Pi Case 过程中暴露并修复（`npm run check` 0 错误 / `npm run test` 364 passed / Fake Pi 无回归）：
 
 1. **`pi-adapter.ts` registerSession 别名 bug**（坑 10）：cold_per_version 复用时新 session 被指向已 dispose 的旧 state，导致复审 Turn 6 稳定返回空响应。改为显式 `(sessionId, piSessionRef)` 别名 + closeSession 清所有 key。
 2. **`pi-adapter.ts` 空响应重试**（坑 9）：deepseek 推理模型偶发只产出 thinking、无 text/tool_use。加最多 3 次重试（追加 nudge 迫使调工具）。
@@ -168,7 +182,7 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 `finalize-cases.ts`（标非终态 case 为 stopped）、`dump-case.ts`、`verify-lifecycle.ts`、`inspect-issues.ts`、`repro-empty-review.ts`、`real-pi-probe.ts` 等。可保留供后续调试或删除。
 
 ### Real Pi kill -9 崩溃恢复 + persistent session 跨进程续跑（2.3 硬指标，2026-07-25 续）
-跑 `scripts/crash-recovery-realpi-e2e.cjs`（真实 DeepSeek + `taskkill /F /T`）暴露并修复（`npm run check` 0 错误 / `npm run test` 78 passed / Fake Pi e2e 8 项无回归）：
+跑 `scripts/crash-recovery-realpi-e2e.cjs`（真实 DeepSeek + `taskkill /F /T`）暴露并修复（`npm run check` 0 错误 / `npm run test` 364 passed / Fake Pi e2e 8 项无回归）：
 
 1. **`main.ts` recovery 接 RealPi resumeSession**（坑 15）：persistent session 复用分支先 `await pi.resumeSession(pi_session_ref)` 再 `registerSession`，否则进程重启后 adapter 内存 map 空、`executeTurn` 报 `Session not found`。
 2. **`pi-adapter.ts` resumeSession 改 `SessionManager.open`**（坑 16）：显式定位 `.jsonl` 文件，fail loud；弃用 `continueRecent`（会静默新建空 session 丢历史）。
@@ -186,4 +200,4 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 - title 用 `scenario.name`（歌词生产/文案生产），不再写死"歌词生产"。
 - 新增 `scenarios/songwriting/input.example.json`、`scenarios/copywriting/input.example.json` 示例输入。
 
-**验证证据**：`npm run check` 0 错误 / `npm run test` 78 passed / Fake Pi songwriting e2e 8 项无回归。copywriting Fake Pi 实测：title "文案生产"、input_payload `{"product_name":...,"promotion_info":...}`、首条消息"产品名称:…促销信息:…"、最终 approved。`FORGE_INPUT` 环境变量覆盖实测生效；缺字段实测 fail loud（`输入缺少必填字段：fixed_phrase`）。
+**验证证据**：`npm run check` 0 错误 / `npm run test` 364 passed / Fake Pi songwriting e2e 8 项无回归。copywriting Fake Pi 实测：title "文案生产"、input_payload `{"product_name":...,"promotion_info":...}`、首条消息"产品名称:…促销信息:…"、最终 approved。`FORGE_INPUT` 环境变量覆盖实测生效；缺字段实测 fail loud（`输入缺少必填字段：fixed_phrase`）。

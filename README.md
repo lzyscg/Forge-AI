@@ -102,6 +102,50 @@ npx forge case run <id> --wait --db ./data/copy.db
 DEEPSEEK_API_KEY=sk-xxxx npx forge case run <id> --wait --mode real --db ./data/real.db
 ```
 
+## 知乎短故事仿写生产
+
+故事仿写不是把多个 `forge case` 手工串起来，而是使用仓库内的外部多 Case 编排器。它把内容生产拆成多个独立场景，并负责输入、父版本、Case 身份、Manifest、文件哈希、恢复和下游失效传播；每个 Case 自己负责故事内容的生成、审核和质量门禁。
+
+完整链路：
+
+```text
+故事输入 → zhihu-story-outline → zhihu-chapter-packet
+  → zhihu-chapter-draft → zhihu-story-ledger → zhihu-story-final
+```
+
+生产 Agent 必须先阅读：
+
+- [外部编排器说明](orchestrators/story-pipeline/README.md)
+- [从头生产使用说明](orchestrators/story-pipeline/外部编排器从头生产使用说明.md)
+
+### 从头运行真实故事
+
+前置条件：Node.js ≥ 20、依赖已安装、仓库根目录 `.env` 中存在 `DEEPSEEK_API_KEY`，以及一份可读取的原始故事文件。密钥只能放在环境变量中，不得写入命令、日志、Manifest 或 Git。
+
+生产配置可参考 [单章配置示例](orchestrators/story-pipeline/examples/imitation-one-chapter.json)。`data/` 被 Git 忽略，因此新环境不能假定存在真实生产配置；可以从该示例复制一份，再填写当前故事的 `run_id`、`story_id`、`title`、`source_file`、`requirements` 和 `chapters`。真实生产必须使用新的运行目录和 Forge DB；`data/story-runs/gaokao-zero-real-003` 仅是历史恢复验收目录，不得复用。
+
+```powershell
+# 从受跟踪的示例复制配置（若本机已有生产配置，也只能复制配置文件，不能复制旧 run 目录）
+New-Item -ItemType Directory -Force data/story-runs | Out-Null
+Copy-Item orchestrators/story-pipeline/examples/imitation-one-chapter.json data/story-runs/gaokao-zero-fresh-001-config.json
+
+$configPath = "data/story-runs/gaokao-zero-fresh-001-config.json"
+$config = Get-Content -Raw -Encoding UTF8 $configPath | ConvertFrom-Json
+$config.run_id = "gaokao-zero-fresh-001"
+# 按当前输入填写 source_file、story_id、title、requirements 和 chapters
+$config | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 $configPath
+
+npx tsx orchestrators/story-pipeline/src/index.ts run `
+  --config data/story-runs/gaokao-zero-fresh-001-config.json `
+  --mode real `
+  --run-dir data/story-runs/gaokao-zero-fresh-001 `
+  --db data/story-runs/gaokao-zero-fresh-001/forge.db
+```
+
+不要增加阶段停止参数、手工接力或手工修改 Manifest。正常情况下编排器会自动运行到 `final`。如果进程意外退出，使用同一组参数重跑；如果出现 `ambiguous`、模板身份不一致或 `fail-closed`，停止并报告，不要绕过门禁。
+
+只有命令退出码为 0、输出包含 `success: true` 和 `final_artifact`，且 Manifest 中 outline、packet、draft、ledger、final 均有 delivered 记录、正式产物和校验报告齐全时，才能报告整条链路完成。终稿必须以编排器落盘的 `final_artifact_path` 为准。
+
 ### Web 操作台
 
 ```bash
@@ -126,7 +170,7 @@ cd apps/web && npm run build && npm run start   # http://localhost:3000
 
 ```bash
 # 检查与测试
-npm run check            # tsc --noEmit，0 错误
+npm run check            # tsc --noEmit；若只报 docs/archive/forge-ai-mvp-report.canvas.tsx，属于历史归档文件问题
 npm run test             # vitest，364 passed
 
 # CLI（主入口）
@@ -146,6 +190,8 @@ DEEPSEEK_API_KEY=sk-xxxx node scripts/crash-recovery-realpi-e2e.cjs   # 真实 k
 # Skill 装配验证（零 token）
 npx tsx scripts/skill-verify-probe.ts
 ```
+
+说明：`docs/archive/forge-ai-mvp-report.canvas.tsx` 是历史画布文件，不属于运行代码；如果 `npm run check` 只因该文件报错，不要把它误判为故事编排器或 Case 生产失败。生产验收仍以编排器命令退出码、Manifest、正式产物和 validation 证据为准。
 
 ## 场景（配置驱动，零代码）
 
