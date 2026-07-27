@@ -120,8 +120,10 @@ describe('leased case CLI', () => {
     expect(readFileSync(logPath, 'utf8')).not.toContain(token);
 
     const reopened = new SqliteRepository(dbPath);
-    expect(reopened.getExecutionLease(caseId)?.runner_token_sha256)
-      .toMatch(/^[a-f0-9]{64}$/);
+    expect(reopened.getExecutionLease(caseId)).toMatchObject({
+      runner_token_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      runner_pid: 0,
+    });
     reopened.close();
   });
 
@@ -202,6 +204,9 @@ describe('leased case CLI', () => {
     );
     expect(`${transferred.stdout}${transferred.stderr}`)
       .not.toMatch(/old-secret-token|new-secret-token/);
+    const transferredRepo = new SqliteRepository(dbPath);
+    expect(transferredRepo.getExecutionLease('case-transfer')?.runner_pid).toBe(0);
+    transferredRepo.close();
 
     const stale = runCli([
       'case', 'abort', 'case-transfer',
@@ -253,7 +258,7 @@ describe('leased case CLI', () => {
     const result = runCli(['case', 'stop', 'case-leased-wait', '--db', dbPath]);
     expect(result.status).not.toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({
-      error: 'Cannot stop a leased case. Use case abort with the matching runner token.',
+      error: 'Case state changed concurrently or execution lease exists',
     });
 
     const reopened = new SqliteRepository(dbPath);

@@ -85,20 +85,39 @@ describe('CaseService execution lease', () => {
       'case-1',
       'wrong-token',
       'new-token',
-      202,
     )).toBe(false);
     expect(service.transferExecutionLease(
       'case-1',
       'old-token',
       'new-token',
-      202,
     )).toBe(true);
-    expect(service.heartbeatExecutionLease('case-1', 'old-token')).toBe(false);
-    expect(service.heartbeatExecutionLease('case-1', 'new-token')).toBe(true);
+    expect(repo.getExecutionLease('case-1')?.runner_pid).toBe(0);
+    expect(service.claimExecutionLease('case-1', 'new-token', 202)).toBe(true);
+    expect(service.claimExecutionLease('case-1', 'new-token', 303)).toBe(false);
+    expect(service.heartbeatExecutionLease('case-1', 'old-token', 202)).toBe(false);
+    expect(service.heartbeatExecutionLease('case-1', 'new-token', 303)).toBe(false);
+    expect(service.heartbeatExecutionLease('case-1', 'new-token', 202)).toBe(true);
+    expect(service.releaseExecutionLeaseOwner('case-1', 'new-token', 303)).toBe(false);
+    expect(service.releaseExecutionLeaseOwner('case-1', 'new-token', 202)).toBe(true);
+    expect(repo.getExecutionLease('case-1')?.runner_pid).toBe(0);
     expect(() => service.abortCase('case-1', 'wrong-token'))
       .toThrow('Execution lease authorization failed');
     expect(service.abortCase('case-1', 'new-token')).toBe('stopped');
     expect(service.abortCase('case-1', 'new-token')).toBe('stopped');
+    repo.close();
+  });
+
+  it('stops a legacy case only when no execution lease exists', () => {
+    const { repo, service } = buildService();
+
+    service.acquireExecutionLease('case-1', 'runner-token', 101);
+    expect(() => service.stopCaseWithoutLease('case-1'))
+      .toThrow('Case state changed concurrently or execution lease exists');
+    expect(repo.getCase('case-1')?.status).toBe('created');
+
+    repo.clearExecutionLease('case-1');
+    expect(service.stopCaseWithoutLease('case-1')).toBe('stopped');
+    expect(repo.getCase('case-1')?.status).toBe('stopped');
     repo.close();
   });
 
@@ -123,7 +142,7 @@ describe('CaseService execution lease', () => {
     const { repo, service } = buildService();
     service.acquireExecutionLease('case-1', 'old-token', 101);
     service.startCase('case-1', 'old-token');
-    service.transferExecutionLease('case-1', 'old-token', 'new-token', 202);
+    service.transferExecutionLease('case-1', 'old-token', 'new-token');
 
     expect(() => service.transitionCaseStatus('case-1', 'waiting_review'))
       .toThrow('Case state changed concurrently or lease authorization failed');

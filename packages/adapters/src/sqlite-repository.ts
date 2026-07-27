@@ -341,6 +341,44 @@ export class SqliteRepository implements RepositoryPort {
     return row !== undefined;
   }
 
+  claimExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+    claimedAt: string,
+  ): boolean {
+    const result = this.db.prepare(`
+      UPDATE execution_leases
+      SET runner_pid = @runner_pid,
+          runner_started_at = @claimed_at,
+          heartbeat_at = @claimed_at
+      WHERE case_id = @case_id
+        AND runner_token_sha256 = @runner_token_sha256
+        AND runner_pid = 0
+    `).run({
+      case_id: caseId,
+      runner_token_sha256: runnerTokenSha256,
+      runner_pid: runnerPid,
+      claimed_at: claimedAt,
+    });
+    return result.changes === 1;
+  }
+
+  releaseExecutionLeaseOwner(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+  ): boolean {
+    const result = this.db.prepare(`
+      UPDATE execution_leases
+      SET runner_pid = 0
+      WHERE case_id = ?
+        AND runner_token_sha256 = ?
+        AND runner_pid = ?
+    `).run(caseId, runnerTokenSha256, runnerPid);
+    return result.changes === 1;
+  }
+
   transferExecutionLease(
     caseId: string,
     oldRunnerTokenSha256: string,
@@ -365,13 +403,14 @@ export class SqliteRepository implements RepositoryPort {
   heartbeatExecutionLease(
     caseId: string,
     runnerTokenSha256: string,
+    runnerPid: number,
     heartbeatAt: string,
   ): boolean {
     const result = this.db.prepare(`
       UPDATE execution_leases
       SET heartbeat_at = ?
-      WHERE case_id = ? AND runner_token_sha256 = ?
-    `).run(heartbeatAt, caseId, runnerTokenSha256);
+      WHERE case_id = ? AND runner_token_sha256 = ? AND runner_pid = ?
+    `).run(heartbeatAt, caseId, runnerTokenSha256, runnerPid);
     return result.changes === 1;
   }
 
@@ -432,6 +471,34 @@ export class SqliteRepository implements RepositoryPort {
 
   clearExecutionLease(caseId: string): void {
     this.db.prepare('DELETE FROM execution_leases WHERE case_id = ?').run(caseId);
+  }
+
+  stopCaseWithoutExecutionLease(
+    caseId: string,
+    expectedStatus: CaseStatus,
+    stoppedAt: string,
+  ): boolean {
+    const stop = this.db.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE cases
+        SET status = 'stopped',
+            updated_at = @stopped_at,
+            completed_at = @stopped_at
+        WHERE case_id = @case_id
+          AND status = @expected_status
+          AND NOT EXISTS (
+            SELECT 1
+            FROM execution_leases
+            WHERE execution_leases.case_id = cases.case_id
+          )
+      `).run({
+        case_id: caseId,
+        expected_status: expectedStatus,
+        stopped_at: stoppedAt,
+      });
+      return result.changes === 1;
+    });
+    return stop.immediate();
   }
 
   compareAndSetCaseStatus(

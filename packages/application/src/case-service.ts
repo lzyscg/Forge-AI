@@ -119,11 +119,35 @@ export class CaseService {
     return this.repo.validateExecutionLease(caseId, sha256(runnerToken));
   }
 
+  claimExecutionLease(
+    caseId: string,
+    runnerToken: string,
+    runnerPid: number,
+  ): boolean {
+    return this.repo.claimExecutionLease(
+      caseId,
+      sha256(runnerToken),
+      runnerPid,
+      this.clock.now(),
+    );
+  }
+
+  releaseExecutionLeaseOwner(
+    caseId: string,
+    runnerToken: string,
+    runnerPid: number,
+  ): boolean {
+    return this.repo.releaseExecutionLeaseOwner(
+      caseId,
+      sha256(runnerToken),
+      runnerPid,
+    );
+  }
+
   transferExecutionLease(
     caseId: string,
     oldRunnerToken: string,
     newRunnerToken: string,
-    runnerPid: number,
   ): boolean {
     const now = this.clock.now();
     return this.repo.transferExecutionLease(
@@ -131,19 +155,47 @@ export class CaseService {
       sha256(oldRunnerToken),
       {
         runner_token_sha256: sha256(newRunnerToken),
-        runner_pid: runnerPid,
+        runner_pid: 0,
         runner_started_at: now,
         heartbeat_at: now,
       },
     );
   }
 
-  heartbeatExecutionLease(caseId: string, runnerToken: string): boolean {
+  heartbeatExecutionLease(
+    caseId: string,
+    runnerToken: string,
+    runnerPid: number,
+  ): boolean {
     return this.repo.heartbeatExecutionLease(
       caseId,
       sha256(runnerToken),
+      runnerPid,
       this.clock.now(),
     );
+  }
+
+  stopCaseWithoutLease(caseId: string): 'stopped' {
+    const record = this.repo.getCase(caseId);
+    if (!record) throw new Error(`Case not found: ${caseId}`);
+    const status = record.status as CaseStatus;
+    if (status === 'approved' || status === 'failed' || status === 'stopped') {
+      throw new Error(`Case already in terminal state: ${status}`);
+    }
+    if (status === 'running') {
+      throw new Error('Cannot stop a running case. Wait for it to finish or crash.');
+    }
+    const stopped = this.repo.stopCaseWithoutExecutionLease(
+      caseId,
+      status,
+      this.clock.now(),
+    );
+    if (!stopped) {
+      throw new Error(
+        'Case state changed concurrently or execution lease exists',
+      );
+    }
+    return 'stopped';
   }
 
   abortCase(caseId: string, runnerToken: string): 'stopped' {

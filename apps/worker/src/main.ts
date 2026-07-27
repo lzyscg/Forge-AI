@@ -167,6 +167,10 @@ const consoleLogger: Logger = {
 async function main() {
   // 读取环境变量
   const piMode = process.env.PI_MODE ?? 'fake';
+  const runnerToken = process.env.FORGE_RUNNER_TOKEN;
+  if (!runnerToken) {
+    throw new Error('FORGE_RUNNER_TOKEN is required');
+  }
   // 两库模型：DB_PATH 显式覆盖优先级最高；否则按 FORGE_ENV 选 production(默认)/test 库。
   // 与 CLI/web 共用 resolveSingleDbPath/defaultDbEnv（计划第 2 节：配置共享）。
   const dbEnv = defaultDbEnv();
@@ -252,7 +256,10 @@ async function main() {
     console.log(`\n[恢复] 发现 ${casesNeedingRecovery.length} 个需要恢复的 Case`);
     const caseId = casesNeedingRecovery[0];
     console.log(`\n[Case] 续跑: ${caseId}`);
-    const result = await runner.runCase(caseId);
+    const result = await runner.runCase(caseId, {
+      runnerToken,
+      runnerPid: process.pid,
+    });
     console.log(`\n[最终] Case ${result.case_id} 状态: ${result.status}`);
   } else {
     // 创建新 Case
@@ -263,7 +270,10 @@ async function main() {
     });
     console.log(`\n[Case] 创建: ${caseId}`);
 
-    const result = await runner.runCase(caseId);
+    const result = await runner.runCase(caseId, {
+      runnerToken,
+      runnerPid: process.pid,
+    });
     console.log(`\n[最终] Case ${result.case_id} 状态: ${result.status}`);
   }
 

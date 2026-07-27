@@ -160,6 +160,97 @@ describe('SQLite execution lease', () => {
     expect(outcomes.filter((outcome) => outcome === false)).toHaveLength(1);
   });
 
+  it('allows only one simultaneous runner to claim an unowned matching lease', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'forge-execution-claim-race-'));
+    roots.push(root);
+    const dbPath = join(root, 'forge.db');
+    const observer = openRepository(dbPath);
+    insertCase(observer);
+    const hash = 'a'.repeat(64);
+    observer.acquireExecutionLease('case-1', {
+      runner_token_sha256: hash,
+      runner_pid: 0,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+
+    const outcomes = await runRace(dbPath, [
+      {
+        kind: 'claim',
+        caseId: 'case-1',
+        runnerTokenSha256: hash,
+        runnerPid: 101,
+        claimedAt: '2026-07-27T00:00:02.000Z',
+      },
+      {
+        kind: 'claim',
+        caseId: 'case-1',
+        runnerTokenSha256: hash,
+        runnerPid: 202,
+        claimedAt: '2026-07-27T00:00:03.000Z',
+      },
+    ]);
+
+    expect(outcomes.filter((outcome) => outcome === true)).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome === false)).toHaveLength(1);
+    expect([101, 202]).toContain(observer.getExecutionLease('case-1')?.runner_pid);
+  });
+
+  it('releases only the current owner while retaining the token lease', () => {
+    const repo = openRepository(':memory:');
+    insertCase(repo);
+    const hash = 'a'.repeat(64);
+    repo.acquireExecutionLease('case-1', {
+      runner_token_sha256: hash,
+      runner_pid: 101,
+      runner_started_at: '2026-07-27T00:00:01.000Z',
+      heartbeat_at: '2026-07-27T00:00:01.000Z',
+    });
+
+    expect(repo.releaseExecutionLeaseOwner('case-1', hash, 202)).toBe(false);
+    expect(repo.releaseExecutionLeaseOwner('case-1', hash, 101)).toBe(true);
+    expect(repo.getExecutionLease('case-1')).toMatchObject({
+      runner_token_sha256: hash,
+      runner_pid: 0,
+    });
+  });
+
+  it('allows only atomic lease acquisition or legacy stop to win', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'forge-execution-stop-race-'));
+    roots.push(root);
+    const dbPath = join(root, 'forge.db');
+    const observer = openRepository(dbPath);
+    insertCase(observer);
+
+    const [acquired, stopped] = await runRace(dbPath, [
+      {
+        kind: 'acquire',
+        caseId: 'case-1',
+        lease: {
+          runner_token_sha256: 'a'.repeat(64),
+          runner_pid: 101,
+          runner_started_at: '2026-07-27T00:00:01.000Z',
+          heartbeat_at: '2026-07-27T00:00:01.000Z',
+        },
+      },
+      {
+        kind: 'stop',
+        caseId: 'case-1',
+        expectedStatus: 'created',
+        stoppedAt: '2026-07-27T00:00:02.000Z',
+      },
+    ]);
+
+    expect(Number(acquired) + Number(stopped)).toBe(1);
+    if (acquired) {
+      expect(observer.getCase('case-1')?.status).toBe('created');
+      expect(observer.getExecutionLease('case-1')).not.toBeNull();
+    } else {
+      expect(observer.getCase('case-1')?.status).toBe('stopped');
+      expect(observer.getExecutionLease('case-1')).toBeNull();
+    }
+  });
+
   it('keeps an existing non-terminal lease valid instead of reacquiring it', () => {
     const repo = openRepository(':memory:');
     insertCase(repo);
@@ -210,11 +301,13 @@ describe('SQLite execution lease', () => {
     expect(repo.heartbeatExecutionLease(
       'case-1',
       originalHash,
+      202,
       '2026-07-27T00:00:03.000Z',
     )).toBe(false);
     expect(repo.heartbeatExecutionLease(
       'case-1',
       replacementHash,
+      202,
       '2026-07-27T00:00:04.000Z',
     )).toBe(true);
     expect(repo.getExecutionLease('case-1')).toEqual({

@@ -66,3 +66,53 @@ exit 0
 
 The full test run emitted only the repository's pre-existing Windows note that
 the symlink escape test was skipped for insufficient privileges.
+
+## Full Fix Round 1
+
+Addressed the three Important review findings across the execution owner,
+Worker, and legacy stop paths.
+
+- `FORGE_RUNNER_TOKEN` is now a required Worker secret input. Fresh and
+  recovery runs forward it with the real Worker PID; the token is never logged
+  or stored as plaintext.
+- Production `CaseRunner.runCase` and human-input resume require a token.
+  Fresh runs atomically acquire an owned lease. Existing leases must atomically
+  claim an unowned (`runner_pid = 0`) matching token before work starts.
+- An executing runner heartbeats once per second. The timer is unreferenced and
+  always cleared. A normal nonterminal return releases only its own PID while
+  retaining the token lease; exceptions leave the owner for explicit transfer.
+- Lease transfer rotates the token into an unowned lease instead of recording
+  the short-lived transfer CLI PID.
+- Legacy stop is now one repository/application `BEGIN IMMEDIATE` conditional
+  CAS. Its update requires the expected status and `NOT EXISTS` lease, then
+  accepts exactly one changed row.
+
+Fix-round RED evidence:
+
+```text
+repository: 3 failed
+- claimExecutionLease is not a function
+- releaseExecutionLeaseOwner is not a function
+- stopCaseWithoutExecutionLease is not a function
+
+CaseRunner: 2 failed
+- a tokenless fresh run resolved
+- a second same-token runner resolved while the first owner was active
+
+Worker: 2 failed
+- a missing FORGE_RUNNER_TOKEN exited 0
+- a token-bearing nonterminal run persisted no lease
+```
+
+Fix-round verification:
+
+```text
+focused: 5 files passed, 55 tests passed
+full: 27 files passed, 229 tests passed
+npm run check: exit 0
+```
+
+The focused tests include real Worker-thread claim and stop/acquire races, a
+blocking FakePi run that observes owner PID and heartbeat while executing,
+Worker process secret/lifecycle checks, and real CLI process coverage. The full
+run retained only the pre-existing Windows symlink privilege skip note.

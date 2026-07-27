@@ -94,6 +94,17 @@ export interface RepositoryPort {
   acquireExecutionLease(caseId: string, lease: ExecutionLease): boolean;
   getExecutionLease(caseId: string): ExecutionLease | null;
   validateExecutionLease(caseId: string, runnerTokenSha256: string): boolean;
+  claimExecutionLease(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+    claimedAt: string,
+  ): boolean;
+  releaseExecutionLeaseOwner(
+    caseId: string,
+    runnerTokenSha256: string,
+    runnerPid: number,
+  ): boolean;
   transferExecutionLease(
     caseId: string,
     oldRunnerTokenSha256: string,
@@ -102,6 +113,7 @@ export interface RepositoryPort {
   heartbeatExecutionLease(
     caseId: string,
     runnerTokenSha256: string,
+    runnerPid: number,
     heartbeatAt: string,
   ): boolean;
   abortCaseWithExecutionLease(
@@ -111,6 +123,11 @@ export interface RepositoryPort {
     abortableStatuses: readonly CaseStatus[],
   ): ExecutionLeaseAbortResult;
   clearExecutionLease(caseId: string): void;
+  stopCaseWithoutExecutionLease(
+    caseId: string,
+    expectedStatus: CaseStatus,
+    stoppedAt: string,
+  ): boolean;
   compareAndSetCaseStatus(
     caseId: string,
     expectedStatus: CaseStatus,

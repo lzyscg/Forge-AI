@@ -345,7 +345,7 @@ export function registerCaseCommand(program: Command): void {
         const result = await runner.resumeCaseWithHumanInput(
           id,
           opts.answer,
-          { runnerToken: opts.runnerToken },
+          { runnerToken: opts.runnerToken, runnerPid: process.pid },
         );
         writeResultLine(result);
         repo.close();
@@ -412,7 +412,6 @@ export function registerCaseCommand(program: Command): void {
           id,
           opts.oldRunnerToken,
           opts.newRunnerToken,
-          process.pid,
         );
         if (!transferred) {
           throw new Error('Execution lease authorization failed');
@@ -442,43 +441,18 @@ export function registerCaseCommand(program: Command): void {
     .action((id: string, opts) => {
       try {
         const dbPath = resolveWriteDbPath(opts.db, opts.env);
-        const { repo, clock } = initInfra(dbPath);
-
-        const caseRecord = repo.getCase(id);
-        if (!caseRecord) {
-          writeErrorLine(`Case not found: ${id}`);
+        const { repo, clock, idGen } = initInfra(dbPath);
+        const service = new CaseService(repo, clock, idGen);
+        try {
+          const status = service.stopCaseWithoutLease(id);
+          if (opts.human) {
+            process.stdout.write(`Case ${id} 已停止。\n`);
+          } else {
+            writeStdoutLine({ case_id: id, status });
+          }
+        } finally {
           repo.close();
-          process.exit(1);
         }
-
-        const status = caseRecord.status as string;
-        const terminalStatuses = ['approved', 'failed', 'stopped'];
-        if (terminalStatuses.includes(status)) {
-          writeErrorLine(`Case already in terminal state: ${status}`);
-          repo.close();
-          process.exit(1);
-        }
-        if (repo.getExecutionLease(id)) {
-          writeErrorLine(
-            'Cannot stop a leased case. Use case abort with the matching runner token.',
-          );
-          repo.close();
-          process.exit(1);
-        }
-        if (status === 'running') {
-          writeErrorLine(`Cannot stop a running case. Wait for it to finish or crash.`);
-          repo.close();
-          process.exit(1);
-        }
-
-        repo.updateCase(id, { status: 'stopped', updated_at: clock.now(), completed_at: clock.now() });
-
-        if (opts.human) {
-          process.stdout.write(`Case ${id} 已停止。\n`);
-        } else {
-          writeStdoutLine({ case_id: id, status: 'stopped' });
-        }
-        repo.close();
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         writeErrorLine(msg);

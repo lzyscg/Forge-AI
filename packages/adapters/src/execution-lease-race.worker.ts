@@ -22,6 +22,19 @@ type RaceOperation =
       fields: Record<string, unknown>;
       runnerTokenSha256?: string;
       clearExecutionLease: boolean;
+    }
+  | {
+      kind: 'claim';
+      caseId: string;
+      runnerTokenSha256: string;
+      runnerPid: number;
+      claimedAt: string;
+    }
+  | {
+      kind: 'stop';
+      caseId: string;
+      expectedStatus: CaseStatus;
+      stoppedAt: string;
     };
 
 const input = workerData as {
@@ -45,6 +58,19 @@ port.once('message', (message: { type: string }) => {
       outcome = repository.acquireExecutionLease(
         input.operation.caseId,
         input.operation.lease,
+      );
+    } else if (input.operation.kind === 'claim') {
+      outcome = repository.claimExecutionLease(
+        input.operation.caseId,
+        input.operation.runnerTokenSha256,
+        input.operation.runnerPid,
+        input.operation.claimedAt,
+      );
+    } else if (input.operation.kind === 'stop') {
+      outcome = repository.stopCaseWithoutExecutionLease(
+        input.operation.caseId,
+        input.operation.expectedStatus,
+        input.operation.stoppedAt,
       );
     } else if (input.operation.kind === 'abort') {
       outcome = repository.abortCaseWithExecutionLease(

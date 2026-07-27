@@ -67,12 +67,13 @@ export interface CaseRunnerOptions {
 
 export interface RunCaseOptions {
   maxTurns?: number;
-  runnerToken?: string;
+  runnerToken: string;
   runnerPid?: number;
 }
 
 export interface ResumeCaseOptions {
-  runnerToken?: string;
+  runnerToken: string;
+  runnerPid?: number;
 }
 
 export class CaseRunner {
@@ -150,9 +151,54 @@ export class CaseRunner {
   /**
    * 运行 Case（含崩溃恢复 + 并发守卫 + Turn 循环）
    */
-  async runCase(caseId: string, opts?: RunCaseOptions): Promise<ResultJson> {
-    const maxTurns = opts?.maxTurns ?? this.maxTurns;
-    const runnerToken = opts?.runnerToken;
+  async runCase(caseId: string, opts: RunCaseOptions): Promise<ResultJson> {
+    if (!opts?.runnerToken) {
+      throw new Error('Runner token is required');
+    }
+    const runnerPid = opts.runnerPid ?? process.pid;
+    const caseRecord = this.repo.getCase(caseId);
+    if (!caseRecord) {
+      throw new Error(`Case not found: ${caseId}`);
+    }
+    const status = caseRecord.status as string;
+    if (status === 'approved' || status === 'failed' || status === 'stopped') {
+      return this.buildResultJson(caseId);
+    }
+
+    const lease = this.repo.getExecutionLease(caseId);
+    if (status === 'created' && !lease) {
+      if (!this.caseService.acquireExecutionLease(
+        caseId,
+        opts.runnerToken,
+        runnerPid,
+      )) {
+        throw new Error('Execution lease acquisition failed');
+      }
+    } else if (
+      !lease
+      || !this.caseService.claimExecutionLease(
+        caseId,
+        opts.runnerToken,
+        runnerPid,
+      )
+    ) {
+      throw new Error('Execution lease owner claim failed');
+    }
+
+    return this.executeWithLeaseOwner(
+      caseId,
+      opts.runnerToken,
+      runnerPid,
+      () => this.runCaseWithOwnedLease(caseId, opts),
+    );
+  }
+
+  private async runCaseWithOwnedLease(
+    caseId: string,
+    opts: RunCaseOptions,
+  ): Promise<ResultJson> {
+    const maxTurns = opts.maxTurns ?? this.maxTurns;
+    const runnerToken = opts.runnerToken;
 
     // 1. 终态 case → 幂等返回（不报错）
     const caseRecord = this.repo.getCase(caseId);
@@ -164,26 +210,12 @@ export class CaseRunner {
       return this.buildResultJson(caseId);
     }
 
-    let lease = this.repo.getExecutionLease(caseId);
-    if (status === 'created' && !lease && runnerToken !== undefined) {
-      const acquired = this.caseService.acquireExecutionLease(
-        caseId,
-        runnerToken,
-        opts?.runnerPid ?? process.pid,
-      );
-      if (!acquired) {
-        throw new Error('Execution lease acquisition failed');
-      }
-      lease = this.repo.getExecutionLease(caseId);
-    }
-    if (lease) {
-      if (
-        runnerToken === undefined
-        || !this.caseService.validateExecutionLease(caseId, runnerToken)
-      ) {
-        throw new Error('Execution lease authorization failed');
-      }
-    } else if (runnerToken !== undefined) {
+    const lease = this.repo.getExecutionLease(caseId);
+    if (
+      !lease
+      || lease.runner_pid !== (opts.runnerPid ?? process.pid)
+      || !this.caseService.validateExecutionLease(caseId, runnerToken)
+    ) {
       throw new Error('Execution lease authorization failed');
     }
 
@@ -283,7 +315,31 @@ export class CaseRunner {
   async resumeCaseWithHumanInput(
     caseId: string,
     answer: string,
-    opts?: ResumeCaseOptions,
+    opts: ResumeCaseOptions,
+  ): Promise<ResultJson> {
+    if (!opts?.runnerToken) {
+      throw new Error('Runner token is required');
+    }
+    const runnerPid = opts.runnerPid ?? process.pid;
+    if (!this.caseService.claimExecutionLease(
+      caseId,
+      opts.runnerToken,
+      runnerPid,
+    )) {
+      throw new Error('Execution lease owner claim failed');
+    }
+    return this.executeWithLeaseOwner(
+      caseId,
+      opts.runnerToken,
+      runnerPid,
+      () => this.resumeCaseWithHumanInputOwned(caseId, answer, opts),
+    );
+  }
+
+  private async resumeCaseWithHumanInputOwned(
+    caseId: string,
+    answer: string,
+    opts: ResumeCaseOptions,
   ): Promise<ResultJson> {
     // 并发守卫
     this.assertNoConcurrentCase(caseId);
@@ -292,7 +348,7 @@ export class CaseRunner {
     this.caseService.transitionCaseStatus(
       caseId,
       'running',
-      opts?.runnerToken,
+      opts.runnerToken,
     );
 
     // 2. 找最后 Turn 的 tool_actions 中 request_human_input 的 agent
@@ -328,11 +384,50 @@ export class CaseRunner {
       targetAgent,
       message,
       this.maxTurns,
-      opts?.runnerToken,
+      opts.runnerToken,
     );
 
     // 6. 返回 buildResultJson
     return this.buildResultJson(caseId);
+  }
+
+  private async executeWithLeaseOwner(
+    caseId: string,
+    runnerToken: string,
+    runnerPid: number,
+    execute: () => Promise<ResultJson>,
+  ): Promise<ResultJson> {
+    const heartbeat = setInterval(() => {
+      this.caseService.heartbeatExecutionLease(
+        caseId,
+        runnerToken,
+        runnerPid,
+      );
+    }, 1_000);
+    heartbeat.unref?.();
+
+    let completedNormally = false;
+    try {
+      const result = await execute();
+      completedNormally = true;
+      return result;
+    } finally {
+      clearInterval(heartbeat);
+      if (completedNormally) {
+        const status = this.repo.getCase(caseId)?.status as string | undefined;
+        if (
+          status !== 'approved'
+          && status !== 'failed'
+          && status !== 'stopped'
+        ) {
+          this.caseService.releaseExecutionLeaseOwner(
+            caseId,
+            runnerToken,
+            runnerPid,
+          );
+        }
+      }
+    }
   }
 
   /**
