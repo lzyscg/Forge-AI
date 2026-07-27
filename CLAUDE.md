@@ -86,6 +86,8 @@ npm run dev              # tsx apps/worker/src/main.ts（默认 Fake Pi + songwr
 - 仅以下情况仍需先问用户：force-push、改写已推送的历史、删除分支、涉及密钥/敏感数据的提交。
 - `data/`（*.db / pi-sessions）、`node_modules/`、`.env*`、`.claude/` 已 gitignore，不会被提交。
 
+**角色分工（用户 2026-07-27 明确）**：主 agent（我）**不直接写代码**，负责 agent 调度 + 最终质量把关 + 验收。所有开发任务开**子 agent（harness/Workflow）执行**：dev agent 写代码、review agent 审查，循环到 review 通过。主 agent 复核最终成果（跑 check/test/e2e、对照交付标准）后才声明完成、才提交。小修小补（一行 typo、文档错字）可直接做，但凡涉及多文件/逻辑改动一律走 dev+review 子 agent。
+
 ## 如何运行 / 测试
 
 **跑 Fake Pi 场景**（默认 songwriting）：
