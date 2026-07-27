@@ -1,11 +1,13 @@
 scenario:
   id: zhihu-story-outline
   name: 知乎故事大纲生产
-  version: 1
+  version: 2
 
 input_fields:
   - key: source_text
     label: 完整原始素材
+  - key: chapter_boundaries
+    label: 控制器生成的章节边界 Sidecar
   - key: production_mode
     label: 生产模式
   - key: production_requirements

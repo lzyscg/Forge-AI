@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 if os.name == "nt":
+    sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
 
 
@@ -57,7 +58,41 @@ def shared_sequences(source: str, output: str, width: int) -> list[str]:
     return matches
 
 
-def validate(packet: str, output: str, source: str | None = None, overlap_width: int = 8) -> dict:
+def quoted_spans(text: str) -> list[str]:
+    return [
+        match.strip()
+        for match in re.findall(r"“([^”\n]+)”", text)
+        if match.strip()
+    ]
+
+
+def quantified_claims(text: str) -> list[str]:
+    pattern = re.compile(
+        r"(?:\d+|[零一二三四五六七八九十百千万两]+)"
+        r"(?:年|月|日|天|小时|分钟|分|秒|科|次|个|名|场|份|条|辆|字)"
+    )
+    claims = list(dict.fromkeys(pattern.findall(text)))
+    for phrase in ("全省最高", "全国最高", "唯一一个", "所有人都", "全部人都"):
+        if phrase in text and phrase not in claims:
+            claims.append(phrase)
+    return claims
+
+
+def control_leaks(text: str) -> list[str]:
+    patterns = (
+        r"尚不可知",
+        r"不可推断",
+        r"未来答案",
+        r"后文(?:揭示|答案|真相)",
+        r"后续(?:揭示|答案|真相)",
+        r"下一章(?:揭示|答案|真相)",
+        r"禁止(?:写|出现|提及|泄露)",
+        r"不得(?:写|出现|提及|泄露)",
+    )
+    return [pattern for pattern in patterns if re.search(pattern, text)]
+
+
+def validate(packet: str, output: str, source: str | None = None, overlap_width: int = 12) -> dict:
     lower, upper = packet_range(packet)
     cjk_count = len(cjk_stream(output))
     errors: list[str] = []
@@ -76,6 +111,22 @@ def validate(packet: str, output: str, source: str | None = None, overlap_width:
                 f"正文复用参考连续 {overlap_width} 汉字："
                 + "、".join(shared_matches)
             )
+    packet_cjk = cjk_stream(packet)
+    unauthorized_quotes = [
+        quote for quote in quoted_spans(output)
+        if cjk_stream(quote) not in packet_cjk
+    ]
+    if unauthorized_quotes:
+        errors.append("未授权对话：" + "；".join(unauthorized_quotes))
+    unauthorized_claims = [
+        claim for claim in quantified_claims(output)
+        if claim not in packet
+    ]
+    if unauthorized_claims:
+        errors.append("未授权数量或绝对化结论：" + "、".join(unauthorized_claims))
+    leaks = control_leaks(output)
+    if leaks:
+        errors.append("正文含控制端措辞：" + "、".join(leaks))
     return {
         "valid": not errors,
         "cjk_count": cjk_count,
@@ -84,32 +135,48 @@ def validate(packet: str, output: str, source: str | None = None, overlap_width:
         "h1_count": h1_count,
         "shared_sequence": shared_matches[0] if shared_matches else None,
         "shared_sequences": shared_matches,
+        "unauthorized_quotes": unauthorized_quotes,
+        "unauthorized_claims": unauthorized_claims,
+        "control_leaks": leaks,
         "errors": errors,
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--packet", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--packet", type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--source", type=Path)
-    parser.add_argument("--overlap-width", type=int, default=8)
+    parser.add_argument("--overlap-width", type=int, default=12)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--normalize-ascii-quotes", action="store_true")
+    parser.add_argument("--stdin-json", action="store_true")
     args = parser.parse_args()
     try:
-        packet_text = read(args.packet)
-        output_text = read(args.output)
-        if args.normalize_ascii_quotes:
-            output_text = normalize_ascii_dialogue_quotes(output_text)
-            args.output.write_text(output_text, encoding="utf-8")
+        if args.stdin_json:
+            request = json.load(sys.stdin)
+            input_payload = request.get("input", {})
+            artifact = request.get("artifact", {})
+            packet_text = str(input_payload.get("chapter_packet", ""))
+            output_text = str(artifact.get("content", ""))
+            source_value = input_payload.get("reference_chapter_text")
+            source_text = str(source_value) if source_value is not None else None
+        else:
+            if args.packet is None or args.output is None:
+                raise OutputError("--packet and --output are required without --stdin-json")
+            packet_text = read(args.packet)
+            output_text = read(args.output)
+            source_text = read(args.source) if args.source else None
+            if args.normalize_ascii_quotes:
+                output_text = normalize_ascii_dialogue_quotes(output_text)
+                args.output.write_text(output_text, encoding="utf-8")
         result = validate(
             packet_text,
             output_text,
-            read(args.source) if args.source else None,
+            source_text,
             args.overlap_width,
         )
-    except (OSError, OutputError) as exc:
+    except (OSError, OutputError, json.JSONDecodeError, AttributeError) as exc:
         result = {"valid": False, "errors": [str(exc)]}
     payload = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     if args.json_out:

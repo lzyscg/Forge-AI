@@ -1,9 +1,11 @@
 scenario:
   id: zhihu-story-final
   name: 知乎故事全文终审
-  version: 1
+  version: 2
 
 input_fields:
+  - key: assembled_manuscript
+    label: 控制器确定性组装的冻结正文
   - key: blueprint_bundle
     label: 已交付的大纲与稳定契约
   - key: approved_chapters

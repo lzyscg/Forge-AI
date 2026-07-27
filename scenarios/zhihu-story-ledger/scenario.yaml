@@ -1,7 +1,7 @@
 scenario:
   id: zhihu-story-ledger
   name: 知乎故事状态账本
-  version: 1
+  version: 2
 
 input_fields:
   - key: chapter_id

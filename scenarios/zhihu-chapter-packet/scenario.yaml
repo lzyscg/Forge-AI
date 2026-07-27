@@ -1,15 +1,21 @@
 scenario:
   id: zhihu-chapter-packet
   name: 知乎故事章节执行包
-  version: 1
+  version: 3
 
 input_fields:
   - key: chapter_id
     label: 章节 ID
   - key: chapter_label
     label: 章节标签
+  - key: chapter_boundary
+    label: 当前章节机械边界
+  - key: reference_chapter_text
+    label: 当前章节参考原文（仅供去重审核）
   - key: blueprint_bundle
     label: 已交付的大纲与稳定契约
+  - key: blueprint_sidecar
+    label: 大纲结构化 Sidecar
   - key: previous_ledger
     label: 上一章已验收状态账本
   - key: previous_chapter_ending
