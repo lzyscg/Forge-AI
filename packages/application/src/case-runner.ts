@@ -21,6 +21,7 @@ import type {
   ResultGate,
   ResultGateCheck,
   GateCheckResult,
+  ArtifactValidatorPort,
 } from '@forge-ai/contracts';
 import { CaseService } from './case-service.js';
 import { TurnExecutor } from './turn-executor.js';
@@ -55,6 +56,7 @@ export interface CaseRunnerOptions {
   configLoader: ConfigLoaderPort;
   toolDefinitions: PiToolDefinition[];
   logger: Logger;
+  artifactValidator?: ArtifactValidatorPort;
   maxTurns?: number; // 默认 20
 }
 
@@ -86,7 +88,13 @@ export class CaseRunner {
     this.maxTurns = opts.maxTurns ?? 20;
 
     this.caseService = new CaseService(opts.repo, opts.clock, opts.idGen);
-    this.turnExecutor = new TurnExecutor(opts.repo, opts.clock, opts.idGen, opts.pi);
+    this.turnExecutor = new TurnExecutor(
+      opts.repo,
+      opts.clock,
+      opts.idGen,
+      opts.pi,
+      opts.artifactValidator,
+    );
     this.recoveryService = new RecoveryService(opts.repo, opts.clock);
 
     // 注册上下文解析器（闭包捕获 repo，FakePi 用于动态替换脚本占位符）

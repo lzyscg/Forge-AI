@@ -9,8 +9,8 @@ import type { CaseStatus } from '@forge-ai/contracts';
 const VALID_TRANSITIONS: Record<CaseStatus, CaseStatus[]> = {
   created: ['running', 'failed', 'stopped'],
   running: ['waiting_review', 'repairing', 'waiting_recovery', 'waiting_human', 'approved', 'failed', 'stopped'],
-  waiting_review: ['running', 'repairing', 'approved', 'failed', 'stopped'],
-  repairing: ['running', 'waiting_review', 'failed', 'stopped'],
+  waiting_review: ['running', 'repairing', 'waiting_human', 'approved', 'failed', 'stopped'],
+  repairing: ['running', 'waiting_review', 'waiting_human', 'failed', 'stopped'],
   waiting_recovery: ['running', 'failed', 'stopped'],
   waiting_human: ['running', 'failed', 'stopped'],
   approved: [],

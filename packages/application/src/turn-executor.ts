@@ -20,6 +20,7 @@ import type {
   ScenarioConfig,
   ToolName,
   TurnStatus,
+  ArtifactValidatorPort,
 } from '@forge-ai/contracts';
 import { transitionTurn } from '@forge-ai/domain';
 import { ToolExecutor, type ToolExecutionContext } from './tool-executor.js';
@@ -52,8 +53,9 @@ export class TurnExecutor {
     private clock: ClockPort,
     private idGen: IdGeneratorPort,
     private pi: PiPort,
+    artifactValidator?: ArtifactValidatorPort,
   ) {
-    this.toolExecutor = new ToolExecutor(repo, clock, idGen);
+    this.toolExecutor = new ToolExecutor(repo, clock, idGen, artifactValidator);
     this.contextBuilder = new ContextBuilder(repo, clock, idGen);
   }
 

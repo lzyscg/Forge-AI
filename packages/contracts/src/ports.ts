@@ -2,7 +2,7 @@
  * 端口接口定义（铁律 5：application 层通过端口调用外部实现，不直接碰具体实现）
  */
 
-import type { ScenarioConfig } from './scenario.js';
+import type { DeliveryValidatorConfig, ScenarioConfig } from './scenario.js';
 import type { ToolName } from './tools.js';
 
 // === Pi 端口 ===
@@ -175,4 +175,21 @@ export interface IdGeneratorPort {
 export interface ConfigLoaderPort {
   loadScenario(path: string): ScenarioConfig;
   loadPrompt(path: string): string;
+}
+
+// === Scenario-owned deterministic delivery validation ===
+export interface ArtifactValidationRequest {
+  validator: DeliveryValidatorConfig;
+  artifactType: string;
+  artifactContent: string;
+  inputPayload: Record<string, unknown>;
+}
+
+export interface ArtifactValidationResult {
+  passed: boolean;
+  detail: string;
+}
+
+export interface ArtifactValidatorPort {
+  validate(request: ArtifactValidationRequest): ArtifactValidationResult;
 }

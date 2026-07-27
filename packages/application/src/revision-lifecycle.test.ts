@@ -276,6 +276,37 @@ describe('7.3 非法 issue_ids（5.3：route_message 校验引用完整性）', 
     expect(ri[0].status).toBe('issued');
   });
 
+  it('漏填 issue_ids 时只绑定同一审核消息刚创建的 minor Issue', () => {
+    seedIssue(repo, clock, caseId, 'issue_current_minor', v1, 'open', 'minor');
+    repo.updateIssue('issue_current_minor', { evaluation_message_id: 'msg_current' });
+
+    const result = toolExecutor.execute(
+      'route_message',
+      {
+        target_agent: 'generator',
+        instruction: '修复当前审核发现',
+        scope: { editable_anchors: ['line:2'], frozen_anchors: ['line:1', 'line:3'] },
+        reason: '当前 minor 问题也需要返修',
+      },
+      {
+        caseId,
+        turnId: 'turn_current',
+        sessionId: 'sess',
+        agentKey: 'supervisor',
+        messageId: 'msg_current',
+        scenarioConfig: SCENARIO,
+      },
+    ) as Record<string, unknown>;
+
+    expect(result.success).toBe(true);
+    const instructions = repo.getRevisionInstructionsByCase(caseId);
+    expect(instructions).toHaveLength(1);
+    expect(JSON.parse(instructions[0].issue_ids as string)).toEqual(['issue_current_minor']);
+    expect(instructions[0].target_artifact_version_id).toBe(v1);
+    expect(repo.getIssue('issue_current_minor')?.status).toBe('repairing');
+    expect(repo.getIssue('issue_open')?.status).toBe('open');
+  });
+
   it('混合合法/非法 -> 整体失败，不写指令不改状态', () => {
     const result = callRoute(['issue_open', 'issue_nonexistent']);
     expect(result.success).toBe(false);

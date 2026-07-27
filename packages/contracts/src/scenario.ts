@@ -46,6 +46,14 @@ export const ArtifactTypeConfigSchema = Type.Object({
   diff: Type.Literal('line'),
 });
 
+export const DeliveryValidatorConfigSchema = Type.Object({
+  id: Type.String({ minLength: 1 }),
+  command: Type.String({ minLength: 1 }),
+  entrypoint: Type.String({ minLength: 1 }),
+  args: Type.Optional(Type.Array(Type.String())),
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 1, maximum: 300_000 })),
+});
+
 // ─── Root Schema ───────────────────────────────────────────────────────────────
 
 export const ScenarioSchema = Type.Object({
@@ -62,6 +70,7 @@ export const ScenarioSchema = Type.Object({
   artifact_types: Type.Array(ArtifactTypeConfigSchema),
   delivery: Type.Object({
     deliverable_artifact_type: Type.String(),
+    validators: Type.Optional(Type.Array(DeliveryValidatorConfigSchema)),
   }),
 });
 
@@ -74,6 +83,7 @@ export type SessionPolicy = Static<typeof SessionPolicySchema>;
 export type RouteConfig = Static<typeof RouteConfigSchema>;
 export type ContextRule = Static<typeof ContextRuleSchema>;
 export type ArtifactTypeConfig = Static<typeof ArtifactTypeConfigSchema>;
+export type DeliveryValidatorConfig = Static<typeof DeliveryValidatorConfigSchema>;
 
 // ─── Runtime Validation ────────────────────────────────────────────────────────
 
