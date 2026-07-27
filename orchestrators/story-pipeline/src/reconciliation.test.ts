@@ -637,6 +637,48 @@ describe('stage reconciliation', () => {
     ]);
   });
 
+  it('prepares replacement evidence without activating or delivering the candidate', () => {
+    const fixture = materializationFixture();
+    const oldRecord: StageRecordV21 = {
+      ...parentRecord(),
+      record_id: 'draft-b001-v1',
+      stage_key: fixture.plan.stage_key,
+      stage: fixture.plan.stage,
+      template: fixture.candidate.template,
+      case_id: 'case-old-draft',
+      parent_record_ids: [...fixture.plan.parent_record_ids],
+      parent_case_ids: ['case-packet'],
+      input_sha256: 'old-input',
+      artifact_type: fixture.plan.expected_artifact_type,
+    };
+    fixture.manifest.stages.push(oldRecord);
+    fixture.candidate.outcome = 'running';
+    const beforeEvents = fixture.manifest.events.length;
+
+    const candidate = materializeDeliveredArtifact({
+      run_dir: fixture.runDirectory,
+      manifest: fixture.manifest,
+      plan: fixture.plan,
+      attempt: fixture.candidate,
+      snapshot: fixture.snapshot,
+      validate: fixture.validate,
+      activation: 'candidate',
+      completed_at: '2026-07-27T01:00:00.000Z',
+    });
+
+    expect(candidate.record_id).toBe('draft-b001-v2');
+    expect(fixture.manifest.stages).toEqual([parentRecord(), oldRecord]);
+    expect(fixture.candidate.outcome).toBe('running');
+    expect(fixture.candidate.raw_artifact_path).toBeNull();
+    expect(fixture.manifest.events).toHaveLength(beforeEvents);
+    expect(materializedEvidencePaths(fixture.runDirectory).every(existsSync))
+      .toBe(false);
+    expect(existsSync(join(
+      fixture.runDirectory,
+      'materialized/draft-b001-v2/artifact.md',
+    ))).toBe(true);
+  });
+
   it('materializes an adopted case once and returns the same record without rewriting', () => {
     const runDirectory = mkdtempSync(join(tmpdir(), 'forge-reconcile-'));
     temporaryDirectories.push(runDirectory);

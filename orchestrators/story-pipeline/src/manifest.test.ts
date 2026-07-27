@@ -19,8 +19,10 @@ import {
   loadManifest,
   persistRunnerCredential,
   saveManifestCas,
+  validateManifestChain,
   type PipelineManifestV21,
   type StageAttemptV21,
+  type StageRecordV21,
 } from './manifest.js';
 
 const roots: string[] = [];
@@ -103,6 +105,39 @@ function runningAttempt(): StageAttemptV21 {
     started_at: '2026-07-27T00:00:00.000Z',
     updated_at: '2026-07-27T00:00:00.000Z',
     detail: null,
+  };
+}
+
+function deliveredRecord(recordId = 'stage-1-v1'): StageRecordV21 {
+  return {
+    record_id: recordId,
+    revision: 1,
+    stage_key: 'stage-1',
+    stage: 'generic-stage',
+    chapter_id: null,
+    template: 'generic-template',
+    template_identity: {
+      algorithm: 'source-tree-sha256-v2',
+      content_sha256: 'template-hash',
+      equivalence: 'verified',
+    },
+    case_id: 'case-1',
+    parent_record_ids: [],
+    parent_case_ids: [],
+    status: 'delivered',
+    input_path: 'inputs/stage-1.json',
+    input_sha256: 'input-hash',
+    raw_artifact_path: 'raw/stage-1.md',
+    raw_artifact_sha256: 'raw-hash',
+    artifact_path: 'artifacts/stage-1.md',
+    artifact_sha256: 'artifact-hash',
+    sidecar_path: 'structured/stage-1.json',
+    sidecar_sha256: 'sidecar-hash',
+    validation_report_path: 'validation/stage-1.json',
+    validation_report_sha256: 'validation-hash',
+    artifact_type: 'generic-artifact',
+    artifact_version: 1,
+    completed_at: '2026-07-27T00:00:02.000Z',
   };
 }
 
@@ -251,6 +286,7 @@ describe('loadManifest', () => {
     expect(
       migrated.attempts[0]?.expected_scenario_snapshot_sha256,
     ).toBeNull();
+    expect(migrated.replacements).toEqual([]);
   });
 
   it('marks a pre-field schema 2.1 attempt scenario identity as unavailable', () => {
@@ -267,6 +303,80 @@ describe('loadManifest', () => {
     expect(
       loaded.attempts[0]?.expected_scenario_snapshot_sha256,
     ).toBeNull();
+  });
+});
+
+describe('replacement manifest invariants', () => {
+  it('rejects a pending candidate that leaked into active stages', () => {
+    const manifest = emptyManifest();
+    const old = deliveredRecord();
+    const candidate = {
+      ...deliveredRecord('stage-1-v2'),
+      revision: 2,
+      case_id: 'case-2',
+      input_sha256: 'new-input',
+    };
+    manifest.stages.push(old, candidate);
+    manifest.invalidations.push({
+      invalidation_id: 'inv-candidate',
+      record_id: candidate.record_id,
+      stage_key: candidate.stage_key,
+      reason: 'fixture',
+      root_record_id: candidate.record_id,
+      invalidated_at: '2026-07-27T00:00:03.000Z',
+    });
+    manifest.replacements.push({
+      replacement_id: 'replacement-1',
+      stage_key: old.stage_key,
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      attempt_id: 'attempt-2',
+      status: 'pending',
+      candidate_record: candidate,
+      reason: 'input changed',
+    });
+
+    expect(() => validateManifestChain(manifest)).toThrow(
+      'pending replacement candidate is already registered',
+    );
+  });
+
+  it('rejects a committed replacement without atomic old invalidation', () => {
+    const manifest = emptyManifest();
+    const old = deliveredRecord();
+    const candidate = {
+      ...deliveredRecord('stage-1-v2'),
+      revision: 2,
+      case_id: 'case-2',
+      input_sha256: 'new-input',
+    };
+    manifest.stages.push(old, candidate);
+    manifest.invalidations.push({
+      invalidation_id: 'inv-candidate',
+      record_id: candidate.record_id,
+      stage_key: candidate.stage_key,
+      reason: 'fixture',
+      root_record_id: candidate.record_id,
+      invalidated_at: '2026-07-27T00:00:03.000Z',
+    });
+    manifest.replacements.push({
+      replacement_id: 'replacement-1',
+      stage_key: old.stage_key,
+      old_record_id: old.record_id,
+      expected_input_sha256: candidate.input_sha256,
+      expected_template_identity: candidate.template_identity,
+      expected_parent_record_ids: [],
+      attempt_id: 'attempt-2',
+      status: 'committed',
+      candidate_record: candidate,
+      reason: 'input changed',
+    });
+
+    expect(() => validateManifestChain(manifest)).toThrow(
+      'committed replacement old record is still active',
+    );
   });
 });
 

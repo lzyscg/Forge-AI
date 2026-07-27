@@ -338,6 +338,95 @@ export function validateManifestChain(manifest: PipelineManifestV21): void {
       throw new Error(`invalidation references missing record: ${invalidation.record_id}`);
     }
   }
+  const replacementIds = new Set<string>();
+  const pendingReplacementStages = new Set<string>();
+  const recordsById = new Map(
+    manifest.stages.map((record) => [record.record_id, record]),
+  );
+  const dependsOn = (record: StageRecordV21, ancestorId: string): boolean => {
+    const pending = [...record.parent_record_ids];
+    const visited = new Set<string>();
+    while (pending.length > 0) {
+      const recordId = pending.pop()!;
+      if (recordId === ancestorId) return true;
+      if (visited.has(recordId)) continue;
+      visited.add(recordId);
+      const parent = recordsById.get(recordId);
+      if (parent) pending.push(...parent.parent_record_ids);
+    }
+    return false;
+  };
+  for (const replacement of manifest.replacements) {
+    if (replacementIds.has(replacement.replacement_id)) {
+      throw new Error(
+        `manifest contains duplicate replacement: ${replacement.replacement_id}`,
+      );
+    }
+    replacementIds.add(replacement.replacement_id);
+    const oldRecord = recordsById.get(replacement.old_record_id);
+    if (!oldRecord || oldRecord.stage_key !== replacement.stage_key) {
+      throw new Error('replacement references a missing old record');
+    }
+    const candidate = replacement.candidate_record;
+    if (candidate) {
+      if (
+        candidate.stage_key !== replacement.stage_key
+        || candidate.input_sha256 !== replacement.expected_input_sha256
+        || canonicalJson(candidate.template_identity)
+          !== canonicalJson(replacement.expected_template_identity)
+        || canonicalJson(candidate.parent_record_ids)
+          !== canonicalJson(replacement.expected_parent_record_ids)
+      ) {
+        throw new Error('replacement candidate identity does not match');
+      }
+      if (
+        replacement.status !== 'committed'
+        && recordIds.has(candidate.record_id)
+      ) {
+        throw new Error(
+          `${replacement.status} replacement candidate is already registered`,
+        );
+      }
+    }
+    if (replacement.status === 'pending') {
+      if (pendingReplacementStages.has(replacement.stage_key)) {
+        throw new Error(
+          `stage ${replacement.stage_key} has multiple pending replacements`,
+        );
+      }
+      pendingReplacementStages.add(replacement.stage_key);
+      if (activeByStage.get(replacement.stage_key) !== replacement.old_record_id) {
+        throw new Error('pending replacement old record is not active');
+      }
+      if (candidate && replacement.attempt_id === null) {
+        throw new Error('pending replacement candidate has no attempt');
+      }
+    }
+    if (replacement.status === 'committed') {
+      if (!candidate || replacement.attempt_id === null) {
+        throw new Error('committed replacement has incomplete evidence');
+      }
+      if (!recordIds.has(candidate.record_id)) {
+        throw new Error('committed replacement candidate is not registered');
+      }
+      if (!invalidated.has(replacement.old_record_id)) {
+        throw new Error('committed replacement old record is still active');
+      }
+      if (
+        invalidated.has(candidate.record_id)
+        || activeByStage.get(replacement.stage_key) !== candidate.record_id
+      ) {
+        throw new Error('committed replacement candidate is not active');
+      }
+      if (manifest.stages.some(
+        (record) =>
+          !invalidated.has(record.record_id)
+          && dependsOn(record, replacement.old_record_id),
+      )) {
+        throw new Error('committed replacement descendant is still active');
+      }
+    }
+  }
 
   let previousHash: string | null = null;
   for (let index = 0; index < manifest.events.length; index += 1) {

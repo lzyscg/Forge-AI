@@ -64,6 +64,7 @@ export interface MaterializeDeliveredArtifactOptions {
   attempt: StageAttemptV21;
   snapshot: ForgeCaseSnapshot;
   validate: (rawContent: string) => ValidationResult;
+  activation?: 'active' | 'candidate';
   completed_at?: string;
   fs_ops?: Partial<MaterializationFsOps>;
 }
@@ -517,7 +518,13 @@ export function materializeDeliveredArtifact(
     case_id: attempt.case_id,
     artifact_version_id: artifactVersionId,
   }));
-  const existing = manifest.stages.find((record) =>
+  const knownRecords = [
+    ...manifest.stages,
+    ...manifest.replacements.flatMap((replacement) =>
+      replacement.candidate_record ? [replacement.candidate_record] : []
+    ),
+  ];
+  const existing = knownRecords.find((record) =>
     (record as Partial<MaterializedStageRecord>).materialization_key
       === materializationKey) as MaterializedStageRecord | undefined;
   if (existing) {
@@ -548,10 +555,13 @@ export function materializeDeliveredArtifact(
     return existing;
   }
 
-  if (manifest.stages.some(
+  if (
+    (options.activation ?? 'active') === 'active'
+    && manifest.stages.some(
     (record) =>
       record.stage_key === plan.stage_key && !invalidated.has(record.record_id),
-  )) {
+    )
+  ) {
     throw new Error(`stage already has an active record: ${plan.stage_key}`);
   }
 
@@ -586,7 +596,7 @@ export function materializeDeliveredArtifact(
 
   const revision = Math.max(
     0,
-    ...manifest.stages
+    ...knownRecords
       .filter((record) => record.stage_key === plan.stage_key)
       .map((record) => record.revision),
   ) + 1;
@@ -742,6 +752,7 @@ export function materializeDeliveredArtifact(
     materialization_key: materializationKey,
     completed_at: completedAt,
   };
+  if (options.activation === 'candidate') return record;
   const beforeOutcome = attempt.outcome;
   attempt.outcome = 'delivered';
   attempt.raw_artifact_path = rawArtifactPath;

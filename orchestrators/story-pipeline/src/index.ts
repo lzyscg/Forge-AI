@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -28,6 +29,16 @@ import {
   type StagePlan,
 } from './reconciliation.js';
 import { descendantClosure } from './invalidation.js';
+import {
+  activeForConsumption,
+  beginReplacement,
+  bindReplacementAttempt,
+  cancelReplacement,
+  commitReplacement,
+  prepareReplacementCandidate,
+  replacementTarget,
+  type BeginReplacementInput,
+} from './replacement.js';
 import {
   appendManifestEvent,
   clearRunnerCredential,
@@ -427,6 +438,126 @@ function saveManifest(runDir: string, manifest: PipelineManifest): void {
   Object.assign(manifest, saved);
 }
 
+function persistReplacementMutation(
+  manifestPath: string,
+  mutate: (manifest: PipelineManifest) => void,
+): PipelineManifest {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const latest = loadManifest(manifestPath);
+    const probe = structuredClone(latest);
+    const beforeEvents = probe.events.length;
+    mutate(probe);
+    if (probe.events.length === beforeEvents) return latest;
+    try {
+      return saveManifestCas(
+        manifestPath,
+        latest.revision,
+        mutate,
+      );
+    } catch (error) {
+      if (
+        attempt < 3
+        && error instanceof Error
+        && error.message.startsWith('manifest revision conflict:')
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error('replacement Manifest CAS retry limit exceeded');
+}
+
+export function persistPendingReplacement(
+  manifestPath: string,
+  input: BeginReplacementInput,
+): PipelineManifest {
+  const at = input.at ?? new Date().toISOString();
+  return persistReplacementMutation(manifestPath, (manifest) => {
+    beginReplacement(manifest, { ...input, at });
+  });
+}
+
+export function persistReplacementAttempt(
+  manifestPath: string,
+  replacementId: string,
+  attemptId: string,
+  at = new Date().toISOString(),
+): PipelineManifest {
+  return persistReplacementMutation(manifestPath, (manifest) => {
+    bindReplacementAttempt(manifest, replacementId, attemptId, at);
+  });
+}
+
+export function persistReplacementCandidate(
+  manifestPath: string,
+  replacementId: string,
+  attemptId: string,
+  candidate: StageRecord,
+  at = new Date().toISOString(),
+): PipelineManifest {
+  return persistReplacementMutation(manifestPath, (manifest) => {
+    prepareReplacementCandidate(
+      manifest,
+      replacementId,
+      attemptId,
+      candidate,
+      at,
+    );
+  });
+}
+
+export function persistReplacementCancellation(
+  manifestPath: string,
+  replacementId: string,
+  reason: string,
+  at = new Date().toISOString(),
+): PipelineManifest {
+  return persistReplacementMutation(manifestPath, (manifest) => {
+    cancelReplacement(manifest, replacementId, reason, at);
+  });
+}
+
+export function persistReplacementCommit(
+  manifestPath: string,
+  replacementId: string,
+  expectedRevision: number,
+  at = new Date().toISOString(),
+): PipelineManifest {
+  const latest = loadManifest(manifestPath);
+  const existing = latest.replacements.find(
+    (replacement) => replacement.replacement_id === replacementId,
+  );
+  if (existing?.status === 'committed') return latest;
+  try {
+    return saveManifestCas(manifestPath, expectedRevision, (manifest) => {
+      commitReplacement(manifest, replacementId, at);
+    });
+  } catch (error) {
+    const afterFailure = loadManifest(manifestPath);
+    const replacement = afterFailure.replacements.find(
+      (item) => item.replacement_id === replacementId,
+    );
+    if (replacement?.status === 'committed') return afterFailure;
+    if (replacement?.status === 'pending') {
+      try {
+        persistReplacementCancellation(
+          manifestPath,
+          replacementId,
+          'replacement commit precondition failed',
+          at,
+        );
+      } catch (cancellationError) {
+        throw new AggregateError(
+          [error, cancellationError],
+          'replacement commit and cancellation both failed',
+        );
+      }
+    }
+    throw error;
+  }
+}
+
 function invalidatedRecordIds(manifest: PipelineManifest): Set<string> {
   return new Set(manifest.invalidations.map((item) => item.record_id));
 }
@@ -538,6 +669,12 @@ function existingStage(
 ): StageRecord | null {
   const record = activeStage(manifest, spec.key);
   if (!record) return null;
+  const pendingReplacement = replacementTarget(manifest, spec.key);
+  if (!activeForConsumption(manifest, spec.key) && !pendingReplacement) {
+    throw new Error(
+      `阶段 ${spec.key} 被上游 pending replacement 阻止启动`,
+    );
+  }
   const intendedInputHash = sha256(canonicalJson(spec.input));
   const intendedParents = spec.parents.map((parent) => parent.record_id);
   const changeReasons: string[] = [];
@@ -560,11 +697,26 @@ function existingStage(
     changeReasons.push('阶段输入变化');
   }
   if (changeReasons.length > 0) {
-    const reason = `${spec.key} 自动失效：${changeReasons.join('、')}`;
-    const affected = invalidateStageAndDescendants(manifest, record, reason);
-    saveManifest(runDir, manifest);
-    process.stdout.write(`[invalidate] ${affected.map((item) => item.record_id).join(', ')}\n`);
+    const reason = `${spec.key} replacement pending：${changeReasons.join('、')}`;
+    const beforeEvents = manifest.events.length;
+    const replacement = beginReplacement(manifest, {
+      stage_key: spec.key,
+      old_record_id: record.record_id,
+      expected_input_sha256: intendedInputHash,
+      expected_template_identity: spec.templateIdentity,
+      expected_parent_record_ids: intendedParents,
+      reason,
+    });
+    if (manifest.events.length > beforeEvents) saveManifest(runDir, manifest);
+    process.stdout.write(
+      `[replace] ${record.record_id} -> ${replacement.replacement_id} pending\n`,
+    );
     return null;
+  }
+  if (pendingReplacement) {
+    throw new Error(
+      `阶段 ${spec.key} 有与当前计划不一致的 pending replacement`,
+    );
   }
 
   const inputPath = resolve(runDir, record.input_path);
@@ -644,10 +796,16 @@ async function executeStageUnlocked(
   }
 
   const inputHash = sha256(canonicalJson(spec.input));
+  const pendingReplacement = replacementTarget(manifest, spec.key);
+  const intendedParentRecordIds = spec.parents.map(
+    (parent) => parent.record_id,
+  );
   const resumableAttempts = [...manifest.attempts].reverse().filter(
     (attempt) =>
       attempt.stage_key === spec.key &&
       attempt.input_sha256 === inputHash &&
+      canonicalJson(attempt.parent_record_ids)
+        === canonicalJson(intendedParentRecordIds) &&
       ['running', 'interrupted', 'blocked'].includes(attempt.outcome),
   );
   if (resumableAttempts.some(
@@ -664,11 +822,24 @@ async function executeStageUnlocked(
       `阶段 ${spec.key} 的旧 Attempt 缺少 scenario snapshot 身份，需要 Task 8 显式证明`,
     );
   }
-  const reusableAttempt = resumableAttempts.find(
-    (attempt) =>
-      compareTemplateIdentity(attempt.template_identity, spec.templateIdentity) === 'equal' &&
-      attempt.template === spec.template,
-  );
+  const reusableAttempt = pendingReplacement?.attempt_id
+    ? resumableAttempts.find(
+        (attempt) => attempt.attempt_id === pendingReplacement.attempt_id,
+      )
+    : resumableAttempts.find(
+        (attempt) =>
+          compareTemplateIdentity(
+            attempt.template_identity,
+            spec.templateIdentity,
+          ) === 'equal'
+          && attempt.template === spec.template,
+      );
+  if (pendingReplacement?.attempt_id && !reusableAttempt) {
+    throw new Error(
+      `pending replacement ${pendingReplacement.replacement_id} `
+      + `cannot recover attempt ${pendingReplacement.attempt_id}`,
+    );
+  }
 
   let attempt: StageAttempt;
   let caseId: string;
@@ -685,6 +856,14 @@ async function executeStageUnlocked(
     }
     attempt = reusableAttempt;
     caseId = attempt.case_id;
+    if (pendingReplacement && pendingReplacement.attempt_id === null) {
+      bindReplacementAttempt(
+        manifest,
+        pendingReplacement.replacement_id,
+        attempt.attempt_id,
+      );
+      saveManifest(options.runDir, manifest);
+    }
     process.stdout.write(`[resume] ${spec.key} -> ${caseId}\n`);
   } else {
     const attemptNumber = manifest.attempts.filter((item) => item.stage_key === spec.key).length + 1;
@@ -724,7 +903,7 @@ async function executeStageUnlocked(
       expected_scenario_snapshot_sha256: scenarioSnapshotSha256,
       case_id: caseId,
       input_sha256: inputHash,
-      parent_record_ids: spec.parents.map((parent) => parent.record_id),
+      parent_record_ids: intendedParentRecordIds,
       template_identity: spec.templateIdentity,
       runner_token_sha256: null,
       runner_credential_path: null,
@@ -746,6 +925,13 @@ async function executeStageUnlocked(
       'running',
       'Forge Case created',
     );
+    if (pendingReplacement) {
+      bindReplacementAttempt(
+        manifest,
+        pendingReplacement.replacement_id,
+        attempt.attempt_id,
+      );
+    }
     saveManifest(options.runDir, manifest);
   }
 
@@ -801,6 +987,28 @@ async function executeStageUnlocked(
     saveManifest(options.runDir, manifest);
     throw new Error(`阶段 ${spec.key} 未返回有效结果`);
   }
+  if (signal.aborted && pendingReplacement) {
+    const beforeOutcome = attempt.outcome;
+    attempt.outcome = 'failed';
+    attempt.updated_at = new Date().toISOString();
+    attempt.detail = 'replacement execution cancelled';
+    clearRunnerCredential(options.runDir, attempt);
+    cancelReplacement(
+      manifest,
+      pendingReplacement.replacement_id,
+      attempt.detail,
+    );
+    appendAttemptEvent(
+      manifest,
+      'stage_failed',
+      attempt,
+      beforeOutcome,
+      'failed',
+      attempt.detail,
+    );
+    saveManifest(options.runDir, manifest);
+    throw new Error(`阶段 ${spec.key} replacement 已取消`);
+  }
   if (!result.success || result.status !== 'approved' || !result.final_artifact) {
     const beforeOutcome = attempt.outcome;
     const plan: StagePlan = {
@@ -836,6 +1044,13 @@ async function executeStageUnlocked(
       : result.error ?? `Forge status=${result.status}`;
     if (attempt.outcome === 'failed') {
       clearRunnerCredential(options.runDir, attempt);
+      if (pendingReplacement) {
+        cancelReplacement(
+          manifest,
+          pendingReplacement.replacement_id,
+          attempt.detail,
+        );
+      }
     }
     appendAttemptEvent(
       manifest,
@@ -876,6 +1091,7 @@ async function executeStageUnlocked(
       attempt,
       snapshot: result,
       validate: spec.validate,
+      activation: pendingReplacement ? 'candidate' : 'active',
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -884,6 +1100,13 @@ async function executeStageUnlocked(
     attempt.updated_at = new Date().toISOString();
     attempt.detail = message;
     clearRunnerCredential(options.runDir, attempt);
+    if (pendingReplacement) {
+      cancelReplacement(
+        manifest,
+        pendingReplacement.replacement_id,
+        message,
+      );
+    }
     appendAttemptEvent(
       manifest,
       'stage_validation_failed',
@@ -900,6 +1123,35 @@ async function executeStageUnlocked(
     );
     saveManifest(options.runDir, manifest);
     throw new Error(`阶段 ${spec.key} 未通过机械门禁: ${attempt.detail}`);
+  }
+  if (pendingReplacement) {
+    prepareReplacementCandidate(
+      manifest,
+      pendingReplacement.replacement_id,
+      attempt.attempt_id,
+      record,
+    );
+    saveManifest(options.runDir, manifest);
+    if (attempt.runner_credential_path !== null) {
+      const credentialPath = resolve(
+        options.runDir,
+        attempt.runner_credential_path,
+      );
+      ensureInsideRunDir(options.runDir, credentialPath);
+      rmSync(credentialPath, { force: true });
+    }
+    const committed = persistReplacementCommit(
+      join(options.runDir, 'manifest.json'),
+      pendingReplacement.replacement_id,
+      manifest.revision,
+    );
+    Object.assign(manifest, committed);
+    const committedRecord = activeForConsumption(manifest, spec.key);
+    if (!committedRecord || committedRecord.record_id !== record.record_id) {
+      throw new Error(`阶段 ${spec.key} replacement commit 未激活候选记录`);
+    }
+    process.stdout.write(`[done] ${record.record_id} -> ${caseId}\n`);
+    return committedRecord;
   }
   clearRunnerCredential(options.runDir, attempt);
   saveManifest(options.runDir, manifest);
@@ -1342,6 +1594,22 @@ export async function reconcileRun(
       );
       if (stageAttempts.length === 0) continue;
       const plan = stagePlanFromAttempts(config, manifest, stageAttempts);
+      const pendingReplacement = replacementTarget(
+        manifest,
+        plan.stage_key,
+      );
+      if (
+        pendingReplacement?.attempt_id
+        && options.adoptCase
+        && stageAttempts.find(
+          (attempt) => attempt.attempt_id === pendingReplacement.attempt_id,
+        )?.case_id !== options.adoptCase
+      ) {
+        throw new Error(
+          `pending replacement ${pendingReplacement.replacement_id} `
+          + 'cannot adopt a different Case',
+        );
+      }
     const snapshots = new Map<string, ForgeCaseSnapshot>();
     for (const attempt of stageAttempts) {
       snapshots.set(
@@ -1353,7 +1621,14 @@ export async function reconcileRun(
       plan,
       stageAttempts,
       snapshots,
-      options.adoptCase,
+      options.adoptCase ?? (
+        pendingReplacement?.attempt_id
+          ? stageAttempts.find(
+              (attempt) =>
+                attempt.attempt_id === pendingReplacement.attempt_id,
+            )?.case_id
+          : undefined
+      ),
       );
       actions.push(...stageActions);
       if (options.dryRun) continue;
@@ -1401,6 +1676,16 @@ export async function reconcileRun(
           attempt.detail = action.reason;
           if (outcome === 'failed') {
             clearRunnerCredential(options.runDir, attempt);
+            if (
+              pendingReplacement?.attempt_id === attempt.attempt_id
+              && pendingReplacement.status === 'pending'
+            ) {
+              cancelReplacement(
+                manifest,
+                pendingReplacement.replacement_id,
+                action.reason,
+              );
+            }
           }
           appendAttemptEvent(
             manifest,
@@ -1436,22 +1721,85 @@ export async function reconcileRun(
           if (!snapshot) {
             throw new Error(`Forge snapshot is missing: ${action.case_id}`);
           }
-          materializeDeliveredArtifact({
-            run_dir: options.runDir,
-            manifest,
-            plan,
-            attempt,
-            snapshot,
-            validate: validators[plan.stage_key]
-              ?? recoveryValidatorFromEvidence(
-                config,
-                manifest,
-                attempt,
+          let record: StageRecord;
+          try {
+            record = materializeDeliveredArtifact({
+              run_dir: options.runDir,
+              manifest,
+              plan,
+              attempt,
+              snapshot,
+              validate: validators[plan.stage_key]
+                ?? recoveryValidatorFromEvidence(
+                  config,
+                  manifest,
+                  attempt,
+                  options.runDir,
+                ),
+              activation: pendingReplacement ? 'candidate' : 'active',
+            });
+          } catch (error) {
+            if (!pendingReplacement) throw error;
+            const reason = error instanceof Error
+              ? error.message
+              : String(error);
+            const beforeOutcome = attempt.outcome;
+            attempt.outcome = 'validation_failed';
+            attempt.updated_at = new Date().toISOString();
+            attempt.detail = reason;
+            clearRunnerCredential(options.runDir, attempt);
+            cancelReplacement(
+              manifest,
+              pendingReplacement.replacement_id,
+              reason,
+            );
+            appendAttemptEvent(
+              manifest,
+              'stage_validation_failed',
+              attempt,
+              beforeOutcome,
+              'validation_failed',
+              reason,
+            );
+            saveManifest(options.runDir, manifest);
+            throw error;
+          }
+          if (pendingReplacement) {
+            if (pendingReplacement.attempt_id !== attempt.attempt_id) {
+              throw new Error(
+                'approved candidate does not belong to pending replacement',
+              );
+            }
+            const beforeEvents = manifest.events.length;
+            prepareReplacementCandidate(
+              manifest,
+              pendingReplacement.replacement_id,
+              attempt.attempt_id,
+              record,
+            );
+            if (manifest.events.length > beforeEvents) {
+              saveManifest(options.runDir, manifest);
+            }
+            if (attempt.runner_credential_path !== null) {
+              const credentialPath = resolve(
                 options.runDir,
+                attempt.runner_credential_path,
+              );
+              ensureInsideRunDir(options.runDir, credentialPath);
+              rmSync(credentialPath, { force: true });
+            }
+            Object.assign(
+              manifest,
+              persistReplacementCommit(
+                manifestPath,
+                pendingReplacement.replacement_id,
+                manifest.revision,
               ),
-          });
-          clearRunnerCredential(options.runDir, attempt);
-          saveManifest(options.runDir, manifest);
+            );
+          } else {
+            clearRunnerCredential(options.runDir, attempt);
+            saveManifest(options.runDir, manifest);
+          }
           continue;
         }
 
