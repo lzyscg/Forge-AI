@@ -1,7 +1,7 @@
 # Forge UI 技术需求文档
 
 > 状态：技术需求拷问进行中
-> 当前版本：0.21
+> 当前版本：0.22
 > 首次建立：2026-07-29
 > 对应产品需求：`docs/Forge_UI_需求文档.md`
 
@@ -423,6 +423,26 @@ P0 用确定性检查点和真实进程终止覆盖命令、Worker 与 Turn Jour
 - 故障测试同时扫描数据库、日志、命令结果、SSE 和报告，验证不存在凭据与隐藏思维链泄漏；
 - 所有窗口先以 Fake Pi 稳定通过；真实 Pi 的最小三项随后作为独立发布门禁运行，不能反向用真实模型的不确定性掩盖确定性故障。
 
+### TD-023 本地 Web 先行与 Electron 封装边界
+
+当前阶段先把本地 Web 产品和真实运行链路做完整，Electron 只保留清晰封装入口，不进入本轮 P0 实施范围：
+
+- P0 交付形态是运行在本机的 Next.js Web、BFF、Supervisor、Case Worker 和 SQLite；
+- Web 主路径、状态管理、恢复、真实 Pi 和崩溃门禁全部通过后，才启动 Electron 封装工作；
+- 当前不创建 Electron 主进程、preload、安装器、签名、自动更新或桌面原生菜单；
+- 当前验收不得因为“以后会放进 Electron”而跳过本地 Web 的启动、关闭、错误处理和数据目录设计；
+- Next.js 保持可生成 standalone 服务的构建边界，不能依赖仓库源码目录或开发服务器才能运行；
+- BFF、Supervisor 和 Worker 提供明确、可由外部宿主管理的启动、健康检查、安全关闭与退出码协议；
+- application 和 domain 不依赖 Electron、BrowserWindow、IPC、安装目录或 Windows API；
+- 浏览器端只使用标准 Web 能力；未来需要文件选择、系统通知等桌面能力时，通过可替换 capability 边界接入；
+- 数据库、Pi Session、模板资源、日志、备份和用户配置都从显式应用数据根目录派生，不写入只读安装目录；
+- 本地服务只监听 loopback；未来 Electron 通过受控本地地址加载同一 Web 应用，不维护第二套 UI 或业务 API；
+- 当前 Web BFF 的 HTTP/SSE Contract 在 Electron 中继续复用，Renderer 不直接访问 SQLite、文件系统或 Worker；
+- 进程发现和终止封装为跨平台 Adapter，业务层不得出现 `taskkill`、PID 扫描或其他 Windows 专属分支；
+- Electron 首个内部 Alpha 暂定为 Windows 11 x64、按用户安装；内部版本可暂不签名，对外分发前必须完成代码签名门禁；
+- macOS、Linux 和 Windows ARM 不在首个 Electron Alpha 支持范围，但平台无关层不得主动阻断后续适配；
+- Electron 的安装器、签名、自动更新和主进程生命周期在本地 Web 冻结后另开需求与技术拷问，不提前纳入当前完成声明。
+
 ## 3. 当前代码基线
 
 - `apps/web` 使用 Next.js 14 App Router；
@@ -436,13 +456,14 @@ P0 用确定性检查点和真实进程终止覆盖命令、Worker 与 Turn Jour
 
 ## 4. 待继续拷问
 
-1. Electron 首个发行平台、打包和签名范围；
-2. Electron 数据目录、升级和进程生命周期。
+1. 本地 Web 的一键启动、健康检查和安全关闭；
+2. 本地 Web 的应用数据目录、备份与空间管理。
 
 ## 5. 变更记录
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| 0.22 | 2026-07-29 | 确认本地 Web 先行、Electron 延后及未来 Windows 桌面封装边界。 |
 | 0.21 | 2026-07-29 | 确认七个进程级故障窗口、真实 Pi 最小强杀矩阵和恢复不变量。 |
 | 0.20 | 2026-07-29 | 确认分阶段 Turn Journal、短事务、工具行为幂等和外部副作用准入规则。 |
 | 0.19 | 2026-07-29 | 确认 Supervisor 崩溃后 Worker 继续运行，并通过租约、实例身份与 IPC 握手安全接管。 |
