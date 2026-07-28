@@ -153,8 +153,14 @@ export class ToolExecutor {
         if (ri.status === 'submitted') return false;
         if (ri.target_agent !== ctx.agentKey) return false;
         const targetVersion = ri.target_artifact_version_id as string | null;
-        // 优先匹配 target_artifact_version_id === parent；允许 null 兜底（指令创建时无版本）
-        return targetVersion === parentId || targetVersion === null;
+        // 缺陷3修复（方案 A）：放宽匹配--target 为 null、精确匹配 parent、或 target 版本已被
+        // superseded（过时但仍有效）均视为匹配。否则当 RI 的 target 已被新版本取代时，publish
+        // 会因 target !== parent 返回 NO_ACTIVE_INSTRUCTION，导致返修版本链断裂、永久阻塞。
+        if (targetVersion === null) return true;
+        if (targetVersion === parentId) return true;
+        const targetVer = this.repo.getArtifactVersion(targetVersion);
+        if (targetVer && (targetVer.status as string) === 'superseded') return true;
+        return false;
       });
       if (candidates.length === 0) {
         // 没有绑定到当前 Agent/父版本的活跃指令：不能发布模糊归属的返修版本。
@@ -173,6 +179,16 @@ export class ToolExecutor {
         };
       }
       boundInstruction = candidates[0];
+      // 缺陷3修复（方案 A）：匹配到的指令 target 若已过时（指向 superseded 版本）或为 null，
+      // 自动重定位到当前父版本，并以 control_event 追加记录（铁律 4：不静默改）。
+      // 不更新内存副本 ri：后续 scope_violation 重发 RI 统一用 parentVersion（缺陷1修复），
+      // scope 校验也只读 editable/frozen 锚点，不读 target。
+      this.rebaseInstructionTargetIfNeeded(
+        caseId,
+        boundInstruction,
+        parentId,
+        'publish_artifact matched active instruction whose target was superseded/null',
+      );
       const ri = boundInstruction;
       const editableAnchors = JSON.parse(ri.editable_anchors as string) as string[];
       const frozenAnchors = JSON.parse(ri.frozen_anchors as string) as string[];
@@ -209,7 +225,10 @@ export class ToolExecutor {
           revision_instruction_id: this.idGen.generate('ri'),
           case_id: caseId,
           target_agent: ri.target_agent as string,
-          target_artifact_version_id: (ri.target_artifact_version_id as string | null) ?? null,
+          // 缺陷1修复（方案 B）：重发 RI 用当前父版本（最新非 rejected 版本），不复制旧 RI 的
+          // 过时 target。否则重发指令的 target 会悬挂在已 superseded 的版本，下一轮 publish
+          // 再次断裂。parentVersion 是越界版本被拒前的基准，正是下一次合规重试的父本。
+          target_artifact_version_id: parentVersion.artifact_version_id as string,
           issue_ids: JSON.stringify(retriedIssueIds),
           editable_anchors: JSON.stringify(editableAnchors),
           frozen_anchors: JSON.stringify(frozenAnchors),
@@ -539,11 +558,34 @@ export class ToolExecutor {
           JSON.parse(existingActive.frozen_anchors as string) as string[],
           input.scope.frozen_anchors ?? [],
         );
+        // 缺陷2修复（方案 B）：合并 issue_ids/anchors 时同步把 target 更新到当前最新版本，
+        // 避免合并后指令 target 仍悬挂在已 superseded 的版本（返修版本链断裂）。
+        const mergeArtifactType = scenarioConfig.artifact_types[0]?.type;
+        const mergeArtifact = mergeArtifactType
+          ? this.repo.getArtifactByTypeAndCase(caseId, mergeArtifactType)
+          : null;
+        const mergeLatestVersion = mergeArtifact
+          ? this.repo.getLatestVersion(mergeArtifact.artifact_id as string)
+          : null;
+        const mergeTargetVersionId = (mergeLatestVersion?.artifact_version_id as string | null) ?? null;
+        const existingTargetVersionId = existingActive.target_artifact_version_id as string | null;
+        const targetAdvanced =
+          mergeTargetVersionId !== null && mergeTargetVersionId !== existingTargetVersionId;
         this.repo.updateRevisionInstruction(existingActive.revision_instruction_id as string, {
           issue_ids: JSON.stringify(mergedIssueIds),
           editable_anchors: JSON.stringify(mergedEditable),
           frozen_anchors: JSON.stringify(mergedFrozen),
+          ...(targetAdvanced ? { target_artifact_version_id: mergeTargetVersionId } : {}),
         });
+        if (targetAdvanced) {
+          this.recordTargetRebase(
+            caseId,
+            existingActive.revision_instruction_id as string,
+            existingTargetVersionId,
+            mergeTargetVersionId,
+            'route_message merged new issues into active instruction; target advanced to latest version',
+          );
+        }
 
         // 只对新加入的（之前非 repairing 的）Issue 触发 open|reopened -> repairing
         const currentIssueStatuses = new Map<string, IssueStatus>();
@@ -977,5 +1019,52 @@ export class ToolExecutor {
       }
     }
     return out;
+  }
+
+  /**
+   * 缺陷3修复（方案 A）：把已匹配指令的 target_artifact_version_id 重定位到当前父版本。
+   * 仅当目标确实变化时才更新 DB 行 + 追加 control_event（铁律 4：不静默改）。
+   * 用于 publish_artifact 匹配到 target 已 superseded/null 的活跃指令时。
+   */
+  private rebaseInstructionTargetIfNeeded(
+    caseId: string,
+    instruction: Record<string, unknown>,
+    newTargetVersionId: string,
+    reason: string,
+  ): boolean {
+    const currentTarget = instruction.target_artifact_version_id as string | null;
+    if (currentTarget === newTargetVersionId) return false;
+    const instructionId = instruction.revision_instruction_id as string;
+    this.repo.updateRevisionInstruction(instructionId, {
+      target_artifact_version_id: newTargetVersionId,
+    });
+    this.recordTargetRebase(caseId, instructionId, currentTarget, newTargetVersionId, reason);
+    return true;
+  }
+
+  /**
+   * 追加一条 revision_target_rebased control_event，记录 RI target 的重定位（铁律 4）。
+   * 被 rebaseInstructionTargetIfNeeded（缺陷3）与 route_message 合并分支（缺陷2）复用。
+   */
+  private recordTargetRebase(
+    caseId: string,
+    instructionId: string,
+    fromTargetVersionId: string | null,
+    toTargetVersionId: string,
+    reason: string,
+  ): void {
+    this.repo.insertControlEvent({
+      event_id: this.idGen.generate('evt'),
+      case_id: caseId,
+      event_type: 'revision_target_rebased',
+      actor: 'system',
+      detail: JSON.stringify({
+        instruction_id: instructionId,
+        from_target_version_id: fromTargetVersionId,
+        to_target_version_id: toTargetVersionId,
+        reason,
+      }),
+      created_at: this.clock.now(),
+    });
   }
 }

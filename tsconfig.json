@@ -17,5 +17,5 @@
     "composite": true,
     "incremental": true
   },
-  "exclude": ["node_modules", "dist", "apps/web", "*.canvas.tsx"]
+  "exclude": ["node_modules", "dist", "apps/web", "**/*.canvas.tsx"]
 }
