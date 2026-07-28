@@ -126,3 +126,20 @@ VERDICT: REVISE
 - 迁移锁改为两阶段协议：先原子发布 migration intent，阻止新连接并排空现有持有者；再取得独占锁、复核双库零连接和零租约，完成备份、迁移、验证或回滚后才清除 intent。崩溃遗留 intent 只能由证明旧 owner 已死亡且重新取得独占锁的恢复器处理。
 - 所有受管 DB opener，包括纯只读 status/list，都必须在完整连接生命周期持有共享锁，并在取得锁后再次检查 migration intent，关闭检查与加锁之间的竞态。
 - 没有稳定 Pi replay key 时，仅“需要恢复 Pi 或接受未证明回调”的路径进入 `outcome_unknown`；如果响应与全部工具结果已经完整持久化，允许恢复器依据 Journal 只补齐 Turn 最终提交。
+
+## Round 5 — Codex
+
+Round 4 blockers are resolved:
+
+- Migration intent now prevents new connections, all readers and writers hold shared locks for their full connection lifetime, and migration acquires exclusive ownership only after draining and rechecking both databases.
+- Crash recovery for stale migration intent is fail-closed and requires exclusive ownership before validation, rollback, or clearing.
+- Pi replay now requires a proven stable replay key; otherwise recovery stops before unverified callbacks or side effects.
+- Journal-only finalization is correctly limited to cases with durable response references and complete, hash-verified tool outcomes.
+
+No material implementation blockers or contradictions remain.
+
+VERDICT: APPROVED
+
+### Claude's response
+
+接受最终评审结论。`PLAN.md` 已完成五轮对抗性复审并达到可实施状态；下一步是否进入实现由用户最终确认。
