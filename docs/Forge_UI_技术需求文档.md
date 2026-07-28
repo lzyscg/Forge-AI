@@ -1,7 +1,7 @@
 # Forge UI 技术需求文档
 
 > 状态：技术需求拷问进行中
-> 当前版本：0.4
+> 当前版本：0.5
 > 首次建立：2026-07-29
 > 对应产品需求：`docs/Forge_UI_需求文档.md`
 
@@ -107,6 +107,23 @@ Electron 是后续桌面交付形态，本轮先保证架构可封装，不立�
 - 被草稿、任务、Case、产物或门禁证据引用的模板修订不得删除；
 - 模板注册库保存元数据和身份，具体资源采用文件内容寻址存储还是数据库 BLOB 留到存储设计时确认，但 Runtime 不得继续依赖可变源目录。
 
+### TD-006 Pi 模型目录发现与 Forge 策略叠加
+
+Provider 的注册、认证和模型事实目录归 Pi 管理；Forge 通过 Pi 的公开模型目录能力发现可用 Provider/Model，并叠加产品策略：
+
+- 新 Provider、认证方式和凭据在 Pi 中添加，不在 Forge 中重复实现；
+- Forge 通过受控 Adapter 调用 Pi `ModelRuntime` 的 `getProviders()`、`getModels()`、`getAvailable()` 和认证状态接口；
+- “扫描 Pi 目录”指调用 Pi 的公开运行时 API，不读取或解析 Pi 的私有配置文件、缓存目录或内部数据库；
+- Pi 返回 Provider、模型、能力和可用性事实；Forge 只维护允许列表、禁用规则、默认值、显示名称和顺序等产品策略；
+- application 层的模型目录查询服务合并 Pi 事实与 Forge 策略，再向 BFF 返回脱敏 DTO；
+- UI 可以查看 Provider/Model 和非敏感连接状态，并从允许且可用的模型中选择；
+- Forge 不返回认证类型细节、凭据路径、API Key、Token 或 Header；
+- 草稿保存每个 Agent 的 `provider_id + model_id` 以及“跟随模板”或“任务覆盖”来源；
+- 启动时再次通过 Pi 校验模型存在且可用，然后把每个 Agent 的准确 Provider/Model 冻结到任务、Case 和 Session 证据；
+- `RealPiAdapter` 必须按 Agent 接收准确 Provider/Model，不再固定 `deepseek` 或只读全局 `PI_MODEL_ID`；
+- 恢复必须使用原 Provider/Model；原模型缺失或不可用时 fail closed，不允许静默替换；
+- Provider/Model 目录的刷新、缓存和失效体验继续单独确认。
+
 ## 3. 当前代码基线
 
 - `apps/web` 使用 Next.js 14 App Router；
@@ -121,7 +138,7 @@ Electron 是后续桌面交付形态，本轮先保证架构可封装，不立�
 ## 4. 待继续拷问
 
 1. application 层查询服务与命令服务边界；
-2. Agent Provider/Model 目录、冻结和恢复；
+2. Provider/Model 目录刷新、缓存和失效；
 3. 实时更新协议；
 4. 并发命令、幂等和前端一致性；
 5. 当前有效产物、阶段与进度的投影模型；
@@ -135,6 +152,7 @@ Electron 是后续桌面交付形态，本轮先保证架构可封装，不立�
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| 0.5 | 2026-07-29 | 确认 Provider 在 Pi 注册、Forge 通过公开 API 发现目录并叠加允许策略。 |
 | 0.4 | 2026-07-29 | 确认文件创作源、不可变模板注册修订、内容寻址和恢复引用规则。 |
 | 0.3 | 2026-07-29 | 确认 production_tasks 与 Case 分离、启动冻结事务和状态投影边界。 |
 | 0.2 | 2026-07-29 | 确认常驻 Supervisor、持久化命令和每个 Case 独立 Worker 进程的执行模型。 |
