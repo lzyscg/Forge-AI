@@ -558,14 +558,19 @@ export class ToolExecutor {
           JSON.parse(existingActive.frozen_anchors as string) as string[],
           input.scope.frozen_anchors ?? [],
         );
-        // 缺陷2修复（方案 B）：合并 issue_ids/anchors 时同步把 target 更新到当前最新版本，
+        // 缺陷2修复（方案 B）：合并 issue_ids/anchors 时同步把 target 更新到"最后非 rejected 版本"，
         // 避免合并后指令 target 仍悬挂在已 superseded 的版本（返修版本链断裂）。
+        // LOW 残留修复：不能用 getLatestVersion（按版本号取最新、不过滤 rejected）。当最新版本恰好是
+        // scope_violation 越界的 rejected 死分支时，合并会把 RI target 指向死分支，writer 下次以
+        // "最后非 rejected 版本"为父本合规发布时 target!==parent 且该版本非 superseded
+        // -> NO_ACTIVE_INSTRUCTION（原 P0 症状残留）。缺陷3 放宽匹配只覆盖 superseded 不覆盖 rejected。
+        // 这里与 publish 路径（缺陷1 重发 RI 的 parentVersion=最后非 rejected）保持一致。
         const mergeArtifactType = scenarioConfig.artifact_types[0]?.type;
         const mergeArtifact = mergeArtifactType
           ? this.repo.getArtifactByTypeAndCase(caseId, mergeArtifactType)
           : null;
         const mergeLatestVersion = mergeArtifact
-          ? this.repo.getLatestVersion(mergeArtifact.artifact_id as string)
+          ? this.getLatestNonRejectedVersion(mergeArtifact.artifact_id as string)
           : null;
         const mergeTargetVersionId = (mergeLatestVersion?.artifact_version_id as string | null) ?? null;
         const existingTargetVersionId = existingActive.target_artifact_version_id as string | null;
@@ -583,7 +588,7 @@ export class ToolExecutor {
             existingActive.revision_instruction_id as string,
             existingTargetVersionId,
             mergeTargetVersionId,
-            'route_message merged new issues into active instruction; target advanced to latest version',
+            'route_message merged new issues into active instruction; target advanced to last non-rejected version',
           );
         }
 
@@ -1019,6 +1024,20 @@ export class ToolExecutor {
       }
     }
     return out;
+  }
+
+  /**
+   * 返回 artifact 的"最后一个非 rejected 版本"（按 version 升序取末尾）。
+   * rejected 版本是 scope_violation 越界的死分支，不能作为返修指令的 target。
+   * 与 publish 路径（缺陷1 重发 RI 的 parentVersion 计算）保持一致：
+   * 否则 writer 下次以"最后非 rejected 版本"为父本合规发布时 target!==parent
+   * 且缺陷3 放宽匹配不覆盖 rejected，会返回 NO_ACTIVE_INSTRUCTION（原 P0 症状残留）。
+   * getLatestVersion 不过滤 rejected，故合并分支（缺陷2）改用本 helper。
+   */
+  private getLatestNonRejectedVersion(artifactId: string): Record<string, unknown> | null {
+    const versions = this.repo.getVersionsByArtifact(artifactId);
+    const nonRejected = versions.filter((v) => v.status !== 'rejected');
+    return nonRejected.length > 0 ? nonRejected[nonRejected.length - 1] : null;
   }
 
   /**

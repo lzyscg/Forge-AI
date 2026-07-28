@@ -343,3 +343,118 @@ describe('约束：多条 superseded-target RI 仍返回 AMBIGUOUS（不引入�
     expect(repo.getRevisionInstruction('ri_amb2')?.target_artifact_version_id).toBe(v1);
   });
 });
+
+describe('缺陷 2 残留（LOW）：route_message 合并取最后非 rejected 版本，不指向 rejected 死分支', () => {
+  let repo: SqliteRepository;
+  let clock: SystemClock;
+  let idGen: UuidGenerator;
+  let toolExecutor: ToolExecutor;
+  const caseId = 'case_merge_rej';
+  const artifactId = 'art_merge_rej';
+  const v1 = 'av_mr1';
+  const v2 = 'av_mr2';
+  const v3 = 'av_mr3'; // scope_violation 越界的 rejected 死分支（版本号最新）
+
+  beforeEach(() => {
+    repo = new SqliteRepository(':memory:');
+    clock = new SystemClock();
+    idGen = new UuidGenerator();
+    toolExecutor = new ToolExecutor(repo, clock, idGen);
+    seedCase(repo, clock, caseId, 'running');
+    repo.insertArtifact({
+      artifact_id: artifactId, case_id: caseId, artifact_type: 'draft',
+      scope_key: null, current_valid_version_id: v2, status: 'active', created_at: clock.now(),
+    });
+    // v1 superseded / v2 under_review(最后非 rejected) / v3 rejected(越界死分支，版本号最新)
+    seedVersion(repo, clock, artifactId, v1, 1, 'superseded', 'line1\nline2\nline3');
+    seedVersion(repo, clock, artifactId, v2, 2, 'under_review', 'line1\nline2Y\nline3', v1);
+    seedVersion(repo, clock, artifactId, v3, 3, 'rejected', 'line1\nline2OUT\nline3', v2);
+    // 两个 open Issue（issue_B 由 supervisor 在合并 route_message 时追加，绑同一审核消息）
+    seedIssue(repo, clock, caseId, 'issue_A', v2, 'open');
+    seedIssue(repo, clock, caseId, 'issue_B', v2, 'open');
+    repo.updateIssue('issue_B', { evaluation_message_id: 'msg_route2' });
+    // 现有活跃指令：模拟越界后系统重发的 RI（缺陷1 修复：target=最后非 rejected=v2），已绑 issue_A
+    seedInstruction(repo, clock, caseId, 'ri_merge_rej', 'writer', v2, ['issue_A'], 'issued');
+  });
+
+  it('合并 issue_B 时 target 不指向 rejected 死分支 v3，保持最后非 rejected v2', () => {
+    const result = toolExecutor.execute(
+      'route_message',
+      {
+        target_agent: 'writer',
+        instruction: '追加修复 issue_B',
+        scope: { editable_anchors: ['line:2'], frozen_anchors: ['line:1', 'line:3'], issue_ids: ['issue_B'] },
+        reason: '追加返修',
+      },
+      { caseId, turnId: 'turn_route', sessionId: 'sess', agentKey: 'supervisor', messageId: 'msg_route2', scenarioConfig: SCENARIO },
+    ) as Record<string, unknown>;
+
+    expect(result.success).toBe(true);
+    expect(result.revision_instruction_id).toBe('ri_merge_rej');
+
+    const ri = repo.getRevisionInstruction('ri_merge_rej');
+    // ★ 修复前（getLatestVersion 不过滤 rejected）：target 被更新到 v3（rejected 死分支）。
+    // ★ 修复后（最后非 rejected）：target 保持 v2。
+    expect(ri?.target_artifact_version_id).toBe(v2);
+    expect(ri?.target_artifact_version_id).not.toBe(v3);
+  });
+
+  it('writer 随后以最后非 rejected 版本 v2 为父本合规发布 -> 成功（不 NO_ACTIVE_INSTRUCTION）', () => {
+    toolExecutor.execute(
+      'route_message',
+      {
+        target_agent: 'writer',
+        instruction: '追加修复 issue_B',
+        scope: { editable_anchors: ['line:2'], frozen_anchors: ['line:1', 'line:3'], issue_ids: ['issue_B'] },
+        reason: '追加返修',
+      },
+      { caseId, turnId: 'turn_route', sessionId: 'sess', agentKey: 'supervisor', messageId: 'msg_route2', scenarioConfig: SCENARIO },
+    );
+
+    // writer 以 v2 为父本发布合规返修版本（只改 editable line:2）
+    const result = toolExecutor.execute(
+      'publish_artifact',
+      { artifact_type: 'draft', content: 'line1\nline2FIXED\nline3', summary: '修复版本' },
+      { caseId, turnId: 'turn_p', sessionId: 'sess', agentKey: 'writer', messageId: 'msg_p', scenarioConfig: SCENARIO },
+    ) as Record<string, unknown>;
+
+    // ★ 修复前：合并后 RI target=v3(rejected)，publish 时 parent=v2(最后非 rejected)，
+    //   target!==parent 且 v3 非 superseded（缺陷3 放宽不覆盖 rejected）
+    //   -> NO_ACTIVE_INSTRUCTION（原 P0 症状残留，永久阻塞）。
+    // ★ 修复后：RI target=v2=parent -> 匹配 -> success。
+    expect(result.success).toBe(true);
+    expect(result.artifact_version_id).toBeTruthy();
+  });
+
+  it('现有 RI target 过时(v1) 时合并重定位到最后非 rejected v2（不指向 v3）+ control_event 记录', () => {
+    // 改造为 stale-target 场景：RI target 指向已 superseded 的 v1
+    repo.updateRevisionInstruction('ri_merge_rej', { target_artifact_version_id: v1 });
+
+    const result = toolExecutor.execute(
+      'route_message',
+      {
+        target_agent: 'writer',
+        instruction: '追加修复 issue_B',
+        scope: { editable_anchors: ['line:2'], frozen_anchors: ['line:1', 'line:3'], issue_ids: ['issue_B'] },
+        reason: '追加返修',
+      },
+      { caseId, turnId: 'turn_route', sessionId: 'sess', agentKey: 'supervisor', messageId: 'msg_route2', scenarioConfig: SCENARIO },
+    ) as Record<string, unknown>;
+
+    expect(result.success).toBe(true);
+    const ri = repo.getRevisionInstruction('ri_merge_rej');
+    // ★ 修复前：target 重定位到 v3（rejected 死分支，getLatestVersion）。
+    // ★ 修复后：target 重定位到 v2（最后非 rejected）。
+    expect(ri?.target_artifact_version_id).toBe(v2);
+    expect(ri?.target_artifact_version_id).not.toBe(v3);
+
+    // 铁律 4：target 重定位以 control_event 追加记录（from v1 -> to v2，不是 to v3）
+    const events = repo.getControlEventsByCase(caseId);
+    const rebaseEvt = events.find((e) => e.event_type === 'revision_target_rebased');
+    expect(rebaseEvt).toBeTruthy();
+    const detail = JSON.parse(rebaseEvt!.detail as string);
+    expect(detail.instruction_id).toBe('ri_merge_rej');
+    expect(detail.from_target_version_id).toBe(v1);
+    expect(detail.to_target_version_id).toBe(v2);
+  });
+});
