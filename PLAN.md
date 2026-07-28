@@ -20,8 +20,9 @@ _Locked via grill — by Claude + user_
    - 若任一 Pi 假设不成立，先更新 Adapter Contract 和技术文档，不在实现中静默回退到硬编码 Provider、全局模型或私有目录扫描。
 
 3. **建立显式迁移系统，再修改业务 Schema**
-   - 在 adapters 层增加版本化 migration runner、`schema_migrations`、checksum 校验、OS 级数据根目录读写锁、WAL checkpoint 和 SQLite Backup API。所有可写 composition root（CLI、Worker、Supervisor/BFF 写服务及 story-pipeline 调用的 Forge 入口）必须在打开任一受管 DB 前取得共享锁，并持有到最后一个写连接关闭；未取得锁时拒绝打开写连接。
-   - 迁移器必须先取得同一数据根目录的独占锁，并从停止领取、排空连接、无 writer 预检开始，一直持有到双库备份、迁移、校验以及必要的回滚全部完成。取得独占锁前不得执行 checkpoint 或 Schema 操作；无法排除任一活跃 writer 时中止迁移。
+   - 在 adapters 层增加版本化 migration runner、`schema_migrations`、checksum 校验、OS 级迁移意图闸门与数据根目录读写锁、WAL checkpoint 和 SQLite Backup API。每一个受管 DB opener，无论 CLI、Worker、Supervisor/BFF、story-pipeline 调用入口还是只读 status/list，均须在打开连接前取得共享锁、再次确认没有迁移意图，并持有到最后一个读写连接关闭；未取得锁或发现意图时拒绝打开连接。
+   - 迁移采用两阶段协议：先原子发布带 owner PID、nonce 和时间的 migration intent，使所有入口停止新开连接并通知 Supervisor 停止领取、排空 Worker/现有连接；待共享锁持有者归零后再取得独占锁，重新确认 production/test 零连接、零有效租约，才允许 checkpoint、双库备份和 Schema 操作。独占锁持有到双库迁移、校验以及必要的回滚全部完成，最后清除 intent。
+   - 迁移进程崩溃时 OS 独占锁自动释放，但 intent 不由普通入口删除；下一次启动只有在证明原 owner 已死亡并重新取得独占锁后，才能按迁移日志和备份完成校验/回滚并清除 intent，避免半迁移状态被误当成可运行状态。
    - 把当前 `SqliteRepository` 构造函数中的零散 `ALTER TABLE` 迁出；应用声明最低/最高支持 Schema。
    - 先完成 production/test 两库的全部空间预检和已验证数据库备份，再开始任一迁移；两库必须共同到达目标版本，否则用备份恢复已成功的第一库并拒绝启动，绝不运行 split-version UI。
    - 明确 migration backup 只覆盖 SQLite；迁移过程不得修改共享 CAS 与 Pi Session，因此数据库回滚复用原有 CAS/Session。整机丢失后的完整灾备导出不属于本计划。
@@ -57,7 +58,7 @@ _Locked via grill — by Claude + user_
    - 先用短事务提交 Turn intent、上下文引用和 `model_running`，再在事务外调用 Pi。
    - 由于 Pi Agent Runtime 可能在模型调用期间内联执行工具，Adapter 必须在每次工具回调产生副作用前，为不可变 `turn_id` 预留并持久化单调 `logical_tool_call_index`；action identity 固定为 `turn_id + logical_tool_call_index`，工具名和规范化参数哈希用于一致性核对，attempt/lease generation 只作执行证据而不参与身份计算。随后在短事务中原子提交 Forge 内部副作用与工具完成记录。
    - 数据库对 `(turn_id, logical_tool_call_index)` 建非空唯一约束。若步骤 2 证明 Pi 提供跨 resume 稳定且唯一的 tool call identity/replay position，则将其作为唯一 replay key 持久化映射到 action identity；崩溃后只有 replay key 命中且工具名/参数哈希一致时才复用原 action，合法的相同参数重复调用因 replay key 不同而获得新逻辑序号。
-   - 若 Pi 不提供经探针证明的稳定 replay key，未中断执行仍可依次创建逻辑调用，但任何进入 `model_invoked` 后发生的崩溃恢复都必须在恢复 Session 或执行首个后续工具回调前进入 `outcome_unknown`，不得用顺序、参数哈希或新序号猜测重放。Fake/Real Pi 测试覆盖完全相同的连续工具调用、callback replay、suffix resume 和 lease generation 变化。
+   - 若 Pi 不提供经探针证明的稳定 replay key，未中断执行仍可依次创建逻辑调用；崩溃后只有在响应引用、全部工具 outcome 和哈希均已完整持久化、无需恢复 Pi 或接受回调时，恢复器才可仅按 Journal 补齐 Turn 最终提交。任何需要恢复 Session 或接受首个未证明回调的路径，都必须在产生新副作用前进入 `outcome_unknown`，不得用顺序、参数哈希或新序号猜测重放。Fake/Real Pi 测试覆盖完全相同的连续工具调用、callback replay、suffix resume、journal-only finalization 和 lease generation 变化。
    - Pi 最终响应返回后持久化响应引用并完成 Turn/路由；已完成工具行为再次调用只返回原结果引用。
    - 恢复器按 Journal 证据判断继续模型核对、未完成工具、Turn 收尾或进入 `outcome_unknown`；不得盲目重放。
    - P0 只注册可与 Forge 事务一起提交，或具有幂等键与结果核对协议的工具。
@@ -145,7 +146,7 @@ _Locked via grill — by Claude + user_
 - 当前 Pi 0.82 公开目录 API、模型选择参数和 Session 核对能力的准确形态需要在步骤 2 用可运行探针证明；若能力缺失，必须先调整 Contract，不能读取 Pi 私有文件兜底。
 - Pi Agent Runtime 可能在一次模型调用中内联多次工具执行，Turn Journal 必须通过工具回调生命周期记录 intent/effect，而不能依赖“完整响应先于全部工具”的理想顺序。
 - Windows 上 Supervisor 崩溃后对存活 Worker 的公钥 challenge 重握手需要证明不会误认 PID、接受重放签名、泄露私钥，也不会因终端关闭意外杀死整个进程树。
-- 所有现有和新增写入口必须共同遵守数据根目录共享锁；任何绕过该锁直接打开写库的 legacy 路径都会破坏迁移互斥，必须由集成测试枚举并封死。
+- 所有现有和新增 DB opener 都必须共同遵守 migration intent + 数据根目录共享锁协议；任何绕过该协议直接打开读库或写库的 legacy 路径都会破坏迁移互斥，必须由集成测试枚举并封死。
 - 从现有跨 await Turn 事务迁移到 Journal 时，历史 Case 和新 Case 的恢复路径必须有明确 Schema/版本边界；不支持混用两种执行器继续同一未完成 Turn。
 - 模板 CAS 与数据库元数据无法依靠单个 SQLite 事务覆盖文件系统，需要用 staging、原子 rename 和提交顺序保证“数据库不引用缺失对象”；P0/P1 保留孤立对象而不冒险回收。
 - 真实 Provider 调用在缺少上游幂等协议时无法保证费用 exactly-once；Forge 只承诺业务副作用不重复，并对未知调用结果 fail closed。

@@ -108,3 +108,21 @@ VERDICT: REVISE
 
 - 数据根目录迁移锁改为所有 writer 共同遵守的读写锁协议：CLI、Worker、Supervisor/BFF 写服务和 story-pipeline 使用的 Forge 入口都必须在打开写库前持有共享锁；迁移器从预检前到双库验证或回滚结束始终持有独占锁。
 - 步骤 2 增加 Pi tool call identity/replay position 探针。只有经真实测试证明跨 resume 稳定的 replay key 才能把回调映射回原 action；如果 Pi 没有该能力，崩溃后的 Turn 在恢复 Session 或执行任何后续工具回调前进入 `outcome_unknown`，绝不靠调用顺序或相同参数猜测。
+
+## Round 4 — Codex
+
+The Pi replay rule is now safely fail-closed, but the locking protocol still has material contradictions:
+
+- **Lock acquisition order can deadlock.** Migration requires the exclusive lock before telling Supervisor/Workers to drain, while those processes retain shared locks until their connections close. Fix: announce a migration-intent gate first, stop new work and drain existing holders, then acquire the exclusive lock and recheck zero connections before backup/migration.
+- **Read-only processes bypass migration exclusion.** CLI status/list and other read-only connections can open after preflight because only write-capable roots require shared locks; on Windows they can obstruct replacement or observe a changing schema. Fix: require every managed DB opener—read or write—to hold the shared lock for its complete connection lifetime.
+- **Fail-closed scope conflicts with journal-only completion.** The blanket rule sends every post-`model_invoked` crash to `outcome_unknown`, even when the response and all tool outcomes are durably recorded and recovery only needs to finalize the Turn. Fix: require `outcome_unknown` only when recovery would need to resume Pi or accept an unprovable callback; allow journal-only finalization from complete durable evidence.
+
+VERDICT: REVISE
+
+### Claude's response
+
+三项全部采纳，并修改 `PLAN.md`：
+
+- 迁移锁改为两阶段协议：先原子发布 migration intent，阻止新连接并排空现有持有者；再取得独占锁、复核双库零连接和零租约，完成备份、迁移、验证或回滚后才清除 intent。崩溃遗留 intent 只能由证明旧 owner 已死亡且重新取得独占锁的恢复器处理。
+- 所有受管 DB opener，包括纯只读 status/list，都必须在完整连接生命周期持有共享锁，并在取得锁后再次检查 migration intent，关闭检查与加锁之间的竞态。
+- 没有稳定 Pi replay key 时，仅“需要恢复 Pi 或接受未证明回调”的路径进入 `outcome_unknown`；如果响应与全部工具结果已经完整持久化，允许恢复器依据 Journal 只补齐 Turn 最终提交。
