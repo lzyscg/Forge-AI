@@ -1,7 +1,7 @@
 # Forge UI 技术需求文档
 
 > 状态：技术需求拷问进行中
-> 当前版本：0.1
+> 当前版本：0.2
 > 首次建立：2026-07-29
 > 对应产品需求：`docs/Forge_UI_需求文档.md`
 
@@ -60,6 +60,21 @@ Electron 是后续桌面交付形态，本轮先保证架构可封装，不立�
 - [Electron Process Model](https://www.electronjs.org/docs/latest/tutorial/process-model)
 - [Electron Security](https://www.electronjs.org/docs/latest/tutorial/security)
 
+### TD-003 Worker Supervisor 与 Case 进程隔离
+
+采用“常驻 Supervisor + 持久化命令 + 每个 Case 独立 Worker 进程”的执行模型：
+
+- BFF 只向 application 层提交运行、暂停、恢复和停止等命令，不直接创建 Worker 或 CLI 子进程；
+- 命令在数据库中持久化，并具有稳定命令 ID、幂等键、状态、创建时间和处理结果；
+- 常驻 Worker Supervisor 领取命令，并按照可配置的并发上限调度；
+- 每个正在执行的 Case 使用独立 Worker 子进程，单个 Case 的 Provider、Pi Session 或未捕获异常不应直接击穿其他 Case；
+- Worker 子进程必须继续使用现有执行租约、runner token 哈希和心跳机制确认执行所有权；
+- Supervisor 只负责命令领取、进程生命周期和可观测性，不替代 Case 状态机，也不伪造业务状态；
+- 子进程异常退出后，由持久化证据和 RecoveryService 判定 Case 是否可以恢复，不能由 Supervisor 直接标记成功或强制重跑；
+- 同一命令被重复提交、Supervisor 重启或领取后崩溃时，必须依靠幂等与租约机制避免重复执行；
+- Web 部署时 Supervisor 作为独立后台进程运行；Electron 封装后由 Electron 主进程启动和监控；
+- 应用关闭、升级和系统关机时的排空、暂停、强制终止和恢复语义留待后续专项确认。
+
 ## 3. 当前代码基线
 
 - `apps/web` 使用 Next.js 14 App Router；
@@ -73,21 +88,21 @@ Electron 是后续桌面交付形态，本轮先保证架构可封装，不立�
 
 ## 4. 待继续拷问
 
-1. Worker 的执行与调度模型；
-2. application 层查询服务与命令服务边界；
-3. 生产任务、草稿、归档、标签和来源关系的数据模型；
-4. Agent Provider/Model 目录、冻结和恢复；
-5. 实时更新协议；
-6. 并发命令、幂等和前端一致性；
-7. 当前有效产物、阶段与进度的投影模型；
-8. 自动保存与草稿冲突；
-9. 脱敏和诊断数据边界；
-10. SQLite 迁移与兼容策略；
-11. 测试、真实 Pi 和崩溃恢复验收；
-12. Electron 打包、数据目录、升级和进程生命周期。
+1. application 层查询服务与命令服务边界；
+2. 生产任务、草稿、归档、标签和来源关系的数据模型；
+3. Agent Provider/Model 目录、冻结和恢复；
+4. 实时更新协议；
+5. 并发命令、幂等和前端一致性；
+6. 当前有效产物、阶段与进度的投影模型；
+7. 自动保存与草稿冲突；
+8. 脱敏和诊断数据边界；
+9. SQLite 迁移与兼容策略；
+10. 测试、真实 Pi 和崩溃恢复验收；
+11. Electron 打包、数据目录、升级和进程生命周期。
 
 ## 5. 变更记录
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| 0.2 | 2026-07-29 | 确认常驻 Supervisor、持久化命令和每个 Case 独立 Worker 进程的执行模型。 |
 | 0.1 | 2026-07-29 | 建立技术需求文档；确认 Next.js BFF 方向和 Electron 后续封装约束。 |
