@@ -70,3 +70,25 @@ VERDICT: REVISE
 拒绝第 1 项中重新加入来源认证的建议：用户在 Act 1 明确拒绝额外 CSRF/权限复杂度。计划保留 loopback、同源、无 CORS、JSON-only mutation 和无副作用 GET，并明确接受残余风险，但不增加自定义 CSRF/Host/Origin/Fetch-Metadata 框架。
 
 拒绝第 14 项中的远程告警扩张：个人本地工具只实现结构化本地健康与诊断，不建设监控/告警平台。
+
+## Round 2 — Codex
+
+Round 2 blockers remain unchanged:
+
+- Loopback BFF still accepts DNS-rebinding risk by excluding `Host` validation; JSON-only writes do not close this hole. Fix: allowlist the exact loopback host and active port.
+- Restarted Supervisor cannot authenticate a surviving Worker using only a stored token hash after the one-time secret is lost. Fix: use Worker-held signing keys with a persisted public verifier.
+- Action identity still includes “Turn attempt,” so recovery can generate a new identity and duplicate side effects. Fix: use immutable `turn_id` plus a persisted logical call index; store attempt/generation separately.
+- Legacy incomplete Cases still enter `waiting_recovery` despite being non-resumable by the new executor. Fix: use an explicit non-resumable failure state or retain a tested legacy executor.
+- Worker-time model unavailability still lacks command/Case convergence and retry semantics. Fix: define a persistent blocked state, bounded retry, explicit user retry, and frozen-model preservation.
+
+VERDICT: REVISE
+
+### Claude's response
+
+五项全部采纳，并修改 `PLAN.md`：
+
+- 增加精确 `127.0.0.1:<active_port>` Host allowlist，关闭 DNS rebinding 主路径；这是一项固定地址校验，不引入账号、CSRF Token、Origin 或 Fetch-Metadata 框架。
+- Worker 首次启动时生成短期非导出签名密钥；数据库只保存公钥和实例绑定。Supervisor 重启后使用一次性 nonce 和公钥验签重新认证存活 Worker，不再依赖已丢失的 raw secret 或 token hash。
+- 工具 action identity 改为不可变 `turn_id + logical_tool_call_index`；attempt 和 lease generation 仅作证据。重放时必须匹配原序号、工具名和参数哈希，歧义进入 `outcome_unknown`。
+- legacy 未完成 Turn 迁移为不可恢复的 `failed` 终态并记录稳定原因码，只允许查看证据或克隆新任务，不再错误展示 `waiting_recovery`。
+- 模型在 Worker 执行时不可用，持久化为 `blocked_model_unavailable` 命令状态并让 Case 投影到带原因的 `waiting_recovery`；只对暂时不可用执行最多 3 次持久化退避，之后由用户显式使用原冻结模型重试，绝不静默换模。

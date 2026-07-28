@@ -34,7 +34,7 @@ _Locked via grill — by Claude + user_
    - 修正 Artifact 当前有效指针：候选版本不替换有效版本，批准事务原子完成旧版 supersede、新版 approve、指针切换和事件追加。
    - 重建关键 SQLite 表并启用 `PRAGMA foreign_keys=ON`：增加状态 `CHECK`、同 Artifact 版本号唯一索引、单 delivered 版本部分唯一索引，以及保证 `current_valid_version_id` 归属和状态合法的 guarded trigger；并发批准必须由数据库约束兜底。
    - 为 Turn Journal 和工具行为增加稳定身份、阶段、请求/响应哈希、租约 generation、结果未知、幂等字段和 `execution_protocol_version`。
-   - 已完成 legacy Case 保持只读可查；legacy 未完成 Turn 不尝试由新执行器续跑，迁移后明确进入 fail-closed `waiting_recovery` 并要求创建新任务或使用受控历史恢复流程。
+   - 已完成 legacy Case 保持只读可查；legacy 未完成 Turn 不尝试由新执行器续跑，迁移后原子进入不可恢复的 `failed` 终态并记录稳定原因码 `legacy_execution_protocol_unsupported`，只允许查看证据或基于原任务创建新任务，不暴露恢复动作。
    - 在开始 Schema/UI 实现前冻结 `/api/v1` HTTP Contract、错误码、action descriptor、分页和脱敏分类，具体基线见步骤 10。
 
 5. **实现应用数据目录、配置和模板 CAS**
@@ -55,8 +55,8 @@ _Locked via grill — by Claude + user_
 
 7. **用分阶段 Turn Journal 替换跨 `await` 长事务**
    - 先用短事务提交 Turn intent、上下文引用和 `model_running`，再在事务外调用 Pi。
-   - 由于 Pi Agent Runtime 可能在模型调用期间内联执行工具，Adapter 必须在每次工具回调前持久化非空、确定性的 action identity（Case/Turn attempt、工具调用序号、工具名和规范化参数哈希），再在短事务中原子提交 Forge 内部副作用与工具完成记录；`provider_tool_call_id` 仅作附加证据，不能作为唯一幂等身份。
-   - 数据库对确定性 action identity 建唯一约束；Fake/Real Pi 恢复测试必须证明回调重放和 Session 恢复得到同一身份。
+   - 由于 Pi Agent Runtime 可能在模型调用期间内联执行工具，Adapter 必须在每次工具回调产生副作用前，为不可变 `turn_id` 预留并持久化单调 `logical_tool_call_index`；action identity 固定为 `turn_id + logical_tool_call_index`，工具名和规范化参数哈希用于一致性核对，attempt/lease generation 只作执行证据而不参与身份计算。随后在短事务中原子提交 Forge 内部副作用与工具完成记录；`provider_tool_call_id` 仅作附加证据，不能作为唯一幂等身份。
+   - 数据库对 `(turn_id, logical_tool_call_index)` 建非空唯一约束。恢复或回调重放按已持久化顺序匹配同一逻辑调用，并核对工具名/参数哈希；出现缺口、重排或同索引不同参数时进入 `outcome_unknown`，不得分配新身份后重放。Fake/Real Pi 恢复测试必须证明 callback replay、Session resume 和 lease generation 变化都复用原身份。
    - Pi 最终响应返回后持久化响应引用并完成 Turn/路由；已完成工具行为再次调用只返回原结果引用。
    - 恢复器按 Journal 证据判断继续模型核对、未完成工具、Turn 收尾或进入 `outcome_unknown`；不得盲目重放。
    - P0 只注册可与 Forge 事务一起提交，或具有幂等键与结果核对协议的工具。
@@ -65,15 +65,16 @@ _Locked via grill — by Claude + user_
 8. **接通真实 Pi 模型目录与按 Agent 模型运行**
    - `RealPiAdapter` 通过公开运行时 API实现目录扫描、TTL/手动刷新、最近成功非敏感快照和启动前实时校验。
    - 模板默认模型、草稿覆盖来源和启动时实际 `provider_id + model_id` 全程可追溯。
-   - Worker 创建/恢复每个 Agent Session 时传入冻结模型；原模型不可用时 fail closed，不静默替换。
+   - Worker 创建/恢复每个 Agent Session 时传入冻结模型；原模型不可用时 fail closed，不静默替换。执行命令持久化进入 `blocked_model_unavailable`，保存原冻结 `provider_id + model_id`、失败证据、`retry_count` 和 `next_attempt_at`，Worker 释放租约，Case 收敛到可恢复的 `waiting_recovery` 原因投影。
+   - 仅对 Provider 暂时不可用执行持久化的有界指数退避，默认最多 3 次；目录确认模型缺失或达到上限后停止自动领取。UI 只提供显式“使用原模型重试”，该命令再次实时校验并复用冻结模型、原 Session 和恢复证据；若仍不可用则保持阻塞，不允许改模后原地续跑。用户如需换模型，只能基于原任务创建新任务。
    - 删除 `deepseek` 与全局 `PI_MODEL_ID` 作为业务默认的硬编码路径；环境变量只保留兼容诊断或显式启动覆盖，不替代任务事实。
    - 用至少一个真实 Provider/Model 验证新建、返修、暂停后恢复和崩溃恢复仍使用原 Session/模型。
 
 9. **实现持久化命令队列、Supervisor 与独立 Worker**
    - 增加常驻 Supervisor composition root；按默认全局并发 1、命令优先级、FIFO/防饥饿和 Provider 限制领取命令。
-   - 每个 Case 启动独立 Worker；Worker 持有 Case 租约、runner token 哈希、generation、心跳和 `worker_instance_id`。
-   - raw runner secret 不放入 argv、环境变量、持久化文件或日志；Supervisor 通过当前用户 SID 限制的继承 pipe/handle 交付一次性 secret，并用 Worker nonce、Case ID、instance ID 和 lease generation 完成 challenge-response。
-   - Supervisor 崩溃时健康 Worker 继续；新 Supervisor 通过 DB 证据与受限 IPC 握手接管监控，不能仅凭 PID 强杀或重复启动。
+   - 每个 Case 启动独立 Worker；Worker 持有 Case 租约、generation、心跳、`worker_instance_id`，并在内存中持有该实例的短期非导出签名私钥；数据库只持久化对应公钥、算法和实例绑定。
+   - raw bootstrap secret 与签名私钥不放入 argv、环境变量、持久化文件或日志。首次启动时 Supervisor 通过当前用户 SID 限制的继承 pipe/handle 交付一次性 bootstrap secret，Worker 生成密钥对并以 bootstrap challenge 将公钥原子绑定到 Case、instance ID 和 lease generation；bootstrap secret 随即销毁。
+   - Supervisor 崩溃时健康 Worker 继续；新 Supervisor 从 DB 读取公钥，通过 SID 限制的 IPC 发送一次性 nonce challenge，由 Worker 签名 Case ID、instance ID、lease generation 和 nonce 后完成接管。nonce 只使用一次并设短时限，不能仅凭 PID、旧签名或 token 哈希强杀、接管或重复启动。
    - 暂停/停止是持久化命令。Worker 在完整 Pi Turn 后检查：暂停成功保存检查点并退出；停止原子进入终态。
    - 暂停强杀进入 `waiting_recovery`；停止强杀经证据核对后收敛为 `stopped`，未知外部结果不自动重试。
 
@@ -81,6 +82,7 @@ _Locked via grill — by Claude + user_
     - 重建 `apps/web` 服务端 composition root，只调用 application Query/Command；删除页面直读 SQLite和 API Route 拉 CLI。
     - HTTP 固定使用 `/api/v1`。Query Route 家族为 tasks/task-overview/timeline/artifacts/templates/models/settings/commands/health；Command Route 家族为 draft-save/start/clone/archive/trash、pause/resume/stop/human-answer、template-import/model-default、catalog-refresh/settings-update。每个具体 Route 在 `contracts/http-v1.ts` 中静态列出，不提供通用 CRUD。
     - REST 写请求只接受 JSON，携带幂等键和预期修订/状态；GET 无副作用；异步命令返回 `202 + command_id`。
+    - 启动器生成并向 BFF 传入唯一规范地址；BFF 对所有请求精确 allowlist `Host` 为本次监听的 `127.0.0.1:<active_port>`，拒绝其他 Host、转发 Host 和绝对形式目标。该检查只防 DNS rebinding，不引入账号、CSRF Token、Origin/Fetch-Metadata 策略或远程访问能力。
     - 错误码基线及 HTTP 映射：`validation_failed(400)`、`not_found(404)`、`revision_conflict/state_conflict/idempotency_mismatch(409)`、`model_unavailable/template_invalid/storage_low/recovery_required/outcome_unknown(422)`、`supervisor_unavailable(503)`、`internal_error(500)`；响应只带用户消息和可选脱敏 diagnostic reference。
     - 任务列表使用 opaque `(created_at, task_id)` 游标，默认 50、最大 100；本地单 Case timeline/versions 按需整组读取，若以后测得真实卡顿再新增游标，不预建复杂分页。
     - 脱敏基线：已知 DTO/工具字段使用 allowlist；未知文本检测 credential/header/cookie/connection-string 模式；占位符统一为 `[REDACTED:<TYPE>]`；解析失败丢弃正文并记录 `redaction_failed`；历史数据 Query 时重脱敏但不原地覆盖。
@@ -133,7 +135,7 @@ _Locked via grill — by Claude + user_
 - **分阶段 Turn Journal 而非跨 await 长事务**：避免 SQLite 长写锁，代价是必须处理结果未知与每个工具的幂等核对。
 - **Supervisor 不是正确性单点**：存活 Worker 可继续并被重接管，代价是需要实例身份、租约 generation 和 IPC 握手。
 - **SSE + Query 失效而非 WebSocket/前端状态机**：足够支持单向本地更新，同时保持权威状态在 application/DB。
-- **loopback 但无用户鉴权/CSRF 子系统**：这是用户明确接受的个人本地工具边界；仍保持同源、无 CORS、JSON 写请求和无副作用 GET，但不扩张为账号或来源认证项目。
+- **loopback 但无用户鉴权/CSRF 子系统**：这是用户明确接受的个人本地工具边界；仍保持精确 loopback `Host` allowlist、同源、无 CORS、JSON 写请求和无副作用 GET，但不扩张为账号、Token 或通用来源认证项目。
 - **个人本地规模优先**：不预建虚拟列表、全文索引、复杂 Diff 服务、权限体系或分布式基础设施。
 - **真实 Pi 与强杀门禁前不抛光 UI**：避免再次出现“Fake 演示 + UI 完成但真实运行未完成”的失败模式。
 
@@ -141,11 +143,11 @@ _Locked via grill — by Claude + user_
 
 - 当前 Pi 0.82 公开目录 API、模型选择参数和 Session 核对能力的准确形态需要在步骤 2 用可运行探针证明；若能力缺失，必须先调整 Contract，不能读取 Pi 私有文件兜底。
 - Pi Agent Runtime 可能在一次模型调用中内联多次工具执行，Turn Journal 必须通过工具回调生命周期记录 intent/effect，而不能依赖“完整响应先于全部工具”的理想顺序。
-- Windows 上 Supervisor 崩溃后对存活 Worker 的重新握手需要证明不会误认 PID、不会泄露 runner token，也不会因终端关闭意外杀死整个进程树。
+- Windows 上 Supervisor 崩溃后对存活 Worker 的公钥 challenge 重握手需要证明不会误认 PID、接受重放签名、泄露私钥，也不会因终端关闭意外杀死整个进程树。
 - 从现有跨 await Turn 事务迁移到 Journal 时，历史 Case 和新 Case 的恢复路径必须有明确 Schema/版本边界；不支持混用两种执行器继续同一未完成 Turn。
 - 模板 CAS 与数据库元数据无法依靠单个 SQLite 事务覆盖文件系统，需要用 staging、原子 rename 和提交顺序保证“数据库不引用缺失对象”；P0/P1 保留孤立对象而不冒险回收。
 - 真实 Provider 调用在缺少上游幂等协议时无法保证费用 exactly-once；Forge 只承诺业务副作用不重复，并对未知调用结果 fail closed。
-- loopback 本身不能防止本机恶意网页尝试访问服务；用户已明确拒绝额外 CSRF/来源认证复杂度，本计划接受该残余风险且不允许绑定 LAN。
+- 精确 loopback `Host` allowlist 只关闭 DNS rebinding 主路径，不能替代浏览器来源认证；用户已明确拒绝额外 CSRF/来源认证复杂度，本计划接受剩余的同机威胁且不允许绑定 LAN。
 - migration backup 是数据库回滚机制，不是 CAS/Session/配置的整机灾备；完整灾备导出属于未来独立需求。
 - 这些项目是需要用 spike 和测试关闭的实施风险，不是授权扩大产品范围的开放需求。
 
@@ -155,7 +157,7 @@ _Locked via grill — by Claude + user_
 - 预定义多 Case 流程 UI、自由拖拽流程设计器和新编排器实现。
 - 人工修改产物、人工修订版本和多人批注。
 - 账号、鉴权、角色、权限、多用户、远程或局域网部署。
-- 自定义 CSRF Token、Host/Origin/Fetch-Metadata 来源认证框架。
+- 自定义 CSRF Token、Origin/Fetch-Metadata 来源认证框架；精确 loopback `Host` allowlist 除外。
 - Provider 凭据管理；凭据继续由 Pi 管理。
 - 通知、邮件、系统托盘提醒。
 - Word/PDF 转换、二进制原始文件、批量下载或批量任务。
