@@ -1,7 +1,7 @@
 # Forge UI 技术需求文档
 
 > 状态：技术需求拷问进行中
-> 当前版本：0.18
+> 当前版本：0.19
 > 首次建立：2026-07-29
 > 对应产品需求：`docs/Forge_UI_需求文档.md`
 
@@ -356,6 +356,24 @@ P0 建立三层测试与发布验收体系；Fake Pi 只承担可重复的基础
 - 真实 Pi 或进程级恢复门禁未通过时，P0 状态必须如实标记为未完成，不能用 Fake Pi 结果代替；
 - 现有 `crash-recovery-e2e.cjs` 和 `crash-recovery-realpi-e2e.cjs` 作为历史基线保留参考，但新版门禁必须覆盖 Supervisor、持久化命令、暂停控制和 UI 投影链路。
 
+### TD-020 Supervisor 重启与存活 Worker 接管
+
+Supervisor 崩溃或重启时，仍然健康的 Case Worker 继续运行；Supervisor 不是 Worker 正确执行的单点依赖：
+
+- Worker 自己持有并续约 Case 执行租约、写入心跳和完成命令结果，不依赖 Supervisor 代写业务状态；
+- Worker 在 Supervisor 暂时离线时仍检查持久化控制命令，因此暂停或停止意图不会只存在于进程间内存消息；
+- 每次 Worker 启动生成稳定到该进程生命周期的 `worker_instance_id`，并将其与 Case、命令和执行租约绑定；
+- PID 只作为诊断信息，不能单独证明 Worker 身份，也不能作为强杀或接管依据；
+- 新 Supervisor 启动后从命令、租约和心跳重建运行视图，并优先通过受限本地 IPC 使用 `worker_instance_id + case_id + lease generation` 完成身份握手；
+- 握手成功且租约仍有效时，新 Supervisor 接管健康监控，不启动第二个 Worker，也不要求原 Worker重跑当前 Turn；
+- 暂时无法完成 IPC 握手但心跳与租约仍有效时，保持观察并阻止重复调度，不凭 PID 强杀未知进程；
+- 心跳停止后仍需等待租约过期，并确认原 Worker 不再拥有合法写入权，才能领取恢复命令；
+- Worker 的每次业务写入继续验证租约 generation 与 runner token，旧 Worker 即使迟到恢复也不能越过已转移的所有权；
+- 新 Supervisor 不得通过扫描系统中所有 Node.js 进程猜测所属关系，也不得终止无法证明由 Forge 启动的进程；
+- Supervisor 重启期间 Worker 正常完成时，由 Worker 原子提交 Case/命令完成证据；新 Supervisor 重建时识别该结果，不重复执行；
+- IPC 地址、实例身份和控制令牌只保存于受限运行目录或持久化哈希字段，不进入普通 Query、SSE、日志或 UI；
+- 验收必须包含 Supervisor 被强杀、Worker 继续完成，以及 Supervisor 重启后重新接管仍在运行 Worker 两种场景。
+
 ## 3. 当前代码基线
 
 - `apps/web` 使用 Next.js 14 App Router；
@@ -369,13 +387,14 @@ P0 建立三层测试与发布验收体系；Fake Pi 只承担可重复的基础
 
 ## 4. 待继续拷问
 
-1. 进程级故障注入窗口与恢复不变量；
+1. Worker 与命令生命周期的进程级故障注入窗口；
 2. Electron 打包、数据目录、升级和进程生命周期。
 
 ## 5. 变更记录
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| 0.19 | 2026-07-29 | 确认 Supervisor 崩溃后 Worker 继续运行，并通过租约、实例身份与 IPC 握手安全接管。 |
 | 0.18 | 2026-07-29 | 确认 Fake Pi、UI E2E、真实 Pi 三层门禁和脱敏发布验收报告。 |
 | 0.17 | 2026-07-29 | 确认 Turn 间安全暂停、检查点恢复、终态停止和强制终止后的证据收敛规则。 |
 | 0.16 | 2026-07-29 | 确认默认单 Case 并发、持久化排队、调度优先级、Provider 限制和重启重建策略。 |
