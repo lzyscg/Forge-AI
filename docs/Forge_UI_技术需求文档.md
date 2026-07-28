@@ -1,7 +1,7 @@
 # Forge UI 技术需求文档
 
 > 状态：技术需求拷问进行中
-> 当前版本：0.19
+> 当前版本：0.20
 > 首次建立：2026-07-29
 > 对应产品需求：`docs/Forge_UI_需求文档.md`
 
@@ -374,6 +374,30 @@ Supervisor 崩溃或重启时，仍然健康的 Case Worker 继续运行；Super
 - IPC 地址、实例身份和控制令牌只保存于受限运行目录或持久化哈希字段，不进入普通 Query、SSE、日志或 UI；
 - 验收必须包含 Supervisor 被强杀、Worker 继续完成，以及 Supervisor 重启后重新接管仍在运行 Worker 两种场景。
 
+### TD-021 分阶段 Turn Journal 与工具副作用约束
+
+用可恢复的分阶段 Turn Journal 替代当前跨越 Pi 调用和工具执行的 SQLite 长写事务：
+
+- Turn 使用明确、可校验的阶段记录，例如 `prepared`、`model_running`、`response_recorded`、`actions_applying`、`completed`、`failed` 和 `outcome_unknown`；
+- 开始 Turn 时用短事务追加 Turn 身份、Agent、序号、输入消息引用、上下文快照引用、请求哈希、Pi Session 引用和执行租约 generation；
+- 提交 `model_running` 后在数据库事务外调用 Pi，模型网络等待期间不持有 SQLite 写锁；
+- Pi 返回后用短事务保存模型响应引用、finish reason 和结构化工具调用清单，再进入工具执行阶段；
+- 每个工具调用具有稳定 `tool_action_id`、参数哈希、目标作用域、状态和幂等键；
+- Forge 内部工具的领域副作用、工具行为完成记录和相关 UI 事件在同一个短事务中原子提交；
+- 已经处于 `completed` 的工具行为再次执行时返回原结果引用，不重复创建产物、Issue、返修、门禁结果或其他副作用；
+- 所有工具行为完成后，用短事务完成 Turn、写入输出消息引用并提交路由或 Case 状态迁移；
+- 恢复器根据 Journal 阶段决定后续动作：尚未调用、核对模型结果、继续未完成工具行为或只补齐 Turn 最终提交；
+- 已保存模型响应时不得再次调用 Pi；已完成工具行为不得再次执行领域副作用；
+- 崩溃发生在 Pi 已处理但响应尚未可靠持久化的窗口时，优先通过冻结的 Pi Session 和响应身份核对结果；
+- Pi 无法提供可靠结果核对时，把 Turn 标记为 `outcome_unknown` 并让 Case 进入 `waiting_recovery`，不盲目重新调用模型；
+- `failed` 表示已有确定失败结果；`outcome_unknown` 表示结果无法确认，两者不能混用；
+- P0 工具只允许两类副作用：能够与 Forge 权威数据在同一事务提交，或提供稳定幂等键与结果核对协议；
+- 外部非事务工具必须声明副作用类别、幂等能力、核对方式和未知结果处置策略；
+- 无法幂等、无法核对结果的外部副作用工具不进入 P0 模板能力；
+- 模型调用本身可能产生无法撤销的 Provider 费用；Forge 保证不重复提交业务副作用，但在 Provider 不支持幂等调用时不能虚假承诺费用层面的 exactly-once；
+- Turn Journal、工具行为和状态迁移全部采用追加式证据、CAS 与执行租约校验，禁止恢复过程覆盖历史记录；
+- 现有 `TurnExecutor` 跨 `await` 保持事务的实现属于待替换基线，不能作为新版并发和恢复架构继续保留。
+
 ## 3. 当前代码基线
 
 - `apps/web` 使用 Next.js 14 App Router；
@@ -387,13 +411,14 @@ Supervisor 崩溃或重启时，仍然健康的 Case Worker 继续运行；Super
 
 ## 4. 待继续拷问
 
-1. Worker 与命令生命周期的进程级故障注入窗口；
+1. Turn Journal、Worker 与命令生命周期的进程级故障注入窗口；
 2. Electron 打包、数据目录、升级和进程生命周期。
 
 ## 5. 变更记录
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| 0.20 | 2026-07-29 | 确认分阶段 Turn Journal、短事务、工具行为幂等和外部副作用准入规则。 |
 | 0.19 | 2026-07-29 | 确认 Supervisor 崩溃后 Worker 继续运行，并通过租约、实例身份与 IPC 握手安全接管。 |
 | 0.18 | 2026-07-29 | 确认 Fake Pi、UI E2E、真实 Pi 三层门禁和脱敏发布验收报告。 |
 | 0.17 | 2026-07-29 | 确认 Turn 间安全暂停、检查点恢复、终态停止和强制终止后的证据收敛规则。 |
