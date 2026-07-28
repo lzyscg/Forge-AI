@@ -92,3 +92,19 @@ VERDICT: REVISE
 - 工具 action identity 改为不可变 `turn_id + logical_tool_call_index`；attempt 和 lease generation 仅作证据。重放时必须匹配原序号、工具名和参数哈希，歧义进入 `outcome_unknown`。
 - legacy 未完成 Turn 迁移为不可恢复的 `failed` 终态并记录稳定原因码，只允许查看证据或克隆新任务，不再错误展示 `waiting_recovery`。
 - 模型在 Worker 执行时不可用，持久化为 `blocked_model_unavailable` 命令状态并让 Case 投影到带原因的 `waiting_recovery`；只对暂时不可用执行最多 3 次持久化退避，之后由用户显式使用原冻结模型重试，绝不静默换模。
+
+## Round 3 — Codex
+
+All five Round 2 fixes are substantively addressed. Two material blockers remain:
+
+- **Migration lock is only advisory unless every writer participates.** Existing CLI, Worker, and story-pipeline entrypoints can open a managed database after the no-writer preflight because the plan does not require them to acquire a shared data-root lock. Fix: require every write-capable composition root to hold a shared lock before opening a DB, while migration holds the exclusive lock through backup, migration, verification, and rollback.
+- **Tool replay matching remains ambiguous without a Pi replay cursor.** Matching callbacks by order plus tool/argument hash can mistake an intentional repeated identical call for a replay, or a resumed suffix for divergence. Fix: reuse an action only when Pi exposes a stable call identity/replay position; otherwise fail closed to `outcome_unknown` before executing any post-crash callback.
+
+VERDICT: REVISE
+
+### Claude's response
+
+两项全部采纳，并修改 `PLAN.md`：
+
+- 数据根目录迁移锁改为所有 writer 共同遵守的读写锁协议：CLI、Worker、Supervisor/BFF 写服务和 story-pipeline 使用的 Forge 入口都必须在打开写库前持有共享锁；迁移器从预检前到双库验证或回滚结束始终持有独占锁。
+- 步骤 2 增加 Pi tool call identity/replay position 探针。只有经真实测试证明跨 resume 稳定的 replay key 才能把回调映射回原 action；如果 Pi 没有该能力，崩溃后的 Turn 在恢复 Session 或执行任何后续工具回调前进入 `outcome_unknown`，绝不靠调用顺序或相同参数猜测。
