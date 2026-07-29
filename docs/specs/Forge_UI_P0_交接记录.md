@@ -1,6 +1,6 @@
 # Forge UI P0 交接记录
 
-> 状态：`NOT_READY`
+> 状态：`READY`
 > 作用：这是开发 Agent 唯一可以当作外部授权和输入事实使用的交接记录。
 > 安全：只记录非秘密信息。API Key、Token、Cookie、Authorization Header 和凭据文件内容不得写入本文。
 
@@ -31,13 +31,13 @@ excludes:
 
 ```yaml
 repository: C:/Users/13863/Desktop/zhihu/Forge AI/Forge-AI-main
-spec_baseline_commit: NOT_SET
+spec_baseline_commit: ad5fb6fafe7cadc5063f68acb03dbd433d4d2123
 handoff_record_commit: CURRENT_HEAD
 handoff_record_parent_must_equal_spec_baseline: true
-target_branch: NOT_SET
+target_branch: codex/forge-ui-p0-handoff
 worktree_must_be_clean: true
-allow_create_codex_branch: NOT_SET
-allow_task_commits: NOT_SET
+allow_create_codex_branch: true
+allow_task_commits: true
 allow_push: false
 allow_pull_request: false
 ```
@@ -80,15 +80,15 @@ observed_handoff_docs_committed: false
 ## 3. 本机与 Harness 权限
 
 ```yaml
-windows_available: NOT_SET
-node_version_gte_22_19: NOT_SET
-npm_registry_access: NOT_SET
-extra_disk_space_gib_gte_5: NOT_SET
-allow_repository_p0_file_changes: NOT_SET
-allow_npm_ci_and_builds: NOT_SET
-allow_playwright_chromium_install: NOT_SET
-allow_temp_data_and_release_roots: NOT_SET
-allow_start_stop_registered_test_processes: NOT_SET
+windows_available: true
+node_version_gte_22_19: true
+npm_registry_access: true
+extra_disk_space_gib_gte_5: true
+allow_repository_p0_file_changes: true
+allow_npm_ci_and_builds: true
+allow_playwright_chromium_install: true
+allow_temp_data_and_release_roots: true
+allow_start_stop_registered_test_processes: true
 allow_terminate_unknown_processes: false
 ```
 
@@ -99,14 +99,14 @@ allow_terminate_unknown_processes: false
 凭据必须已经由 Pi 或本机环境管理；本文只记录状态和非秘密标识。
 
 ```yaml
-pi_auth_configured_locally: NOT_SET
-provider_id: NOT_SET
-model_id: NOT_SET
-provider_network_available: NOT_SET
-tool_calling_allowed: NOT_SET
-real_pi_calls_authorized: NOT_SET
-real_pi_cost_limit: NOT_SET
-real_pi_time_window: NOT_SET
+pi_auth_configured_locally: true
+provider_id: deepseek
+model_id: deepseek-v4-flash
+provider_network_available: true
+tool_calling_allowed: true
+real_pi_calls_authorized: true
+real_pi_cost_limit: unlimited
+real_pi_time_window: unlimited
 ```
 
 Task 4 用该选择完成目录、signature 和 in-memory Session 重建兼容性探针。Task 13 必须使用同一选择；更换 Provider/Model 会回到 Task 4。
@@ -116,7 +116,7 @@ Task 4 用该选择完成目录、signature 和 in-memory Session 重建兼容�
 必须且只能选择一项：
 
 ```yaml
-real_legacy_data_strategy: NOT_SET
+real_legacy_data_strategy: no_real_migration_use_fixtures_and_fresh_root
 allowed_values:
   - no_real_migration_use_fixtures_and_fresh_root
   - migrate_production_under_strict_offline_protocol
@@ -136,14 +136,14 @@ real_legacy_data_strategy: no_real_migration_use_fixtures_and_fresh_root
 
 ```yaml
 visual_direction: warm restrained light editor
-reference_image_mode: NOT_SET
+reference_image_mode: none_use_frozen_direction
 reference_image_mode_allowed:
   - none_use_frozen_direction
   - repository_asset
-reference_image_path: NOT_SET
-reference_image_sha256: NOT_SET
-reference_image_media_type: NOT_SET
-reference_image_bytes: NOT_SET
+reference_image_path: NONE
+reference_image_sha256: NONE
+reference_image_media_type: NONE
+reference_image_bytes: NONE
 final_visual_signoff_required: true
 ```
 
