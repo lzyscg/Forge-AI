@@ -2,6 +2,14 @@
   'use strict';
 
   const allowedViews = new Set(['workbench', 'templates', 'overview', 'trace']);
+  const taskActionsByStatus = {
+    running: ['pause', 'stop'],
+    waiting: ['stop'],
+    repairing: ['pause', 'stop'],
+    draft: ['new-from-task'],
+    failed: ['retry'],
+    delivered: ['copy-result', 'download-result', 'new-from-task'],
+  };
 
   function createInitialState(data) {
     return {
@@ -75,6 +83,10 @@
     };
   }
 
+  function getTaskActions(status) {
+    return [...(taskActionsByStatus[status] ?? [])];
+  }
+
   global.ForgePrototypeState = {
     createInitialState,
     filterTasks,
@@ -83,5 +95,6 @@
     selectAgent,
     selectTimeline,
     selectEvolution,
+    getTaskActions,
   };
 })(window);

@@ -49,6 +49,15 @@
     verified: { label: '验证事件', icon: 'check' },
   };
 
+  const taskActionMeta = {
+    pause: { label: '暂停', icon: 'pause', className: 'button-secondary' },
+    stop: { label: '停止', icon: 'stop', className: 'button-danger' },
+    retry: { label: '重试', icon: 'retry', className: 'button-secondary' },
+    'copy-result': { label: '复制结果', icon: 'artifact', className: 'button-secondary' },
+    'download-result': { label: '下载结果', icon: 'link', className: 'button-secondary' },
+    'new-from-task': { label: '基于此任务新建', icon: 'plus', className: 'button-primary' },
+  };
+
   let state = {
     ...stateApi.createInitialState(data),
     modelDetailAgentId: null,
@@ -355,15 +364,7 @@
             </div>
           </div>
           <div class="hero-actions" aria-label="任务模拟操作">
-            <button class="button button-secondary" type="button" data-action="notice" data-notice="pause">
-              ${icon('pause')}<span>暂停</span>
-            </button>
-            <button class="button button-secondary" type="button" data-action="notice" data-notice="retry">
-              ${icon('retry')}<span>重试</span>
-            </button>
-            <button class="button button-danger" type="button" data-action="notice" data-notice="stop">
-              ${icon('stop')}<span>停止</span>
-            </button>
+            ${renderTaskActions(task.status)}
           </div>
         </section>
 
@@ -409,6 +410,28 @@
         ${renderArtifactPanel(task)}
       </div>
     `;
+  }
+
+  function renderTaskActions(status) {
+    return stateApi
+      .getTaskActions(status)
+      .map((actionId) => {
+        const action = taskActionMeta[actionId];
+        if (!action) {
+          return '';
+        }
+        return `
+          <button
+            class="button ${action.className}"
+            type="button"
+            data-action="notice"
+            data-notice="${escapeHtml(actionId)}"
+          >
+            ${icon(action.icon)}<span>${escapeHtml(action.label)}</span>
+          </button>
+        `;
+      })
+      .join('');
   }
 
   function renderAgentOverviewCard(agent) {
@@ -788,6 +811,18 @@
       retry: {
         title: '重试轮次 · 原型演示',
         body: '此入口用于演示失败恢复位置。离线原型不会创建新 Turn，也不会声称重试成功。',
+      },
+      'copy-result': {
+        title: '复制结果 · 原型演示',
+        body: '此入口仅说明已交付结果的复制位置。离线原型不会写入剪贴板，也不会声称已经复制。',
+      },
+      'download-result': {
+        title: '下载结果 · 原型演示',
+        body: '此入口仅说明已交付结果的下载位置。离线原型不会生成文件，也不会触发真实下载。',
+      },
+      'new-from-task': {
+        title: '基于此任务新建 · 原型演示',
+        body: '此入口用于说明终态任务的后续生产路径。离线原型不会创建 Case、保存配置或启动生产。',
       },
       'model-change': {
         title: '切换模型 · 原型演示',

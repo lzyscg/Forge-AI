@@ -51,4 +51,25 @@ const selectedVersion = api.selectEvolution(selectedTurn, {
 assert.equal(selectedVersion.selectedEvolutionId, 'version-2');
 assert.equal(selectedVersion.selectedTimelineId, 'turn-6');
 
-console.log('Forge prototype state tests: 7 passed');
+assert.deepEqual(
+  Array.from(api.getTaskActions('delivered')),
+  ['copy-result', 'download-result', 'new-from-task'],
+  'delivered tasks must expose only read-only or follow-up actions',
+);
+assert.deepEqual(
+  Array.from(api.getTaskActions('running')),
+  ['pause', 'stop'],
+  'running tasks must expose only running-state controls',
+);
+assert.deepEqual(
+  Array.from(api.getTaskActions('failed')),
+  ['retry'],
+  'failed tasks may retry but cannot be stopped again',
+);
+assert.deepEqual(
+  Array.from(api.getTaskActions('unknown')),
+  [],
+  'unknown task statuses must fail closed with no actions',
+);
+
+console.log('Forge prototype state tests: 11 passed');
