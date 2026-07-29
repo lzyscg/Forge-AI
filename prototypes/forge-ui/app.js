@@ -18,6 +18,8 @@
     dialog: document.getElementById('prototype-dialog'),
     dialogTitle: document.getElementById('prototype-dialog-title'),
     dialogBody: document.getElementById('prototype-dialog-body'),
+    turnInspector: document.getElementById('turn-inspector'),
+    turnInspectorContent: document.getElementById('turn-inspector-content'),
   };
 
   const statusMeta = {
@@ -147,6 +149,8 @@
 
     if (state.view === 'templates') {
       renderTemplates();
+    } else if (state.view === 'workspace') {
+      renderWorkspace(findPrimaryTask());
     } else if (state.view === 'overview') {
       renderOverview(findPrimaryTask());
     } else if (state.view === 'trace') {
@@ -325,6 +329,363 @@
           )
           .join('')}
       </section>
+    `;
+  }
+
+  function renderWorkspace(task) {
+    elements.viewTitle.innerHTML = `
+      <div class="title-copy workspace-title-copy">
+        <p class="eyebrow">${escapeHtml(task.displayId)} · Production workspace</p>
+        <h1 tabindex="-1">${escapeHtml(task.title)}</h1>
+        <p class="view-subtitle">
+          ${escapeHtml(task.phase)} · Agent 左右分列，时间从上向下推进。
+        </p>
+      </div>
+    `;
+    elements.viewToolbar.innerHTML = `
+      <div class="toolbar-group">
+        <button class="button button-quiet" type="button" data-action="back-workbench">
+          ${icon('arrow-left')}
+          <span>返回工作台</span>
+        </button>
+        ${statusBadge(task.status)}
+        <span class="workspace-current">
+          ${icon('clock')}
+          ${escapeHtml(task.updatedAt)} · ${escapeHtml(task.agents.length)} 个 Agent
+        </span>
+      </div>
+      <div class="toolbar-group workspace-actions" aria-label="任务操作">
+        ${renderTaskActions(task.status)}
+      </div>
+    `;
+
+    elements.viewContent.innerHTML = `
+      <section
+        class="workspace-grid ${state.configDrawerOpen ? 'has-config-open' : ''} ${state.artifactDrawerOpen ? 'has-artifact-open' : ''}"
+        aria-label="任务运行工作区"
+      >
+        ${renderConfigDrawer(task)}
+        <section class="swimlane-workspace" aria-label="Agent 泳道流程图">
+          <div class="swimlane-intro">
+            <div>
+              <p class="eyebrow">Agent execution graph</p>
+              <h2>生产流程</h2>
+              <p>点击 Turn 查看完整 Agent 会话；点击产物节点联动右侧演进链。</p>
+            </div>
+            <div class="graph-legend" aria-label="节点图例">
+              <span><i class="legend-dot is-input"></i>输入</span>
+              <span><i class="legend-dot is-turn"></i>Turn</span>
+              <span><i class="legend-dot is-output"></i>输出 / 产物</span>
+              <span><i class="legend-dot is-system"></i>系统事件</span>
+            </div>
+          </div>
+          ${renderSwimlaneCanvas(task)}
+        </section>
+        ${renderArtifactDrawer(task)}
+      </section>
+    `;
+  }
+
+  function renderConfigDrawer(task) {
+    if (!state.configDrawerOpen) {
+      return `
+        <aside class="workspace-drawer config-drawer is-collapsed" aria-label="运行配置">
+          <button
+            class="drawer-rail-button"
+            type="button"
+            data-action="toggle-config-drawer"
+            aria-expanded="false"
+            aria-label="打开运行配置"
+          >
+            ${icon('model')}
+            <span>运行配置</span>
+          </button>
+        </aside>
+      `;
+    }
+
+    return `
+      <aside class="workspace-drawer config-drawer is-open" aria-label="运行配置">
+        <div class="drawer-header">
+          <div>
+            <p class="eyebrow">Configuration</p>
+            <h2>运行配置</h2>
+          </div>
+          <button
+            class="icon-button"
+            type="button"
+            data-action="toggle-config-drawer"
+            aria-expanded="true"
+            aria-label="收起运行配置"
+          >
+            ${icon('close')}
+          </button>
+        </div>
+        <div class="drawer-scroll">
+          <section class="config-section">
+            <h3>模板与场景</h3>
+            <dl class="compact-definition">
+              <dt>模板</dt><dd>${escapeHtml(task.template)}</dd>
+              <dt>环境</dt><dd>${state.environment === 'production' ? '生产' : '测试'}（模拟）</dd>
+              <dt>配置状态</dt><dd>启动后已冻结</dd>
+            </dl>
+          </section>
+          <section class="config-section">
+            <h3>Agent 与模型</h3>
+            <div class="config-agent-list">
+              ${task.agents
+                .map(
+                  (agent) => `
+                    <article class="config-agent" style="--agent-color: ${safeColor(agent.color)}">
+                      <span class="agent-dot" aria-hidden="true">${icon('agent')}</span>
+                      <span>
+                        <strong>${escapeHtml(agent.name)}</strong>
+                        <small>${escapeHtml(agent.role)}</small>
+                        <code>${escapeHtml(agent.model)}</code>
+                        <small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.modelSource)}</small>
+                      </span>
+                    </article>
+                  `,
+                )
+                .join('')}
+            </div>
+          </section>
+          <section class="config-section">
+            <h3>运行参数</h3>
+            <dl class="compact-definition">
+              <dt>版本策略</dt><dd>追加，不覆盖</dd>
+              <dt>交付方式</dt><dd>系统门禁</dd>
+              <dt>会话策略</dt><dd>Agent 独立会话</dd>
+            </dl>
+          </section>
+          <div class="drawer-note">
+            ${icon('info')}
+            <p>这里只展示已冻结配置。离线原型不会修改模型或启动真实运行。</p>
+          </div>
+        </div>
+      </aside>
+    `;
+  }
+
+  function renderArtifactDrawer(task) {
+    if (!state.artifactDrawerOpen) {
+      return `
+        <aside class="workspace-drawer artifact-drawer is-collapsed" aria-label="产物与演进">
+          <button
+            class="drawer-rail-button"
+            type="button"
+            data-action="toggle-artifact-drawer"
+            aria-expanded="false"
+            aria-label="打开产物与演进"
+          >
+            ${icon('artifact')}
+            <span>产物与演进</span>
+          </button>
+        </aside>
+      `;
+    }
+
+    return `
+      <aside class="workspace-drawer artifact-drawer is-open" aria-label="产物与演进">
+        <div class="drawer-header">
+          <div>
+            <p class="eyebrow">Artifact line</p>
+            <h2>产物与演进</h2>
+          </div>
+          <button
+            class="icon-button"
+            type="button"
+            data-action="toggle-artifact-drawer"
+            aria-expanded="true"
+            aria-label="收起产物与演进"
+          >
+            ${icon('close')}
+          </button>
+        </div>
+        <div class="drawer-scroll artifact-drawer-scroll">
+          ${renderEvolution(task.evolution)}
+          ${renderArtifactPanel(task)}
+          <section class="delivery-mini" aria-labelledby="workspace-delivery-title">
+            <div class="delivery-mini-head">
+              <h3 id="workspace-delivery-title">交付门禁</h3>
+              ${statusBadge('passed')}
+            </div>
+            ${task.deliveryChecks
+              .map(
+                (check) => `
+                  <div class="delivery-mini-row">
+                    ${icon('check')}
+                    <span><strong>${escapeHtml(check.label)}</strong><small>${escapeHtml(check.detail)}</small></span>
+                  </div>
+                `,
+              )
+              .join('')}
+          </section>
+        </div>
+      </aside>
+    `;
+  }
+
+  function renderSwimlaneCanvas(task) {
+    const laneWidth = 218;
+    const laneGap = 20;
+    const canvasPadding = 24;
+    const turnStep = 240;
+    const canvasWidth =
+      canvasPadding * 2 + task.agents.length * laneWidth + (task.agents.length - 1) * laneGap;
+    const canvasHeight = 40 + task.turns.length * turnStep;
+    const agentIndex = new Map(task.agents.map((agent, index) => [agent.id, index]));
+    const nodeCenterX = (turn) =>
+      canvasPadding + (agentIndex.get(turn.agentId) || 0) * (laneWidth + laneGap) + laneWidth / 2;
+    const nodeY = (index) => 28 + index * turnStep;
+
+    const paths = [];
+    task.turns.forEach((turn, index) => {
+      const centerX = nodeCenterX(turn);
+      const y = nodeY(index);
+      const selected = state.selectedTimelineId === turn.id;
+      paths.push(
+        `<path class="route-path route-internal ${selected ? 'is-selected' : ''}" d="M ${centerX} ${y + 36} L ${centerX} ${y + 48}"></path>`,
+        `<path class="route-path route-internal ${selected ? 'is-selected' : ''}" d="M ${centerX} ${y + 136} L ${centerX} ${y + 146}"></path>`,
+        `<path class="route-path route-internal ${selected ? 'is-selected' : ''}" d="M ${centerX} ${y + 188} L ${centerX} ${y + 198}"></path>`,
+      );
+
+      const nextTurn = task.turns[index + 1];
+      if (nextTurn) {
+        const nextX = nodeCenterX(nextTurn);
+        const nextY = nodeY(index + 1);
+        const routeSelected =
+          state.selectedTimelineId === turn.id || state.selectedTimelineId === nextTurn.id;
+        const bendY = y + 246;
+        paths.push(`
+          <path
+            class="route-path route-handoff ${routeSelected ? 'is-selected' : ''}"
+            d="M ${centerX} ${y + 228} C ${centerX} ${bendY}, ${nextX} ${nextY - 18}, ${nextX} ${nextY}"
+            marker-end="url(#route-arrow)"
+          ></path>
+        `);
+      }
+    });
+
+    return `
+      <div class="swimlane-scroll" tabindex="0" aria-label="可横向和纵向滚动的 Agent 泳道">
+        <div class="swimlane-stage" style="width:${canvasWidth}px">
+          <div
+            class="swimlane-head-grid"
+            style="grid-template-columns:repeat(${task.agents.length}, ${laneWidth}px);gap:${laneGap}px;padding-inline:${canvasPadding}px"
+          >
+            ${task.agents
+              .map(
+                (agent) => `
+                  <div class="swimlane-agent-head" style="--agent-color:${safeColor(agent.color)}">
+                    <span class="agent-dot" aria-hidden="true">${icon('agent')}</span>
+                    <span>
+                      <strong>${escapeHtml(agent.name)}</strong>
+                      <small>${escapeHtml(agent.model)}</small>
+                    </span>
+                  </div>
+                `,
+              )
+              .join('')}
+          </div>
+          <div class="swimlane-canvas" style="height:${canvasHeight}px">
+            <svg
+              class="route-layer"
+              width="${canvasWidth}"
+              height="${canvasHeight}"
+              viewBox="0 0 ${canvasWidth} ${canvasHeight}"
+              aria-hidden="true"
+            >
+              <defs>
+                <marker id="route-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z"></path>
+                </marker>
+              </defs>
+              ${paths.join('')}
+            </svg>
+            ${task.agents
+              .map(
+                (agent, index) => `
+                  <div
+                    class="lane-backdrop"
+                    style="left:${canvasPadding + index * (laneWidth + laneGap)}px;width:${laneWidth}px;--agent-color:${safeColor(agent.color)}"
+                    aria-hidden="true"
+                  ></div>
+                `,
+              )
+              .join('')}
+            ${task.turns
+              .map((turn, index) =>
+                renderTurnGraphCluster(
+                  turn,
+                  index,
+                  canvasPadding +
+                    (agentIndex.get(turn.agentId) || 0) * (laneWidth + laneGap),
+                  nodeY(index),
+                  laneWidth,
+                ),
+              )
+              .join('')}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderTurnGraphCluster(turn, index, left, top, width) {
+    const agent = findAgent(turn.agentId);
+    const selected = state.selectedTimelineId === turn.id;
+    const inputLabel =
+      turn.input?.attachments?.[0]?.label || (index === 0 ? '任务输入' : '上游信息');
+    const outputLabel =
+      findEvolution(turn.linkedEvolutionId)?.title || turn.output?.text || 'Agent 输出';
+    const outputAction = turn.linkedEvolutionId
+      ? `data-action="select-evolution" data-evolution-id="${escapeHtml(turn.linkedEvolutionId)}"`
+      : '';
+
+    return `
+      <div
+        class="graph-node input-node"
+        style="left:${left + 14}px;top:${top}px;width:${width - 28}px;--agent-color:${safeColor(agent?.color)}"
+      >
+        <span class="node-kicker">输入</span>
+        <strong>${escapeHtml(inputLabel)}</strong>
+      </div>
+      <button
+        class="graph-node turn-node ${selected ? 'is-selected' : ''}"
+        style="left:${left}px;top:${top + 48}px;width:${width}px;--agent-color:${safeColor(agent?.color)}"
+        type="button"
+        data-action="open-turn-inspector"
+        data-turn-id="${escapeHtml(turn.id)}"
+        aria-label="查看 ${escapeHtml(agent?.name || 'Agent')} ${escapeHtml(turn.title)} 的完整会话"
+        aria-pressed="${selected}"
+      >
+        <span class="turn-node-top">
+          <span class="turn-index">${escapeHtml(turn.sequence)}</span>
+          <time>${escapeHtml(turn.time)}</time>
+        </span>
+        <strong>${escapeHtml(turn.title)}</strong>
+        <span>${escapeHtml(kindLabels[turn.kind] || '执行轮次')} · ${escapeHtml(turn.duration || '')}</span>
+        <small>${escapeHtml(turn.toolCalls?.length || 0)} 次工具调用 · 查看全过程</small>
+      </button>
+      <${
+        turn.linkedEvolutionId ? 'button' : 'div'
+      }
+        class="graph-node output-node ${state.selectedEvolutionId === turn.linkedEvolutionId ? 'is-selected' : ''}"
+        style="left:${left + 14}px;top:${top + 146}px;width:${width - 28}px;--agent-color:${safeColor(agent?.color)}"
+        ${turn.linkedEvolutionId ? 'type="button"' : ''}
+        ${outputAction}
+      >
+        <span class="node-kicker">${turn.linkedEvolutionId ? '产物 / 事件' : '输出'}</span>
+        <strong>${escapeHtml(outputLabel)}</strong>
+      </${turn.linkedEvolutionId ? 'button' : 'div'}>
+      <div
+        class="graph-node system-node"
+        style="left:${left + 14}px;top:${top + 198}px;width:${width - 28}px"
+      >
+        ${icon('check')}
+        <span>${escapeHtml(turn.systemEvents?.[0] || '系统已记录')}</span>
+      </div>
     `;
   }
 
@@ -778,6 +1139,234 @@
     `;
   }
 
+  function showTurnInspector(turn) {
+    const agent = findAgent(turn.agentId);
+    if (!agent || !elements.turnInspector || !elements.turnInspectorContent) {
+      return;
+    }
+
+    const agentTurns = findPrimaryTask().turns.filter(
+      (candidate) => candidate.agentId === agent.id,
+    );
+    elements.turnInspectorContent.innerHTML = `
+      <div class="inspector-shell" style="--agent-color:${safeColor(agent.color)}">
+        <header class="inspector-header">
+          <div class="inspector-agent">
+            <span class="agent-avatar" aria-hidden="true">${icon('agent')}</span>
+            <span>
+              <p class="eyebrow">Agent run inspector</p>
+              <h2 id="turn-inspector-title">${escapeHtml(agent.name)}</h2>
+              <small>${escapeHtml(agent.role)} · ${escapeHtml(agent.provider)} / ${escapeHtml(agent.model)}</small>
+            </span>
+          </div>
+          <div class="inspector-current-meta">
+            <span>Turn ${escapeHtml(turn.sequence)}</span>
+            ${statusBadge(turn.status)}
+            <span>${escapeHtml(turn.time)} · ${escapeHtml(turn.duration || '')}</span>
+          </div>
+          <button
+            class="icon-button"
+            type="button"
+            data-action="close-turn-inspector"
+            aria-label="关闭 Agent 运行详情"
+          >
+            ${icon('close')}
+          </button>
+        </header>
+        <div class="inspector-safety-note" role="note">
+          ${icon('info')}
+          <span>只读运行证据 · “推理摘要”是可公开决策说明，不是模型隐藏思维链。</span>
+        </div>
+        <div class="conversation-stream">
+          ${agentTurns
+            .map((agentTurn) => renderConversationTurn(agentTurn, agent, agentTurn.id === turn.id))
+            .join('')}
+        </div>
+        <footer class="inspector-footer">
+          <span><kbd>Esc</kbd> 关闭后返回原流程节点</span>
+          <button class="button button-primary" type="button" data-action="close-turn-inspector">
+            返回泳道
+          </button>
+        </footer>
+      </div>
+    `;
+
+    if (typeof elements.turnInspector.showModal === 'function') {
+      if (!elements.turnInspector.open) {
+        elements.turnInspector.showModal();
+      }
+    } else {
+      elements.turnInspector.setAttribute('open', '');
+    }
+
+    global.requestAnimationFrame(() => {
+      const currentTurn = elements.turnInspector.querySelector(
+        `[data-conversation-turn="${turn.id}"]`,
+      );
+      if (currentTurn instanceof HTMLElement) {
+        currentTurn.scrollIntoView({ block: 'center', behavior: 'instant' });
+      }
+      const closeButton = elements.turnInspector.querySelector(
+        '[data-action="close-turn-inspector"]',
+      );
+      if (closeButton instanceof HTMLElement) {
+        closeButton.focus({ preventScroll: true });
+      }
+    });
+  }
+
+  function renderConversationTurn(turn, agent, isCurrent) {
+    const attachments = turn.input?.attachments || [];
+    const toolCalls = turn.toolCalls || [];
+    const systemEvents = turn.systemEvents || [];
+
+    return `
+      <details
+        class="conversation-turn ${isCurrent ? 'is-current' : ''}"
+        data-conversation-turn="${escapeHtml(turn.id)}"
+        ${isCurrent ? 'open' : ''}
+      >
+        <summary>
+          <span class="conversation-turn-index">${escapeHtml(turn.sequence)}</span>
+          <span>
+            <strong>${escapeHtml(turn.title)}</strong>
+            <small>${escapeHtml(turn.time)} · ${escapeHtml(turn.duration || '')} · ${escapeHtml(toolCalls.length)} 次工具调用</small>
+          </span>
+          ${isCurrent ? '<span class="current-turn-label">当前 Turn</span>' : ''}
+        </summary>
+        <div class="conversation-body">
+          <section class="conversation-block incoming-message">
+            <div class="conversation-label">
+              <span class="message-avatar">${icon('link')}</span>
+              <span><strong>上游输入</strong><small>完整业务输入</small></span>
+            </div>
+            <div class="message-bubble">
+              <p>${escapeHtml(turn.input?.text || '没有记录业务输入。')}</p>
+              ${
+                attachments.length
+                  ? `
+                    <div class="message-attachments" aria-label="输入附件">
+                      ${attachments
+                        .map(
+                          (attachment) => `
+                            <button
+                              class="attachment-chip"
+                              type="button"
+                              ${
+                                findEvolution(attachment.id)
+                                  ? `data-action="select-evolution-from-inspector" data-evolution-id="${escapeHtml(attachment.id)}"`
+                                  : 'disabled'
+                              }
+                            >
+                              ${icon(attachment.kind === 'issue' ? 'alert' : 'artifact')}
+                              <span>${escapeHtml(attachment.label)}</span>
+                            </button>
+                          `,
+                        )
+                        .join('')}
+                    </div>
+                  `
+                  : ''
+              }
+            </div>
+          </section>
+
+          <section class="conversation-block agent-message">
+            <div class="conversation-label">
+              <span class="message-avatar">${icon('agent')}</span>
+              <span><strong>${escapeHtml(agent.name)}</strong><small>推理摘要</small></span>
+            </div>
+            <div class="reasoning-summary">
+              <div class="reasoning-title">${icon('info')}<strong>公开决策说明</strong></div>
+              <p>${escapeHtml(turn.reasoningSummary || '本轮没有公开推理摘要。')}</p>
+            </div>
+          </section>
+
+          <section class="tool-sequence" aria-label="工具调用过程">
+            <div class="conversation-section-title">
+              <span>${icon('model')} 工具调用</span>
+              <small>按真实发生顺序 · ${escapeHtml(toolCalls.length)} 次</small>
+            </div>
+            ${
+              toolCalls.length
+                ? toolCalls
+                    .map(
+                      (toolCall, toolIndex) => `
+                        <details class="tool-call-card" ${isCurrent ? 'open' : ''}>
+                          <summary>
+                            <span class="tool-order">${String(toolIndex + 1).padStart(2, '0')}</span>
+                            <span>
+                              <strong>${escapeHtml(toolCall.name)}</strong>
+                              <small>${escapeHtml(toolCall.duration)} · ${escapeHtml(statusMeta[toolCall.status]?.label || toolCall.status)}</small>
+                            </span>
+                            ${icon('chevron')}
+                          </summary>
+                          <div class="tool-call-detail">
+                            <div>
+                              <span>脱敏参数</span>
+                              <pre>${escapeHtml(toolCall.arguments)}</pre>
+                            </div>
+                            <div>
+                              <span>返回结果</span>
+                              <p>${escapeHtml(toolCall.result)}</p>
+                            </div>
+                          </div>
+                        </details>
+                      `,
+                    )
+                    .join('')
+                : '<p class="empty-inline">本轮没有调用工具。</p>'
+            }
+          </section>
+
+          <section class="conversation-block agent-message output-message">
+            <div class="conversation-label">
+              <span class="message-avatar">${icon('agent')}</span>
+              <span><strong>${escapeHtml(agent.name)}</strong><small>完整输出</small></span>
+            </div>
+            <div class="message-bubble agent-output">
+              <p>${escapeHtml(turn.output?.text || '没有记录模型输出。')}</p>
+            </div>
+          </section>
+
+          <section class="system-event-list" aria-label="系统处理结果">
+            <div class="conversation-section-title">
+              <span>${icon('check')} 系统处理结果</span>
+              <small>由 Forge 记录，不由 Agent 声明</small>
+            </div>
+            ${systemEvents
+              .map(
+                (event) => `
+                  <div class="system-event-row">
+                    ${icon('check')}
+                    <span>${escapeHtml(event)}</span>
+                  </div>
+                `,
+              )
+              .join('')}
+          </section>
+        </div>
+      </details>
+    `;
+  }
+
+  function closeTurnInspector() {
+    const turnId = state.inspectorTurnId;
+    if (
+      elements.turnInspector &&
+      typeof elements.turnInspector.close === 'function' &&
+      elements.turnInspector.open
+    ) {
+      elements.turnInspector.close();
+    } else if (elements.turnInspector) {
+      elements.turnInspector.removeAttribute('open');
+    }
+    state = stateApi.closeTurnInspector(state);
+    if (turnId) {
+      focusAfterRender(`[data-action="open-turn-inspector"][data-turn-id="${turnId}"]`);
+    }
+  }
+
   function showPrototypeNotice(title, body) {
     elements.dialogTitle.textContent = title;
     elements.dialogBody.textContent = body;
@@ -874,7 +1463,56 @@
       } else {
         showPrototypeNotice(
           '浅层任务记录',
-          `为保持原型聚焦，只有“${data.primaryTask.title}”配置了完整总览、执行轨迹和产物演进；其他任务用于演示列表状态。`,
+          `为保持原型聚焦，只有“${data.primaryTask.title}”配置了完整任务工作区、Agent 泳道和产物演进；其他任务用于演示列表状态。`,
+        );
+      }
+      return;
+    }
+
+    if (action === 'toggle-config-drawer') {
+      state = stateApi.toggleConfigDrawer(state);
+      renderApp();
+      focusAfterRender('[data-action="toggle-config-drawer"]');
+      return;
+    }
+
+    if (action === 'toggle-artifact-drawer') {
+      state = stateApi.toggleArtifactDrawer(state);
+      renderApp();
+      focusAfterRender('[data-action="toggle-artifact-drawer"]');
+      return;
+    }
+
+    if (action === 'open-turn-inspector') {
+      const turn = findTurn(actionElement.dataset.turnId);
+      if (turn) {
+        state = stateApi.selectTimeline(state, turn);
+        state = stateApi.openTurnInspector(state, turn.id);
+        renderApp();
+        showTurnInspector(turn);
+      }
+      return;
+    }
+
+    if (action === 'close-turn-inspector') {
+      closeTurnInspector();
+      return;
+    }
+
+    if (action === 'select-evolution-from-inspector') {
+      const node = findEvolution(actionElement.dataset.evolutionId);
+      if (node) {
+        if (elements.turnInspector.open) {
+          elements.turnInspector.close();
+        }
+        state = stateApi.closeTurnInspector(state);
+        state = {
+          ...stateApi.selectEvolution(state, node),
+          artifactDrawerOpen: true,
+        };
+        renderApp();
+        focusAfterRender(
+          `[data-action="select-evolution"][data-evolution-id="${node.id}"]`,
         );
       }
       return;
@@ -1006,6 +1644,12 @@
       elements.search.focus();
     }
 
+    if (event.key === 'Escape' && elements.turnInspector?.open) {
+      event.preventDefault();
+      closeTurnInspector();
+      return;
+    }
+
     if (event.key === 'Escape' && elements.dialog.open) {
       event.preventDefault();
       closeDialog();
@@ -1021,6 +1665,17 @@
   elements.dialog.addEventListener('cancel', (event) => {
     event.preventDefault();
     closeDialog();
+  });
+
+  elements.turnInspector.addEventListener('click', (event) => {
+    if (event.target === elements.turnInspector) {
+      closeTurnInspector();
+    }
+  });
+
+  elements.turnInspector.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    closeTurnInspector();
   });
 
   renderApp();

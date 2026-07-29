@@ -179,7 +179,7 @@
           <main id="main-content" class="main-content">
             <div class="desktop-banner" role="note">
               <svg class="icon" aria-hidden="true"><use href="#icon-info"></use></svg>
-              <span>建议在桌面端查看完整执行轨迹；当前布局已压缩为单列。</span>
+              <span>建议在桌面端查看完整 Agent 泳道；当前尺寸下可横向滚动画布并使用覆盖抽屉。</span>
             </div>
             <div id="view-title" class="view-title"></div>
             <div id="view-toolbar" class="view-toolbar"></div>
@@ -225,9 +225,17 @@
       </div>
     </dialog>
 
+    <dialog
+      id="turn-inspector"
+      class="turn-inspector"
+      aria-labelledby="turn-inspector-title"
+    >
+      <div id="turn-inspector-content"></div>
+    </dialog>
+
     <noscript>
       <div class="noscript-message">
-        此静态交互原型需要 JavaScript 才能展示任务、执行轨迹和产物 Diff。
+        此静态交互原型需要 JavaScript 才能展示任务、Agent 泳道、完整会话和产物 Diff。
       </div>
     </noscript>
   </body>

@@ -33,11 +33,26 @@ assert.deepEqual(
   'search must include task phase',
 );
 
-const overview = api.selectTask(initial, 'task-b');
-assert.equal(overview.view, 'overview');
-assert.equal(overview.selectedTaskId, 'task-b');
+const workspace = api.selectTask(initial, 'task-b');
+assert.equal(workspace.view, 'workspace');
+assert.equal(workspace.selectedTaskId, 'task-b');
+assert.equal(workspace.configDrawerOpen, false);
+assert.equal(workspace.artifactDrawerOpen, true);
+assert.equal(workspace.inspectorTurnId, null);
 
-const selectedTurn = api.selectTimeline(overview, {
+const configOpen = api.toggleConfigDrawer(workspace);
+assert.equal(configOpen.configDrawerOpen, true);
+assert.equal(api.toggleConfigDrawer(configOpen).configDrawerOpen, false);
+
+const artifactClosed = api.toggleArtifactDrawer(workspace);
+assert.equal(artifactClosed.artifactDrawerOpen, false);
+assert.equal(api.toggleArtifactDrawer(artifactClosed).artifactDrawerOpen, true);
+
+const inspectorOpen = api.openTurnInspector(workspace, 'turn-4');
+assert.equal(inspectorOpen.inspectorTurnId, 'turn-4');
+assert.equal(api.closeTurnInspector(inspectorOpen).inspectorTurnId, null);
+
+const selectedTurn = api.selectTimeline(workspace, {
   id: 'turn-4',
   linkedEvolutionId: 'issue-1',
 });
@@ -72,4 +87,4 @@ assert.deepEqual(
   'unknown task statuses must fail closed with no actions',
 );
 
-console.log('Forge prototype state tests: 11 passed');
+console.log('Forge prototype state assertions: 24 passed');

@@ -1,7 +1,7 @@
 (function exposeForgePrototypeState(global) {
   'use strict';
 
-  const allowedViews = new Set(['workbench', 'templates', 'overview', 'trace']);
+  const allowedViews = new Set(['workbench', 'templates', 'workspace', 'overview', 'trace']);
   const taskActionsByStatus = {
     running: ['pause', 'stop'],
     waiting: ['stop'],
@@ -21,6 +21,9 @@
       selectedTimelineId: null,
       selectedEvolutionId: null,
       artifactMode: 'content',
+      configDrawerOpen: false,
+      artifactDrawerOpen: true,
+      inspectorTurnId: null,
       compactTasks: false,
       toast: null,
     };
@@ -50,12 +53,15 @@
   function selectTask(state, taskId) {
     return {
       ...state,
-      view: 'overview',
+      view: 'workspace',
       selectedTaskId: taskId,
       selectedAgentId: null,
       selectedTimelineId: null,
       selectedEvolutionId: null,
       artifactMode: 'content',
+      configDrawerOpen: false,
+      artifactDrawerOpen: true,
+      inspectorTurnId: null,
     };
   }
 
@@ -87,6 +93,34 @@
     return [...(taskActionsByStatus[status] ?? [])];
   }
 
+  function toggleConfigDrawer(state) {
+    return {
+      ...state,
+      configDrawerOpen: !state.configDrawerOpen,
+    };
+  }
+
+  function toggleArtifactDrawer(state) {
+    return {
+      ...state,
+      artifactDrawerOpen: !state.artifactDrawerOpen,
+    };
+  }
+
+  function openTurnInspector(state, turnId) {
+    return {
+      ...state,
+      inspectorTurnId: turnId,
+    };
+  }
+
+  function closeTurnInspector(state) {
+    return {
+      ...state,
+      inspectorTurnId: null,
+    };
+  }
+
   global.ForgePrototypeState = {
     createInitialState,
     filterTasks,
@@ -96,5 +130,9 @@
     selectTimeline,
     selectEvolution,
     getTaskActions,
+    toggleConfigDrawer,
+    toggleArtifactDrawer,
+    openTurnInspector,
+    closeTurnInspector,
   };
 })(window);
