@@ -2,10 +2,15 @@
 
 Act 1 (grill) complete — product and technical decisions were locked with the user across the Forge UI requirement review. MAX_ROUNDS=5.
 
-Normative files:
+Current source model:
 
-- `PLAN.md`
-- `docs/superpowers/plans/2026-07-29-forge-ui-p0-implementation.md`
+- `AGENTS.md`：铁律、安全与架构依赖；
+- `docs/Forge_UI_需求文档.md`：产品语义和 P0/P1 边界；
+- `docs/Forge_UI_技术需求文档.md`：技术协议和运行拓扑；
+- `docs/superpowers/plans/2026-07-29-forge-ui-p0-implementation.md`：不违反前三者的逐 Task 执行清单；
+- `docs/specs/Forge_UI_P0_自主开发交接_Spec.md` 与 `docs/specs/Forge_UI_P0_交接记录.md`：交接、外部输入、授权和停止规则。
+
+`PLAN.md` 只做摘要；本文件只做审查追溯。历史轮次中的“规范性文件”或已被后续修订废止的方案，不得覆盖上述当前来源。
 
 ## Round 1 — Codex
 
@@ -192,3 +197,209 @@ VERDICT: REVISE
 - 同时修正最终扫描发现的残留：`source_event_seq` 明确为当前环境序号，Task 1 冻结 `SseStreamResetSchema`，Task 2 文件清单补入完整旧进程/句柄探针。
 
 达到 `MAX_ROUNDS=5` 后不再开启新一轮外部审查；主 Agent 仅对上述已报告阻断项执行逐条闭环与本地一致性校验，不再扩张方案范围。
+
+## 实施阻塞专项审查 — Codex + 用户
+
+日期：2026-07-29
+
+范围：Task 2 SQLite 迁移协议、Pi 0.82 Session/Agent 循环、Turn/Action Journal、进程故障门禁与本地发布包。
+
+方式：先验证用户报告的 Backup API 阻塞，再对修订方案进行五轮只读反证审查；不修改业务代码。
+
+### 已确认的原计划阻塞
+
+1. 同一个 SQLite connection 持有 `BEGIN EXCLUSIVE` 时运行 Backup API 的协议不可满足，替换 native Adapter 不能改变该 C API 边界。
+2. Pi `SessionManager` 没有可替换的公开持久化 sink，`SanitizedSessionManager` JSONL 包装方案不可交付。
+3. Pi 原生 `prompt()` 内包含模型—工具—模型循环，原线性 `model_running → response_recorded → actions_applying` Journal 无法准确覆盖。
+4. Pi extension/provider hook 的 handler 异常会被 Runtime 吸收，不能充当 fail-closed 持久化屏障。
+5. 自定义工具虽然支持 async，但默认批次可以并行；P0 写工具不显式 sequential 会破坏 SQLite Action 顺序。
+6. 当前 Adapter 的 `MAX_ATTEMPTS` 会在一个 `executeTurn` 内静默调用多次外层 `prompt()`，与 unknown 后禁止重调冲突。
+7. Pi 默认启用 auto-compaction；只回放普通消息不能重建压缩后的有效上下文。
+8. `prompt()` 正常 resolve 仍可能产生 `stopReason=error | aborted`，不能把 Promise resolve 当作成功。
+9. Windows 无法可靠证明任意未知旧进程都没有引用数据根；把该证明作为迁移前置条件会永久阻塞。
+10. 发布包允许多个 Node major，却直接携带 `better-sqlite3` native binary，缺少 ABI 绑定。
+11. 计划还包含 `/draf`、`/star`、`npm tes`、Web Vitest config 和 workspace exports 等机械错误。
+
+### 用户接受并冻结的修订
+
+- Task 2 改为严格离线迁移：维护锁只协调新 Forge；只确认 Forge 登记子进程退出；不可信数据根要求重启后先迁移或使用新根。checkpoint/关闭连接后，以独立源/目标连接完成 Backup API，再迁移验证备份并切换新 generation。
+- 新增 Task 0 可行性硬门禁，只证明 Pi 0.82 公共 API、in-memory replay、顺序工具、abort、终态分类和概念性两事务协议；不得引用为生产恢复证据。
+- Pi P0 Session 全部改为 `SessionManager.inMemory()`；Forge 保存固定 `logical_session_id`、有序公开内容块和原位 opaque signature，不持久化 plaintext hidden thinking 或生产 Pi JSONL。
+- P0 关闭 auto-compaction，以冻结模型 `contextWindow` 做调用前硬限流；P1 再设计脱敏 compaction evidence。
+- 一个 `agent_run_attempt_id` 最多调用一次 Forge 外层 `AgentSession.prompt()`；删除 Adapter 的空响应/nudge 重试。
+- attempt 前短事务提交 `started`；attempt 内同步 listener 只写内存 transcript buffer；settled 后统一脱敏校验，并在短事务中原子提交完整消息证据和明确 outcome。
+- Action 使用两事务：A 提交 `prepared + arguments_hash`；B 原子提交 domain effect、completed、outbox。B 回滚时 prepared 保留，其他三者不存在，并通过 `ctx.abort() + throw + fatal flag` 阻止成功。
+- `succeeded`、`known_failed` 和 `outcome_unknown` 明确分离；started 后没有分类终态的崩溃一律进入 `waiting_recovery`，不自动重调 Pi。
+- Provider hooks 降级为 best-effort telemetry；外部非事务副作用工具不进入 P0。
+- Task 6 用最终 Schema/Repository 重跑生产协议测试；Task 12 用真实 Worker/进程驱动器重跑崩溃窗口。
+- 真实 Pi kill 只证明 Agent Run 已 started 且尚无完成证据，不虚假声称观测到 HTTP 正处于网络 in-flight。
+- 本地 release manifest 绑定 OS、arch、Node major 和 `process.versions.modules`；未来 Electron 单独 rebuild native module。
+
+### 最终裁决
+
+五轮专项反证审查在合并上述修订后得到：
+
+`VERDICT: APPROVED`
+
+未发现剩余材料级 blocker。上下文估算算法、具体列类型与测试夹具属于各实施 Task 内可自然细化事项，不改变冻结协议。
+
+## 零上下文全局交接审查
+
+日期：2026-07-29
+
+审查会话：`019fae16-433f-7433-ae56-fc189b4998dd`
+
+范围：当前权威来源、P0 产品追踪、技术协议、逐 Task 计划、外部输入、发布证据与零上下文启动说明。
+约束：只读对抗审查；同一会话内修订后复审。
+
+### Round 1 — Codex
+
+结论：`VERDICT: NEEDS_REVISION`
+
+1. 用户清单仍是空白模板，文档未提交，不能据此证明授权基线；
+2. 权威来源冲突，技术需求仍保留 Supervisor IPC 接管和跨环境可写调度，而计划采用无接管、单环境实例；
+3. `CLAUDE.md` 的旧 JSONL/nudge/自动 push 描述可能覆盖 P0；
+4. Fake 故障矩阵包含运行时不可能产生的“终态已提交、命令未闭合”窗口；
+5. Task 5 没有声明 `CaseService`、端口和旧 Repository 的跨聚合事务改造；
+6. migration fixture、FK、完整性和来源证明不足以机械执行；
+7. 若干错误、健康和 launcher reason code 未声明；
+8. P0 缺少工作台筛选、模板详情、来源任务复制、正文复制与完整 Issue 链的可追踪证据，并混入 P1；
+9. lockfile、Playwright 浏览器和 PowerShell 命令不可复现；
+10. clean commit、source tree 与同一 immutable release 证据不可强制；
+11. Provider/Model 和费用条件被要求得过晚，最终视觉确认也没有与自动 readiness 分阶段。
+
+已实施的修订：
+
+- 新增只读填写模板与唯一 `Forge_UI_P0_交接记录.md`，明确 `NOT_READY/READY` 算法、Git/Harness/Pi/迁移/视觉输入和无秘密规则；交接采用“冻结 baseline commit + 只含记录/可选参考图的直接子提交”，不把提交 SHA 写入自身形成自指；
+- 统一来源优先级，`CLAUDE.md` 降为历史基线；技术需求升级到 0.43，冻结无 IPC 接管、每实例单环境拓扑；
+- 把终态窗口改为“原子终态提交后、UI/SSE 消费前”，遗留不一致只通过显式 fixture 验证；
+- 补齐跨聚合 `TransactionContext` 所有权、CaseService 参与文件、逐写入失败回滚测试；
+- 固化历史 Schema fixture manifest、生成程序、FK RESTRICT、integrity/FK/orphan/identity/hash 检查；
+- 封闭 public error、health reason 和 launcher exit code；
+- 产品需求 1.5、Task 路由/UI/E2E 和 15 行追踪矩阵覆盖全部 P0；验收条目显式标记 P0/P1，文件下载、归档/回收站等不再进入 P0；
+- Tasks 10/12 拥有 lockfile，固定 Playwright 与浏览器 preflight，Windows 验收统一使用 `.cmd` 入口；
+- 发布流程先提交 source/harness，再从 clean commit 构建显式 manifest，所有 package/Fake/fault/real/visual Gate 记录同一 source commit、tree hash 和 release ID；
+- Pi 非秘密选择和费用边界前移到交接；自动完成状态为 `G7_AUTOMATED_READY`，同一 release 经一次用户视觉接受后才是 `P0_ACCEPTED`。
+
+Round 1 不能作为通过结论；必须在同一审查会话中复核上述修订。
+
+### Round 2 — Codex
+
+结论：`VERDICT: REVISE`
+
+审查确认原 11 项中的 9 项已经材料级闭环：
+
+| 原问题 | 状态 | 复核结果 |
+|---|---|---|
+| 1 交接清单/基线 | 已闭环 | baseline + direct-child 协议成立；当前 `NOT_READY`/dirty 是预交接 fail-closed 状态 |
+| 2 权威拓扑 | 未完全闭环 | 主拓扑已统一，但技术需求仍残留第二套所有权措辞 |
+| 3 `CLAUDE.md` | 已闭环 | 已明确降为历史基线，不能覆盖权威来源 |
+| 4 不可达窗口 | 已闭环 | 运行时窗口可达，遗留终态/命令不一致仅由 fixture 验证 |
+| 5 Task 5 事务所有权 | 已闭环 | branded context、文件归属、同连接校验与逐写入回滚明确 |
+| 6 migration 机械定义 | 已闭环 | 历史 fixture、manifest、FK、integrity/orphan/generation 规则明确；另有真实数据动作缺陷见下 |
+| 7 枚举 | 已闭环 | public/health/Agent-run/launcher code 与映射已冻结 |
+| 8 P0 追踪 | 已闭环 | 产品、Route、UI、E2E、15 行矩阵与 P1 排除一致 |
+| 9 Windows/lockfile/Playwright | 已闭环 | lockfile 所有权、固定版本、preflight 与 `.cmd` 成立 |
+| 10 release provenance | 未完全闭环 | 构建候选已修正，但 Task 14 验收后 commit 会使来源失效 |
+| 11 Pi/视觉时点 | 已闭环 | Pi 前移到 Task 4 前，自动 readiness 与人工签收已分离 |
+
+剩余材料级问题：
+
+1. **Critical — 冻结技术协议仍有竞争所有权机制。** TD-003、TD-010、TD-017、TD-020、TD-022 仍出现命令租约 heartbeat、旧 IPC 握手与 runner token 所有权，和施工计划“唯一 execution lease”冲突。
+   Correction：交接前只有无 heartbeat 的短期 dispatch claim；交接后只有 `execution_lease(worker_instance_id,generation)`；不与旧 Worker 建 IPC；runner token 如保留只能是从属认证因子。
+2. **Critical — 自动迁移会在未授权时移动真实旧数据。** 计划在秘密扫描命中时要求把旧根 quarantine 到其他位置，但交接只授权停止和让用户选择。
+   Correction：旧根内容和路径完全不动，只在 Harness 目录写脱敏诊断并停止；移动/重命名必须另有明确源、目标和破坏性操作授权。
+3. **High — Task 14 形成 post-G7 provenance loop。** 自动 Gate 后修改 README/提交报告会改变 source tree，使已接受 release 失效。
+   Correction：README 必须在候选 commit 前完成；验收后只允许一个明确 allowlist 的 evidence-report 子提交，并声明它不是 release source。
+4. **High — 外部或可变参考图可造成 false READY。** 外部稳定路径没有可读性、类型、大小或 hash 保证。
+   Correction：READY 只能选择不使用图片，或使用交接 HEAD 内已跟踪、allowlisted、普通文件、经过 MIME/magic bytes/大小/SHA-256 校验的唯一图片。
+
+### 主 Agent 对 Round 2 的处理
+
+- 接受 1：技术需求 0.43 明确唯一 execution lease、无 heartbeat dispatch claim、无旧 IPC 握手和 runner token 从属认证边界，并把旧“命令租约”版本记录标为历史。
+- 接受 2：旧根扫描异常时路径和字节均保持不动；P0 不移动、重命名、删除或 quarantine 真实旧根。
+- 接受 3：Task 14 把 README 前移到候选 commit；接受后只创建稳定 final report，报告不嵌入自身 commit SHA，最终命令读取当前 evidence commit。
+- 接受 4：交接记录冻结 `none_use_frozen_direction | repository_asset`，禁止外部路径；仓库图片必须通过 path、tracked、普通文件、reparse、magic bytes、size、SHA-256 和可读性校验。
+
+Round 2 仍不能作为通过结论；修订后继续在同一审查会话复核。
+
+### Round 3 — Codex
+
+结论：`VERDICT: REVISE`
+
+当前 `NOT_READY` 状态是正确的 fail-closed 预交接状态，不是缺陷。Round 2 的四项中，Worker 所有权、旧数据迁移和 Task 14 provenance 已闭环；视觉参考的外部/可变路径风险已闭环，但仍有三处跨文档歧义：
+
+1. **High — 冻结技术协议仍把 P1 功能写成 P0 强制项。** `TD-004` 的标签/归档/回收站字段，`TD-008` 的归档/恢复草稿命令，`TD-032` 的设置页视觉回归和 `TD-035` 的 `/settings`，与产品 P0/P1 矩阵和 P0 Route/UI 计划冲突。
+   Correction：逐项标为 P1 且不进入 P0 Schema、Route、UI 或 Gate；P0 模板页和模型目录只保留追踪矩阵要求的上下文能力。
+2. **Medium — 最高优先级产品文档仍假设必须提供截图。** 产品文档称第一版采用用户截图，而交接允许 `none_use_frozen_direction`。
+   Correction：冻结文字方向始终为权威；只有选择 `repository_asset` 时才使用仓库内哈希校验图作为补充。
+3. **Medium — 参考图大小规则不一致。** 交接记录和计划写 `1..20 MiB`，填写清单只写不超过 20 MiB，可能把普通小图误判为不合格。
+   Correction：全部统一为 `1 byte <= reference_image_bytes <= 20 MiB`。
+
+Round 2 四项复核：
+
+| 项目 | Round 3 状态 | 证据 |
+|---|---|---|
+| 唯一 Worker ownership/liveness | 已闭环 | 唯一 `execution_lease(worker_instance_id,generation)`；dispatch claim 无 heartbeat；不接管旧 IPC；runner token 仅从属认证 |
+| 旧数据安全迁移 | 已闭环 | 扫描异常时旧根字节和路径不动；无额外授权不备份、复制、移动、重命名、删除或隔离 |
+| Task 14 provenance | 已闭环 | README/source 先于候选；同一 release 跑 G7；签收后仅允许非自指 evidence-only 直接子提交 |
+| 视觉参考安全 | 部分闭环 | 外部/可变路径风险已闭环；仍需消除产品权威和大小规则歧义 |
+
+其他已审查区域——TransactionContext、迁移 fixture/FK/integrity、错误码、崩溃窗口、Windows/Playwright、Task 4 时点、`G7_AUTOMATED_READY`/`P0_ACCEPTED`、停止语义和 P0 完成措辞——未发现新的材料级阻塞。
+
+### 主 Agent 对 Round 3 的处理
+
+- 接受 1：在技术需求 0.43 现行条款中，把标签/归档/回收站、对应命令、设置页视觉回归、`/settings` 及模板维护扩展明确标为 P1；P0 只保留追踪矩阵要求的任务、模板与上下文模型能力。
+- 接受 2：产品视觉语言改为冻结文字方向始终有效，仓库参考图仅在 `repository_asset` 模式下作为补充。
+- 接受 3：交接记录、填写模板、交接 Spec 和 Task 14 全部统一为 `1 byte <= reference_image_bytes <= 20 MiB`。
+
+Round 3 仍不能作为通过结论；修订后继续在同一审查会话复核。
+
+### Round 4 — Codex
+
+结论：`VERDICT: REVISE`
+
+当前 `NOT_READY` 和未提交状态是正确的审查前置状态，不计为缺陷。Round 2 的四项已经闭环；Round 3 的视觉权威来源和图片大小规则已经闭环，但仍有两处 High 级范围矛盾：
+
+1. **High — 技术协议仍把 P1 设置和模板维护能力写成未限定条款。** TD-005 的模板默认模型维护、TD-026 的高级设置与安全清理入口、TD-029 的高级设置表单，以及 TD-030 的配置 Command/Query 与热更新，没有逐项限定为 P1；这与 TD-035、产品 P0/P1 矩阵和 P0 实施计划冲突。
+   Correction：给上述 UI/维护能力统一加 `[P1]`，并明确 P0 只保留后台安全默认配置、创建任务上下文模型覆盖和只读模板详情。
+2. **High — TD-041 把产品与实施计划要求的 P0 工作区能力误降为 P1。** 现行条款只保证 `Turn → 产物/Issue/返修` 单向定位，并把“完整泳道、全部跨对象联动”整体列为 P1；但产品与 Task 10 要求 P0 在当前任务内呈现完整 Agent 泳道、持久化边，以及泳道与产物链的双向定位。
+   Correction：明确 P0 包含当前任务完整 Agent 泳道、持久化关系边及其与产物/Issue/返修/版本的双向定位；仅跨任务、完整历史轮次、完整传播分析和高级诊断属于 P1。
+
+Round 3 闭环复核：
+
+| 项目 | Round 4 状态 | 证据 |
+|---|---|---|
+| 标签/归档/回收站等 P1 切分 | 部分闭环 | 已修正的条款有效，但 TD-005/026/029/030 仍残留未限定 UI 能力 |
+| 冻结书面视觉方向权威 | 已闭环 | 产品文档明确图片只在 `repository_asset` 模式下作为补充 |
+| 图片大小规则 | 已闭环 | 四份有效协议统一为 `1 byte <= reference_image_bytes <= 20 MiB` |
+
+### 主 Agent 对 Round 4 的处理
+
+- 接受 1：技术需求升级到 0.44，把模板默认模型维护、设置/清理 UI、高级设置表单和配置 Command/Query/热更新逐项限定为 P1；P0 只保留安全默认配置、启动级覆盖、创建任务上下文模型覆盖与只读模板详情。
+- 接受 2：TD-041 明确 P0 必须交付当前任务完整 Agent 泳道、持久化关系边，以及 Agent/Turn 与产物、Issue、返修和版本的双向定位；只有跨任务、完整历史轮次、完整传播分析和高级诊断属于 P1。
+- 同步产品文档、总计划、实施计划、交接 Spec、填写清单和交接记录中的冻结技术版本为 0.44。
+
+Round 4 仍不能作为通过结论；修订后继续在同一审查会话进行第 5 轮终审。
+
+### Round 5 — Codex
+
+结论：`VERDICT: APPROVED`
+
+严重度复核结果：
+
+- Critical：无；
+- High：无；
+- Medium：无；
+- Low：无。
+
+既往问题全部闭环：
+
+- Round 2：唯一 Worker execution lease、旧数据根 fail-closed、Task 14 同一发布来源证明、视觉参考来源约束全部 `CLOSED`；
+- Round 3：P0/P1 第一批技术条款、冻结书面视觉权威、统一图片大小规则全部 `CLOSED`；
+- Round 4：模板/设置写能力的 P1 限定，以及当前任务完整泳道、持久化关系边和双向定位的 P0 要求全部 `CLOSED`；
+- 技术需求标题、产品文档、总计划、实施计划、交接 Spec、填写清单和交接记录中的现行版本引用全部统一为 0.44；其他版本号只存在于明确的历史变更记录。
+
+终审重新核对了来源优先级、单环境 Supervisor/Worker 拓扑、TransactionContext 所有权、严格离线迁移、真实 Pi Task 4/13 门禁、Windows `.cmd` 命令、Playwright/lockfile 责任、同一 release provenance、`G7_AUTOMATED_READY` 与人工签收分离，以及仅声明 P0 的完成措辞。历史迁移 fixture 所引用的三个提交均可解析，Task 0–14 均具备文件、接口、依赖、命令和证据边界。
+
+当前旧 Node/Pi/package 配置属于明确记录的改造前基线，由 Task 0–1 负责机械升级，不构成隐藏前置阻塞。当前交接记录保持 `NOT_READY`、冻结文档仍未提交且工作树 dirty，是正确的 fail-closed 交接前状态；`APPROVED` 只表示文档包不存在材料级开发阻塞，不表示应用已实现、交接记录已 `READY` 或 Forge UI P0 已验收。

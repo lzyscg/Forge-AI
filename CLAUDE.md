@@ -1,5 +1,9 @@
 # CLAUDE.md — Forge AI MVP
 
+> **Forge UI P0 接手提示（2026-07-29）：本文是改造前历史状态，不是 P0 规范或授权文件。**
+>
+> Forge UI P0 必须先读 `AGENTS.md`、`docs/Forge_UI_需求文档.md`、`docs/Forge_UI_技术需求文档.md`、施工计划和交接 Spec。本文中关于 Node `>=20`、production JSONL Session、跨 Pi 的 Turn 长事务、三次空响应/nudge 重试、旧 Web 直读 SQLite、自动 commit/push 的描述均只用于识别待替换基线，不得实现为 P0 目标。Git 分支、commit、push 和 PR 权限只以达到 `READY` 的 `docs/specs/Forge_UI_P0_交接记录.md` 为准；用户提供清单仅是模板。
+
 > 给接手开发的 Agent：本文档是项目入口。先读这里，再按"先读这些"读详细文档。
 
 ## 这是什么
@@ -89,7 +93,7 @@ npm run dev              # tsx apps/worker/src/main.ts（默认 Fake Pi + songwr
 
 ## 工作流（提交规则·用户明确要求）
 
-**每完成一处改动（代码或文档），自动 `git commit` + `git push origin main`，无需每次问用户。** 这是用户 2026-07-25 明确授予的 standing authorization，覆盖之前"推送前确认"的谨慎做法。
+**历史记录，不适用于 Forge UI P0：** 2026-07-25 曾存在“每处改动自动 commit/push”的旧任务授权。该授权不延续到新的 P0 交接；开发 Agent 只能按本次用户提供清单中明确填写的权限操作，未明确允许时不得 push 或创建 PR。
 
 细则：
 - 直接提交到 `main`（沿用本项目 direct-to-main 模式，无 PR 流程）。
@@ -127,7 +131,7 @@ cd apps/web && DB_PATH=<绝对路径到*.db> npx next dev -p 3137
 
 1. **不要读旧仓库代码**：父目录的旧 TS monorepo 和 `pi-pipline-main` Python 项目是失败品，只保留"分层约定"思路，不复用一行实现。唯一允许借用的旧事实是 Pi 包名/仓库地址。
 2. **`docs/HANDOFF.md` 是过时的**：它描述旧 PostgreSQL/Kysely/Next16/SSE/Playwright 项目，与当前 SQLite/pi-coding-agent 代码**完全不符**，已被错误带进本仓库。**不要依据它判断当前状态**。
-3. **Git 版本控制状态**：`Forge-AI-main/` **已是独立 git 仓库**（与父目录 `C:\Users\13863\Desktop\zhihu\Forge AI` 的旧项目仓库隔离）。当前在 `main` 分支（direct-to-main，无 PR 流程）。`.gitignore` 已排除 `node_modules/`、`data/`、`*.db`、`.env*`、`deepseek_config.txt`、`.claude/`。**remote `origin = https://github.com/lzyscg/Forge-AI.git`**（用户自有仓库），本仓库配了 `http.proxy=127.0.0.1:10808` 走本地 V2Ray 代理访问 GitHub（国内网络必需）。**每处改动自动 commit + push（见上"工作流"），无需逐次问用户。** 最新提交历史见 `git log --oneline`。
+3. **Git 版本控制状态（历史基线）**：`Forge-AI-main/` **已是独立 git 仓库**（与父目录 `C:\Users\13863\Desktop\zhihu\Forge AI` 的旧项目仓库隔离）。本文记录时位于 `main`，但 P0 开工时必须重新读取实际分支、remote 和工作树，并使用本次用户提供清单中的 Git 权限；本文不授权 direct-to-main、自动 commit 或自动 push。`.gitignore` 已排除 `node_modules/`、`data/`、`*.db`、`.env*`、`deepseek_config.txt`、`.claude/`。
 4. **不要读旧仓库代码**：父目录的旧 TS monorepo 和 `pi-pipline-main` Python 项目是失败品，只保留"分层约定"思路，不复用一行实现。唯一允许借用的旧事实是 Pi 包名/仓库地址。
 5. **依赖安装**：`node_modules` 必须本机 `npm install`，不能从别处拷贝（之前拷贝损坏：native 二进制缺失、包空壳）。已加 `.npmrc` 设 `allow-scripts=true`（npm 11 默认拦 native 脚本）；重装后需 `npm rebuild better-sqlite3 esbuild` 生成 native 二进制。
 6. **环境**：Node v24 / npm 11 / TS ^5.5 / better-sqlite3 11.x（通过 N-API prebuild 支持 Node 24）。`engines` 写 `>=20`。

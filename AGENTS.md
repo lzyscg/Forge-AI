@@ -12,7 +12,17 @@
    - `docs/archive/Forge_AI_MVP_需求文档.md`
    - `docs/archive/PLAN.md`
 
-根目录的 `CLAUDE.md` 是给接手 Agent 的补充入口；如果它与上述当前运行手册冲突，以代码、场景配置和外部编排器使用说明为准。
+根目录的 `CLAUDE.md` 只记录当前仓库在 Forge UI P0 改造前的历史状态和已知旧坑，不授予 Git 操作权限，也不是 Forge UI P0 的规范来源。如果它与上述当前运行手册冲突，以代码、场景配置和外部编排器使用说明为准。
+
+Forge UI P0 开发不属于故事生产任务，必须改用以下入口和优先级：
+
+1. 本文件的六条铁律与作用域边界；
+2. `docs/Forge_UI_需求文档.md` 的 P0 产品语义；
+3. `docs/Forge_UI_技术需求文档.md` 的冻结技术协议；
+4. `docs/superpowers/plans/2026-07-29-forge-ui-p0-implementation.md` 的施工级 Task、测试和 Gate；
+5. `docs/specs/Forge_UI_P0_自主开发交接_Spec.md` 负责交接与停止规则；`docs/specs/Forge_UI_P0_交接记录.md` 是唯一外部输入/授权事实源，`Forge_UI_P0_用户提供清单.md` 只是一份填写模板。
+
+`PLAN.md` 只做摘要，`PLAN-REVIEW-LOG.md` 只做审查追溯，`README.md`、`CLAUDE.md` 和当前代码只用于识别改造前基线。后四者不得覆盖已冻结的 P0 产品、技术或施工协议。
 
 ## 故事仿写生产入口
 
@@ -44,7 +54,7 @@
 
 ## 不要读取或复用任何旧仓库代码
 
-旧的 TS monorepo 骨架和 `pi-pipline-main` Python 项目均视为失败品。只保留"分层约定"这一思路，不复用一行实现代码。
+这里的“旧仓库”明确指当前独立 Git 仓库之外、父目录中的旧 TS monorepo 和 `pi-pipline-main` Python 项目；二者均视为失败品，只保留“分层约定”这一思路，不读取或复制其实现。当前仓库当前基线代码可以为了识别现状、编写回归测试和按冻结实施计划逐步替换而读取；不得把它尚未满足 P0 的旧行为当作目标设计。
 
 ## 已知失败模式提醒
 

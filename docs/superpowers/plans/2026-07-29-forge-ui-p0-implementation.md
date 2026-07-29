@@ -8,10 +8,13 @@
 
 **Tech Stack:** Node.js `>=22.19.0`、TypeScript 5.5、TypeBox、Vitest、SQLite/better-sqlite3、`@earendil-works/pi-ai@0.82.0`、`@earendil-works/pi-coding-agent@0.82.0`、Next.js 14 App Router、React 18、TanStack Query、React Hook Form、Radix UI、CSS Modules、Playwright。
 
+**Zero-context handoff:** Read `docs/specs/Forge_UI_P0_交接记录.md`, `docs/specs/Forge_UI_P0_自主开发交接_Spec.md` and the non-authoritative filling template `docs/specs/Forge_UI_P0_用户提供清单.md` before Task 0. The record must be `READY`; its `spec_baseline_commit` must resolve; current `HEAD` must be the baseline's direct child containing only the record and optional allowed reference image; and the worktree must be clean before any mutation. Product scope is frozen in `docs/Forge_UI_需求文档.md` 1.5; technical protocol is frozen in `docs/Forge_UI_技术需求文档.md` 0.44. This file is the normative task checklist but may not contradict either source.
+
 ## Global Constraints
 
 - 依赖只能为 `contracts → domain → application → adapters → apps`，domain/application 不依赖 SQLite、Next.js、Electron 或 Pi SDK。
-- 全仓、CI、README 和发布门禁统一使用 Node.js `>=22.19.0`；Pi 依赖精确锁定为 `0.82.0`，可重复安装使用 `npm ci`。
+- 全仓、CI、README 和发布门禁统一使用 Node.js `>=22.19.0`；根 `package.json` 与 `packages/adapters/package.json` 都把 Pi 依赖精确锁定为 `0.82.0`，Windows 可重复安装使用 `npm.cmd ci`。
+- 本项目正式开发与验收环境是 Windows PowerShell。本文命令中的 `npm`/`npx` 是脚本名称；Harness 在 Windows 必须调用可执行文件 `npm.cmd`/`npx.cmd` 并在证据中记录解析后的路径。最终 Gate 的命令块全部使用 `.cmd`，不得依赖被 ExecutionPolicy 拦截的 `npm.ps1`。
 - 平台代码不得按业务角色名、阶段名或产物名分支；全部来自冻结模板修订。
 - 生产证据追加而不覆盖；交付只由系统门禁判定；UI 不得直接改写 Case、Issue、版本或门禁状态。
 - API Key、Token、Authorization Header、Cookie、Provider 凭据路径和隐藏思维链不得进入日志、数据库业务表、API、SSE 或 UI。
@@ -19,12 +22,17 @@
 - P0 本地服务只监听 `127.0.0.1`；不建设账号、鉴权、权限、多用户、Electron 或局域网访问。
 - 任务启动后冻结输入、模板修订、环境和每个 Agent 的 `provider_id + model_id`；恢复不得静默替换。
 - 真实 Pi 和进程级崩溃恢复门禁通过前，只实现功能性 UI，不做视觉打磨。
-- 任何 Provider/文件/进程 IPC 等外部 I/O 都不得发生在业务写事务内；唯一例外是 Task 2 已隔离全部业务 Writer 的离线迁移维护窗口，其中 SQLite Backup API 属于被测试的维护协议。
+- 任何 Provider/文件/进程 IPC 等外部 I/O 都不得发生在业务写事务内；Task 2 的 SQLite Backup API 只在严格离线维护窗口、无业务写事务且所有 Forge 已登记子进程退出后运行。
 - 所有 Worker 业务写必须携带 `worker_instance_id + lease_generation` 并在同一 SQL 事务中验证当前租约；失效 Worker 只能得到 `LEASE_LOST` 后退出。
 - `execution_lease` 是 Worker 运行及业务写的唯一权威租约；命令在交接前只有短暂的 Supervisor dispatch claim，交接后不得再维护第二套命令租约。
 - application 的跨聚合原子用例只依赖 `TransactionScopePort`；SQLite Adapter 的 `SqliteUnitOfWork` 用同一连接和 branded transaction context 实现它，Repository 自己不得打开隐式写连接。
 - 日志、Pi Session、数据库诊断和 Query 共用一套前置 `SecretSanitizer`；任何持久化 sink 不得自建宽松规则。
+- P0 的 Pi Session 只使用 `SessionManager.inMemory()`；Forge 只持久化脱敏后的公开有序消息证据、原位 opaque signature 和固定 `logical_session_id`，不让 Pi 写生产 JSONL。
+- P0 关闭 Pi auto-compaction；调用前超过保守上下文上限时进入 `waiting_recovery/context_limit`，不得继续调用 Pi。一个 `agent_run_attempt_id` 最多调用一次外层 `AgentSession.prompt()`。
+- 本地发布包绑定 `platform + arch + Node major + process.versions.modules`；启动器必须在加载 `better-sqlite3` 前拒绝 ABI 不匹配的发布包。
+- 任何发布候选都必须从 clean、已提交的 source commit 构建；所有 Fake、故障、真实 Pi 和视觉 Gate 显式接收同一个 `release-manifest.json`，禁止选择“latest”或从未提交工作树打包。
 - 每项实现使用 TDD；一次任务只提交本任务文件，禁止夹带无关改动。
+- 本计划只完成 Forge UI P0。P1 才完成冻结的 Forge UI 1.0；预定义流程编排器、Electron 和 P2 均需要后续独立 Spec，不得把 P0 报告写成“整个 Forge 项目完成”。
 
 ---
 
@@ -45,10 +53,11 @@
 
 ### Domain / Application
 
-- `packages/domain/src/production-task-state.ts`：草稿、冻结、归档和回收站规则。
+- `packages/domain/src/production-task-state.ts`：P0 草稿、冻结、来源复制和运行控制规则；归档/回收站属于 P1。
 - `packages/domain/src/artifact-version-selection.ts`：当前有效、最新创建与交付版本统一选择规则。
 - `packages/domain/src/command-state.ts`：命令状态迁移与可领取判定。
-- `packages/domain/src/turn-journal-state.ts`：Turn Journal 阶段迁移。
+- `packages/domain/src/agent-run-attempt-state.ts`：Agent Run attempt 终态和保守恢复判定。
+- `packages/domain/src/turn-journal-state.ts`：Turn Journal、Action Journal 与 Case 终态迁移。
 - `packages/application/src/task-command-service.ts`：保存草稿、启动、暂停、恢复、停止、人工回答。
 - `packages/application/src/task-query-service.ts`：任务列表与工作区投影。
 - `packages/application/src/agent-session-query-service.ts`：按需 Agent 会话浮窗投影。
@@ -56,7 +65,7 @@
 - `packages/application/src/model-catalog-service.ts`：Pi 目录发现、快照和实时校验。
 - `packages/application/src/template-registry-service.ts`：Bundle 校验、不可变修订注册与读取。
 - `packages/application/src/supervisor-service.ts`：命令领取、并发调度与 Worker 生命周期。
-- `packages/application/src/turn-journal-service.ts`：短事务阶段提交与恢复决策。
+- `packages/application/src/turn-journal-service.ts`：Agent Run/Action 的短事务提交、消息证据提交与恢复决策。
 - `packages/application/src/secret-sanitizer.ts`：写入前与查询前共用的脱敏规则。
 - `packages/application/src/progress-projector.ts`：只基于通用持久化证据计算离散进度。
 - `packages/application/src/ui-event-service.ts`：事件回放、水位、保留和清理用例。
@@ -72,7 +81,8 @@
 - `packages/adapters/src/backup-manager.ts`：SQLite Backup API、校验和保留。
 - `packages/adapters/src/disk-space-guard.ts`：迁移/启动/导入的空间门禁。
 - `packages/adapters/src/structured-logger.ts`：脱敏结构化日志、关联 ID 和轮转。
-- `packages/adapters/src/sanitized-session-manager.ts`：Pi JSONL 所有 entry 类型的唯一白名单序列化 sink。
+- `packages/adapters/src/pi-session-evidence.ts`：Pi in-memory Session 重建、attempt transcript 缓冲与公开内容块脱敏。
+- `packages/adapters/src/sqlite-agent-run-repository.ts`：Agent Run attempt、公开消息证据和 logical Session 映射。
 - `packages/adapters/src/template-cas.ts`：模板资源 CAS。
 - `packages/adapters/src/pi-model-catalog.ts`：Pi 公共模型目录 Adapter。
 - `packages/adapters/src/pi-adapter.ts`：按 Session 接收准确 Provider/Model。
@@ -87,6 +97,38 @@
 
 ---
 
+### Task 0: Pi 0.82 与 SQLite 恢复协议可行性门禁
+
+**Files:**
+- Create: `scripts/probes/pi-082-feasibility.mjs`
+- Create: `scripts/probes/pi-082-fixtures.mjs`
+- Create: `docs/acceptance/pi-082-feasibility.md`
+- Modify: root `package.json`
+- Modify: `packages/adapters/package.json`
+- Modify: `package-lock.json`
+
+**Interfaces:**
+- Produces: `npm.cmd run test:feasibility:pi`, a sanitized feasibility report, and a stop/go decision for Tasks 1–14.
+- Consumes: installed Pi `0.82.0` public APIs, a temporary in-memory SessionManager and a temporary conceptual SQLite schema; it does not consume or certify production repositories.
+
+- [ ] **Step 1: Freeze the exact dependency and write the probe assertions**
+
+  Pin both Pi packages to exact `0.82.0` in the root and Adapter manifests. The probe must assert: `SessionManager.inMemory(cwd, { id })` preserves a supplied logical ID; ordered public `appendMessage()` replay rebuilds the same safe context; custom tool `execute()` is awaited; P0 mutation tools run sequentially; `ctx.abort() + throw` stops the remaining sequential batch; `AgentSession.prompt()` can resolve with `error` or `aborted`; synchronous listeners can buffer complete `message_end` evidence; `setAutoCompactionEnabled(false)` is observable; and one conceptual Action transaction A followed by a rolled-back transaction B retains only the `prepared` row.
+
+- [ ] **Step 2: Prove the negative paths**
+
+  Inject a tool failure, Provider error message, aborted message, missing final message, transcript validation failure and transaction-B rollback. Assert none can produce `succeeded`; transaction-B rollback leaves no domain effect, completed marker or outbox; and the conceptual recovery result is `outcome_unknown + waiting_recovery`. The harness must never claim to have tested production lease fencing, Repository code or crash recovery.
+
+- [ ] **Step 3: Run the blocking feasibility gate**
+
+  Run: `npm.cmd ci && npm.cmd run test:feasibility:pi`
+  Expected: PASS with a sanitized report listing the exact Node/Pi versions and every assertion. Any failure blocks Task 1; do not substitute a private Pi API or partial wrapper.
+
+- [ ] **Step 4: Record the evidence boundary and commit**
+
+  `docs/acceptance/pi-082-feasibility.md` must state that this is SDK/API and conceptual SQLite feasibility evidence only. Task 6 and Task 12 must repeat the transaction and crash assertions against the final production schema, repositories, Worker and process driver.
+  Commit: `test(runtime): prove Pi 0.82 recovery feasibility`
+
 ### Task 1: 冻结共享 Contract、错误码与 REST 路由
 
 **Files:**
@@ -98,6 +140,7 @@
 - Create: `packages/contracts/src/task-workspace.ts`
 - Create: `packages/contracts/src/progress.ts`
 - Create: `packages/contracts/src/health.ts`
+- Create: `packages/contracts/src/runtime.ts`
 - Create: `packages/application/src/secret-sanitizer.ts`
 - Test: `packages/contracts/src/api-contracts.test.ts`
 - Test: `packages/application/src/secret-sanitizer.test.ts`
@@ -132,20 +175,70 @@
     'RECOVERY_UNSAFE',
     'DISK_SPACE_LOW',
     'SCHEMA_INCOMPATIBLE',
+    'SCHEMA_INTEGRITY_FAILED',
     'LEGACY_SECRET_DETECTED',
     'MIGRATION_PROCESS_ACTIVE',
+    'MIGRATION_OFFLINE_REQUIRED',
     'LEASE_LOST',
     'CURSOR_AHEAD',
     'PAYLOAD_TOO_LARGE',
     'INTERNAL_ERROR',
   ] as const;
+
+  export const HealthReasonCodes = [
+    'SCHEMA_INCOMPATIBLE',
+    'SCHEMA_INTEGRITY_FAILED',
+    'MIGRATION_ACTIVE',
+    'MIGRATION_FAILED',
+    'SUPERVISOR_NOT_OBSERVED',
+    'SUPERVISOR_HEARTBEAT_STALE',
+    'DISK_CRITICAL',
+    'DISK_LOW',
+    'COMMAND_LAG',
+    'LEASE_CHURN',
+    'SANITIZER_SERIALIZATION_FAILURE',
+    'OUTCOME_UNKNOWN_PRESENT',
+    'EVENT_PRUNE_FAILED',
+    'MIGRATION_BACKUP_FAILED',
+  ] as const;
+
+  export const AgentRunReasonCodes = [
+    'CONTEXT_LIMIT',
+    'PROVIDER_FAILURE',
+    'ABORTED',
+    'TRANSCRIPT_INVALID',
+    'ACTION_FATAL',
+    'OUTCOME_UNCLASSIFIED',
+  ] as const;
+
+  export const LauncherFailureExitCodes = {
+    INVALID_ARGUMENT: 64,
+    CONFIG_INVALID: 65,
+    INSTANCE_LOCK_CONFLICT: 66,
+    MIGRATION_PROCESS_ACTIVE: 67,
+    MIGRATION_OFFLINE_REQUIRED: 68,
+    LEGACY_SECRET_DETECTED: 69,
+    MIGRATION_FAILED: 70,
+    SCHEMA_INCOMPATIBLE: 71,
+    SCHEMA_INTEGRITY_FAILED: 72,
+    DISK_SPACE_LOW: 73,
+    RUNTIME_PACKAGE_INVALID: 74,
+    RUNTIME_ABI_MISMATCH: 75,
+    SUPERVISOR_START_FAILED: 76,
+    WEB_START_FAILED: 77,
+    READINESS_TIMEOUT: 78,
+    DRAIN_TIMEOUT: 79,
+    INTERNAL_STARTUP_ERROR: 80,
+  } as const;
   ```
 
-  Change root `engines.node` to `>=22.19.0`, replace Pi caret ranges with exact `0.82.0`, refresh the lockfile under Node 22.19+, and document `npm ci` as the supported installation command. Add a preflight test that fails on an older Node or resolved Pi version drift.
+  Freeze mappings before implementation: `MIGRATION_OFFLINE_REQUIRED` and `SUPERVISOR_UNAVAILABLE` → HTTP `503`; `RECOVERY_UNSAFE`, revision/state/idempotency/model drift conflicts → HTTP `409`; validation → `400/422`; payload size → `413`; missing object → `404`; unknown internal failures → `500`. `CONTEXT_LIMIT` is an Agent Run reason persisted with `waiting_recovery`, not an arbitrary HTTP error. Launcher failures always emit one declared symbolic code plus its fixed nonzero number; `RUNTIME_ABI_MISMATCH` is launcher-only. Health reasons are bounded Query values, not exceptions. Tests assert every enum is duplicate-free and no later Task introduces an undeclared string.
+
+  Change root `engines.node` to `>=22.19.0`, replace Pi caret ranges with exact `0.82.0`, refresh the lockfile under Node 22.19+, and document `npm.cmd ci` as the supported Windows installation command. Add a preflight test that fails on an older Node or resolved Pi version drift.
 
 - [ ] **Step 2: Run the tests and verify failure**
 
-  Run: `npx vitest run packages/contracts/src/api-contracts.test.ts`
+  Run: `npx.cmd vitest run packages/contracts/src/api-contracts.test.ts`
   Expected: FAIL because the new schemas are not exported.
 
 - [ ] **Step 3: Implement exact public DTO boundaries**
@@ -175,7 +268,7 @@
 
   `TaskWorkspace` must contain `task`, `status_summary`, `progress`, `legal_actions`, `configuration`, `lanes`, paged `nodes`, paged `edges`, `artifact_panel`, `source_event_seq`, and `projection_revision`. `AgentSessionDetail` must contain `session`, paged ordered `turns`, optional `focus_turn_id`, and sanitized per-Turn `input`, `public_reasoning_summary`, `tool_actions`, `output`, `system_results`.
 
-  Freeze finite bounds in every public schema: IDs/idempotency keys `1..128` chars; labels/titles `1..200`; public diagnostic text `2 KiB`; input, answer and model output `1 MiB`; sanitized tool arguments/result `256 KiB` each; at most `100` input fields, `100` Agents and `100` tool actions per Turn. Task/template/model collections page at `1..100`; Agent Session turns page at `1..100`; one workspace graph page carries at most `500` nodes and `1,000` edges with opaque cursor and `has_more`; template resource manifests carry at most `1,000` bounded entries. Progress contains at most `16` stages and `64` total steps; Workspace embeds at most `20` newest round summaries total plus `round_count` and `rounds_truncated`, while complete round history remains P1. Inline artifact text is at most `5 MiB`; larger text returns metadata plus `download_required`. Diff requires explicit `from_version_id` and `to_version_id` from the same task/artifact/environment, is capped at `50,000` lines or `2 MiB`, and on truncation returns `truncated` plus the two stable scoped version-download actions for offline comparison; it does not claim to provide a full diff download. HTTP JSON bodies are at most `2 MiB`. Public errors use fixed messages; operation-specific conflict DTOs contain only white-listed task revision/status/action fields.
+  Freeze finite bounds in every public schema: IDs/idempotency keys `1..128` chars; labels/titles `1..200`; public diagnostic text `2 KiB`; input, answer and model output `1 MiB`; sanitized tool arguments/result `256 KiB` each; at most `100` input fields, `100` Agents and `100` tool actions per Turn. Task/template/model collections page at `1..100`; Agent Session turns page at `1..100`; one workspace graph page carries at most `500` nodes and `1,000` edges with opaque cursor and `has_more`; template resource manifests carry at most `1,000` bounded entries. Progress contains at most `16` stages and `64` total steps; Workspace embeds at most `20` newest round summaries total plus `round_count` and `rounds_truncated`, while complete round history remains P1. P0 accepts and serves artifact text versions up to `5 MiB`; larger content is rejected before persistence with a typed size error rather than creating an unreadable P0 artifact. Diff requires explicit `from_version_id` and `to_version_id` from the same task/artifact/environment, is capped at `50,000` lines or `2 MiB`, and on truncation returns `truncated` plus direct links to each normal P0 version-reading view; it does not claim to provide a full Diff download. HTTP JSON bodies are at most `2 MiB`. Public errors use fixed messages; operation-specific conflict DTOs contain only white-listed task revision/status/action fields.
 
   Extend the existing `ScenarioSchema` with optional `presentation.progress`. Stage/step keys are unique and ordered; selectors permit only `case_status | agent_turn | artifact_version | evaluation | issue | revision_instruction | human_input | delivery_gate`, with stable template-local keys and referenced Agent/artifact identities. `evaluation` identifies immutable structured `evaluation_evidence` and maps its enum result to waiting/blocked/completed without reading prose. Template registration validates every Agent/artifact reference and the stage/step bounds. Aggregation priority is `blocked > waiting > in_progress > completed > not_started`; repeated Issue/revision/evaluation evidence creates bounded newest-round summaries. A template without this block falls back only to non-prunable Case, Turn, artifact, Issue, revision, human-request and gate facts; prunable UI events are invalidation hints and never progress evidence.
 
@@ -193,16 +286,17 @@
   GET    /api/v1/tasks
   POST   /api/v1/tasks
   GET    /api/v1/tasks/:taskId
-  PUT    /api/v1/tasks/:taskId/draf
-  POST   /api/v1/tasks/:taskId/star
+  POST   /api/v1/tasks/:taskId/copy
+  PUT    /api/v1/tasks/:taskId/draft
+  POST   /api/v1/tasks/:taskId/start
   POST   /api/v1/tasks/:taskId/commands
   POST   /api/v1/tasks/:taskId/human-requests/:actionId/answer
   GET    /api/v1/tasks/:taskId/workspace
   GET    /api/v1/tasks/:taskId/sessions/:sessionId
   GET    /api/v1/tasks/:taskId/artifacts/:artifactId/versions/:versionId
-  GET    /api/v1/tasks/:taskId/artifacts/:artifactId/versions/:versionId/download
   GET    /api/v1/tasks/:taskId/artifacts/:artifactId/diff
   GET    /api/v1/templates
+  GET    /api/v1/templates/:templateRevisionId
   GET    /api/v1/models
   POST   /api/v1/models/refresh
   GET    /api/v1/events?env=:environment&after=:eventSeq
@@ -211,7 +305,7 @@
 
 - [ ] **Step 6: Run checks and commit**
 
-  Run: `npm ci && npx vitest run packages/contracts/src/api-contracts.test.ts packages/application/src/secret-sanitizer.test.ts && npm run check`
+  Run: `npm.cmd ci && npx.cmd vitest run packages/contracts/src/api-contracts.test.ts packages/application/src/secret-sanitizer.test.ts && npm.cmd run check`
   Expected: PASS.
   Commit: `feat(contracts): define Forge UI P0 API contracts`
 
@@ -225,6 +319,12 @@
 - Create: `packages/adapters/src/migrations/001-baseline.ts`
 - Create: `packages/adapters/src/migrations/002-ui-control-plane.ts`
 - Create: `packages/adapters/src/migrations/003-turn-journal.ts`
+- Create: `packages/adapters/src/__fixtures__/migrations/manifest.json`
+- Create: `packages/adapters/src/__fixtures__/migrations/legacy-836e072-pre-identity.sqlite`
+- Create: `packages/adapters/src/__fixtures__/migrations/legacy-514698c-partial-identity-*.sqlite`
+- Create: `packages/adapters/src/__fixtures__/migrations/legacy-a26ab8e-current.sqlite`
+- Create: `packages/adapters/src/__fixtures__/migrations/legacy-<source-commit>-<schema-fingerprint>.sqlite` for every other unique historical writable shape
+- Create: `scripts/generate-legacy-migration-fixtures.cjs`
 - Create: `packages/adapters/src/migration-runner.ts`
 - Create: `packages/adapters/src/database-connection.ts`
 - Create: `packages/adapters/src/database-bootstrap.ts`
@@ -232,14 +332,14 @@
 - Create: `packages/adapters/src/backup-manager.ts`
 - Create: `packages/adapters/src/disk-space-guard.ts`
 - Create: `packages/adapters/src/structured-logger.ts`
-- Create: `packages/adapters/src/legacy-process-probe.ts`
+- Create: `packages/adapters/src/known-child-shutdown.ts`
 - Test: `packages/adapters/src/migration-runner.test.ts`
 - Test: `packages/adapters/src/database-bootstrap.integration.test.ts`
 - Test: `packages/adapters/src/sqlite-unit-of-work.test.ts`
 - Test: `packages/adapters/src/backup-manager.test.ts`
 - Test: `packages/adapters/src/disk-space-guard.test.ts`
 - Test: `packages/adapters/src/structured-logger.test.ts`
-- Test: `packages/adapters/src/legacy-process-probe.integration.test.ts`
+- Test: `packages/adapters/src/known-child-shutdown.integration.test.ts`
 - Modify: `packages/adapters/src/sqlite-repository.ts`
 - Modify: `packages/adapters/src/index.ts`
 - Modify: `apps/worker/src/main.ts`
@@ -252,16 +352,18 @@
 
 - [ ] **Step 1: Write migration failure tests**
 
-  Cover empty DB, every committed legacy schema fixture, repeated migration, checksum mismatch, injected failure rollback, DB newer than supported version, active WAL, insufficient disk, backup restore, two-process migration race, a full legacy Worker that ignores the new data-root lock, production/test path isolation and path normalization. For every fixture assert evidence row counts and content hashes are unchanged. A pre-identity fixture receives one new `db_instance_id` exactly once and keeps it on the second open; fixtures that already contain identity must retain the original value.
+  Cover empty DB, every checked-in legacy schema fixture, repeated migration, checksum mismatch, injected failure rollback, DB newer than supported version, active WAL, insufficient disk, backup restore, two new-Forge migration processes racing, a registered Forge child that must be stopped, an untrusted/unknown-provenance data root, production/test path isolation and path normalization. For every fixture assert evidence row counts and content hashes are unchanged. A pre-identity fixture receives one new `db_instance_id` exactly once and keeps it on the second open; fixtures that already contain identity must retain the original value.
+
+  `manifest.json` is normative and records for every immutable fixture: source commit, fixture SHA-256, source schema SHA-256, exact generation step, normalized `sqlite_master` fingerprint, `db_instance_id` expectation, row counts and canonical evidence-row hashes. Scan all commits that created or modified the writable SQLite schema and check in one fixture per unique fingerprint. At minimum, generate the pre-identity fixture from `836e072`; one partial fixture for every prefix of the opportunistic identity-column sequence introduced by `514698c`; every later execution-lease identity shape; and the current fixture from baseline `a26ab8e`. `scripts/generate-legacy-migration-fixtures.cjs` must reproduce byte-independent logical fingerprints and fail if source SQL or the manifest changes. Tests consume checked-in fixtures; they never synthesize an unknown “representative” schema at test time.
 
 - [ ] **Step 2: Run the focused test**
 
-  Run: `npx vitest run packages/adapters/src/migration-runner.test.ts`
+  Run: `npx.cmd vitest run packages/adapters/src/migration-runner.test.ts`
   Expected: FAIL because `MigrationRunner` does not exist.
 
 - [ ] **Step 3: Implement migration 001 and legacy adoption**
 
-  Migration 001 creates `schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)`. Check in one immutable fixture and schema fingerprint for each historically committed shape: pre-identity schema, identity columns partially added, and current full schema. Each known fingerprint gets one deterministic upgrade path; unknown/ambiguous partial schemas fail with `SCHEMA_INCOMPATIBLE`. Do not recreate or rewrite core evidence merely to adopt it.
+  Migration 001 creates `schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)`. Check in the immutable fixture family and manifest defined above. Each known fingerprint gets one deterministic upgrade path; unknown/ambiguous partial schemas fail with `SCHEMA_INCOMPATIBLE`. Do not recreate or rewrite core evidence merely to adopt it.
 
 - [ ] **Step 4: Implement migration 002 control-plane schema**
 
@@ -269,8 +371,8 @@
 
   ```sql
   production_tasks(task_id PK, title, environment, lifecycle, template_revision_id,
-    draft_input_json, draft_revision, draft_hash, source_task_id, archived_at,
-    trashed_at, frozen_at, created_at, updated_at)
+    draft_input_json, draft_revision, draft_hash, source_task_id,
+    frozen_at, created_at, updated_at)
   production_task_cases(task_id, case_id UNIQUE, environment, bound_at,
     PRIMARY KEY(task_id, case_id))
   task_agent_models(task_id, agent_key, provider_id, model_id, source,
@@ -311,22 +413,30 @@
     generation, state, heartbeat_at, started_at, exited_at)
   ```
 
-  Add indexes for task updated time/lifecycle, command status/priority/available time, dispatch-claim expiry and UI event object/sequence.
+  All evidence and ownership references use explicit `ON UPDATE RESTRICT ON DELETE RESTRICT`: task→template revision/source task; task-case→task/case; task-model→task/catalog snapshot; template resource/parent→template revision; command→task/case/related command; evaluation→case/turn; Journal→turn/case/owning command/attempt; attempt→turn; message evidence→attempt; Action→attempt; Worker→case/command. Nullable references remain nullable but are checked when present. No P0 table uses cascading evidence deletion. Add indexes for task updated time/lifecycle, command status/priority/available time, dispatch-claim expiry and UI event object/sequence.
 
 - [ ] **Step 5: Implement migration 003 execution schema**
 
   Rebuild affected tables where SQLite cannot add constraints safely. Add `paused` to allowed Case semantics in Contract/domain, `provider_id` and `model_id` to `agent_sessions`, `generation`, `worker_instance_id` and `expires_at` to execution leases, and create:
 
   ```sql
-  turn_journal_heads(turn_id PRIMARY KEY, revision, phase, invocation_id,
+  turn_journal_heads(turn_id PRIMARY KEY, revision, phase, agent_run_attempt_id,
     owning_run_command_id, lease_generation, updated_at)
   turn_journal_events(journal_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    turn_id, case_id, revision, phase, invocation_id, request_hash,
-    response_ref, detail_json, owning_run_command_id,
+    turn_id, case_id, revision, phase, agent_run_attempt_id, request_hash,
+    detail_json, owning_run_command_id,
     worker_instance_id, lease_generation, created_at,
     UNIQUE(turn_id, revision))
-  tool_action_attempts(attempt_id PK, action_id UNIQUE, idempotency_key UNIQUE, arguments_hash,
-    outcome, result_ref, lease_generation, created_at,
+  agent_run_attempts(agent_run_attempt_id PK, turn_id, logical_session_id,
+    request_hash, status, outcome, stop_reason, fatal_error_code,
+    worker_instance_id, lease_generation, started_at, settled_at,
+    UNIQUE(turn_id, agent_run_attempt_id))
+  agent_message_evidence(message_evidence_id PK, agent_run_attempt_id,
+    ordinal, role, public_content_json, provider_id, model_id, stop_reason,
+    created_at, UNIQUE(agent_run_attempt_id, ordinal))
+  tool_action_attempts(attempt_id PK, action_id UNIQUE, agent_run_attempt_id,
+    provider_tool_call_id, idempotency_key UNIQUE, arguments_hash,
+    status, outcome, result_ref, lease_generation, prepared_at, completed_at,
     CHECK(length(arguments_hash) = 64))
   worker_instances(worker_instance_id PK, environment, case_id, command_id,
     pid, state, lease_generation, heartbeat_at, started_at, exited_at)
@@ -336,27 +446,29 @@
 
 - [ ] **Step 6: Implement safe migration orchestration**
 
-  After all old processes are proven stopped and before backup, run the shared fail-closed detector over the complete legacy data root: logical DB columns/JSON, raw DB pages/freelist, WAL/SHM, Pi JSONL, logs, backups, cache and runtime files. If a probable credential, Authorization/Cookie value or plaintext thinking is found—or any surface cannot be read safely—fail with `LEGACY_SECRET_DETECTED`, quarantine the old root outside the new active root, create no copied backup inside it and require a fresh data root or an explicit future forensic migration tool. Automatic migration never rewrites evidence to hide this finding.
+  After all Forge-registered child processes are stopped and before backup, run the shared fail-closed detector over the complete legacy data root: logical DB columns/JSON, raw DB pages/freelist, WAL/SHM, legacy Pi JSONL, logs, backups, cache and runtime files. If a probable credential, Authorization/Cookie value or plaintext thinking is found—or any surface cannot be read safely—fail with `LEGACY_SECRET_DETECTED`, create no backup/copy inside or outside that root, and leave the legacy root byte-for-byte and path-for-path untouched. Write only a bounded sanitized diagnostic to the Harness evidence directory outside the user data root, then stop for the already defined choice of a fresh root or a future forensic migration tool. Moving, renaming, deleting or “quarantining” a real legacy root requires a separate explicit source, destination and destructive-action authorization and is not part of P0. Automatic migration never rewrites evidence to hide this finding.
 
   Preserve the existing production/test isolation: each environment owns `db/<environment>/active.json` and `db/<environment>/generations/<generation_id>/forge.sqlite`; one launcher/Web/Supervisor instance opens exactly one explicit environment, and `all` remains read-only CLI aggregation only. Generation IDs and directories are never reused, while the active SQLite contents remain writable.
 
-  Before migration, stop every known child and use the platform process/handle probe to prove no Forge Worker, Pi Session writer or tool process still references that environment's data root; then acquire the environment migration lock. If absence cannot be proven, fail `MIGRATION_PROCESS_ACTIVE` and require the user to close Forge/reboot or use a fresh root—publishing while an old Worker may still call Provider/tools or write JSONL is forbidden. Under that condition: open the legacy/current generation → checkpoint WAL → acquire and continuously hold `BEGIN EXCLUSIVE` → create and verify a SQLite Backup API snapshot → migrate that snapshot into a new generation → verify it → atomically replace that environment's `active.json` containing generation ID, schema, DB identity and an `initial_image_sha256` migration-provenance hash → only then release the source barrier. Later starts validate generation, internal DB identity and Schema; they do not compare the initial-image hash after normal writes.
+  Migration is a strict offline maintenance operation. Acquire the environment migration lock to coordinate new Forge instances, stop every child recorded by the current Forge instance, and confirm those exact process identities exited. Do not claim that Windows handle enumeration can prove absence of an arbitrary unknown legacy writer. If the data root has unknown provenance, a live/untrusted runtime marker, or cannot be placed in a trusted quiet state, fail `MIGRATION_OFFLINE_REQUIRED` and require either a reboot followed by migration before starting Forge or a fresh data root.
 
-  A process test starts the full legacy Worker, including Pi JSONL and a synthetic tool side effect, and proves migration remains blocked until that process and its descendants exit. A separate legacy DB Writer with a `busy_timeout` longer than migration proves the SQLite barrier, but is not accepted as the complete process-safety proof. After publication, assert every new Writer resolves only its environment's pointer and never the other environment or an older generation. Unknown/tampered pointers, identities or generations fail `SCHEMA_INCOMPATIBLE`. If the chosen better-sqlite3 Backup API cannot be proven to preserve the source barrier, Task 2 is blocked until a tested native Backup adapter does; raw file copy is not accepted. Require free space `2 × DB size + 512 MiB`; on failure retain source and verified backup without publishing the new pointer.
+  Under the trusted offline boundary: checkpoint WAL on the source → close every Forge SQLite connection → reopen the source only for the Backup API and create a verified backup on a separate destination connection → close both backup connections → run source/backup `PRAGMA integrity_check` (exact single `ok`), `PRAGMA foreign_key_check` (zero rows) and explicit orphan queries → migrate the verified backup into a new generation → repeat all three checks plus continuous migration versions, exact names/checksums, target schema fingerprint, identity, evidence counts and hashes → close and readonly-reopen the candidate and repeat the checks → atomically replace that environment's `active.json` containing generation ID, schema, DB identity and an `initial_image_sha256` migration-provenance hash → release the maintenance lock. Any check failure returns `SCHEMA_INTEGRITY_FAILED`, leaves the source and verified backup untouched and never publishes the generation. Never hold `BEGIN EXCLUSIVE` on the same connection that runs the Backup API. Later starts validate generation, internal DB identity and Schema; they do not compare the initial-image hash after normal writes.
+
+  A process test starts a Forge-registered Worker with a synthetic tool side effect and proves maintenance waits until that known child and its registered descendants exit. A separate unregistered legacy Writer demonstrates the boundary honestly: the migration must refuse an untrusted root rather than claiming it can prove the Writer absent. A two-new-Forge race proves the maintenance lock. After publication, assert every new Writer resolves only its environment's pointer and never the other environment or an older generation. Unknown/tampered pointers, identities or generations fail `SCHEMA_INCOMPATIBLE`. Raw database file copy is not accepted as a backup. Require free space `2 × DB size + 512 MiB`; on failure retain source and any verified backup without publishing the new pointer.
 
 - [ ] **Step 7: Introduce the only database bootstrap**
 
   `database-connection.ts` enables `foreign_keys=ON`, WAL and busy timeout on every writable connection; readonly connections verify schema without migrating. `DatabaseBootstrap` is the only constructor path and every Worker/CLI/Web/test call site is migrated in this same task. `SqliteRepository` no longer executes schema DDL or opportunistic `ALTER TABLE`.
 
-  Task 2 adds `TransactionScopePort` to `packages/contracts/src/ports.ts`; its callback is synchronous (`run<T>(work: (tx: TransactionContext) => T): T`) because better-sqlite3 transactions must not span an `await`. `SqliteUnitOfWork` implements it, owns the single writable connection and passes an opaque branded transaction context into participating Adapter repositories. Application code never imports the SQLite type. A Repository method that participates in a cross-aggregate write requires that context and refuses another connection or nested implicit transaction. Tests deliberately combine two Repository instances from different connections and assert rejection before any row changes.
+  Task 2 adds `TransactionScopePort` to `packages/contracts/src/ports.ts`; its callback is synchronous (`run<T>(work: (tx: TransactionContext) => T): T`) because better-sqlite3 transactions must not span an `await`. `TransactionContext` is an opaque nominal token signed at runtime by one `SqliteUnitOfWork`; application code can receive and pass it only inside the callback and cannot construct, inspect or retain it. `SqliteUnitOfWork` owns the single writable connection. Every cross-aggregate write port takes `tx` first; the Adapter validates ownership before any SQL and rejects a context from another Unit of Work/connection, an expired context or a nested implicit transaction before row changes. Application code never imports a SQLite type.
 
 - [ ] **Step 8: Implement operational safety before first new persistent feature**
 
-  `StructuredLogger` accepts only named fields and delegates every value to Task 1's `SecretSanitizer`; correlation fields are `request_id`, `task_id`, `command_id`, `case_id`, `worker_instance_id`, `turn_id`, `invocation_id`. Rotate at 14 days/100 MiB. `DiskSpaceGuard` blocks migration below `2 × DB + 512 MiB`, task start/import below `512 MiB`, and marks disk degraded below `1 GiB`. `BackupManager` retains 3 verified migration backups and never deletes the only recoverable backup. The Adapter exposes bounded metrics for schema, disk, backup count/latest verification, command lag, lease churn, sanitizer serialization failures and `outcome_unknown`; Task 8 turns them into the public Health Query.
+  `StructuredLogger` accepts only named fields and delegates every value to Task 1's `SecretSanitizer`; correlation fields are `request_id`, `task_id`, `command_id`, `case_id`, `worker_instance_id`, `turn_id`, `agent_run_attempt_id`, `action_id`. Rotate at 14 days/100 MiB. `DiskSpaceGuard` blocks migration below `2 × DB + 512 MiB`, task start/import below `512 MiB`, and marks disk degraded below `1 GiB`. `BackupManager` retains 3 verified migration backups and never deletes the only recoverable backup. The Adapter exposes bounded metrics for schema, disk, backup count/latest verification, command lag, lease churn, sanitizer serialization failures and `outcome_unknown`; Task 8 turns them into the public Health Query.
 
 - [ ] **Step 9: Run integration checks and commit**
 
-  Run: `npx vitest run packages/adapters/src/migration-runner.test.ts packages/adapters/src/database-bootstrap.integration.test.ts packages/adapters/src/sqlite-unit-of-work.test.ts packages/adapters/src/backup-manager.test.ts packages/adapters/src/disk-space-guard.test.ts packages/adapters/src/structured-logger.test.ts packages/adapters/src/legacy-process-probe.integration.test.ts packages/adapters/src/sqlite-readonly-snapshot.test.ts && npm run check`
+  Run: `npx.cmd vitest run packages/adapters/src/migration-runner.test.ts packages/adapters/src/database-bootstrap.integration.test.ts packages/adapters/src/sqlite-unit-of-work.test.ts packages/adapters/src/backup-manager.test.ts packages/adapters/src/disk-space-guard.test.ts packages/adapters/src/structured-logger.test.ts packages/adapters/src/known-child-shutdown.integration.test.ts packages/adapters/src/sqlite-readonly-snapshot.test.ts && npm.cmd run check`
   Expected: PASS.
   Commit: `feat(adapters): add explicit Forge schema migrations`
 
@@ -381,11 +493,11 @@
 
 - [ ] **Step 1: Write failing state and CAS tests**
 
-  Verify drafts can change, started tasks cannot; only unstarted drafts can enter trash; started tasks can archive; copying creates a new draft without Case/evidence. CAS tests reject absolute paths, `..`, symlink escape, ADS/device names on Windows, duplicate normalized paths and hash mismatch. Progress tests reject duplicate stage/step keys and unknown Agent/artifact references; map each allowed evidence selector to a discrete step state; apply the frozen priority order; create repeat rounds keyed by persisted Issue/revision/evaluation identity; and fall back only to non-prunable domain facts when `presentation.progress` is absent.
+  Verify drafts can change, started tasks cannot, and copying creates a new draft without Case/evidence. Do not implement P1 labels, archive or recycle-bin state/actions in this Task. CAS tests reject absolute paths, `..`, symlink escape, ADS/device names on Windows, duplicate normalized paths and hash mismatch. Progress tests reject duplicate stage/step keys and unknown Agent/artifact references; map each allowed evidence selector to a discrete step state; apply the frozen priority order; create repeat rounds keyed by persisted Issue/revision/evaluation identity; and fall back only to non-prunable domain facts when `presentation.progress` is absent.
 
 - [ ] **Step 2: Run focused tests**
 
-  Run: `npx vitest run packages/domain/src/production-task-state.test.ts packages/application/src/template-registry-service.test.ts packages/application/src/progress-projector.test.ts packages/adapters/src/template-cas.test.ts`
+  Run: `npx.cmd vitest run packages/domain/src/production-task-state.test.ts packages/application/src/template-registry-service.test.ts packages/application/src/progress-projector.test.ts packages/adapters/src/template-cas.test.ts`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement CAS staging and immutable registration**
@@ -398,7 +510,7 @@
 
 - [ ] **Step 5: Verify and commit**
 
-  Run: `npx vitest run packages/domain/src/production-task-state.test.ts packages/application/src/template-registry-service.test.ts packages/application/src/progress-projector.test.ts packages/adapters/src/template-cas.test.ts && npm run check`
+  Run: `npx.cmd vitest run packages/domain/src/production-task-state.test.ts packages/application/src/template-registry-service.test.ts packages/application/src/progress-projector.test.ts packages/adapters/src/template-cas.test.ts && npm.cmd run check`
   Expected: PASS.
   Commit: `feat(tasks): add production tasks and immutable templates`
 
@@ -406,34 +518,37 @@
 
 **Files:**
 - Create: `packages/adapters/src/pi-model-catalog.ts`
-- Create: `packages/adapters/src/sanitized-session-manager.ts`
+- Create: `packages/adapters/src/pi-session-evidence.ts`
+- Create: `packages/adapters/src/sqlite-agent-run-repository.ts`
 - Create: `packages/adapters/src/sqlite-model-catalog-repository.ts`
 - Create: `packages/application/src/model-catalog-service.ts`
 - Test: `packages/application/src/model-catalog-service.test.ts`
 - Test: `packages/adapters/src/pi-model-catalog.test.ts`
 - Test: `packages/adapters/src/sqlite-model-catalog-repository.test.ts`
-- Test: `packages/adapters/src/sanitized-session-manager.test.ts`
+- Test: `packages/adapters/src/pi-session-evidence.test.ts`
 - Modify: `packages/contracts/src/ports.ts`
+- Modify: `packages/application/src/index.ts`
 - Modify: `packages/adapters/src/pi-adapter.ts`
 - Modify: `packages/adapters/src/pi-adapter.probe.test.ts`
+- Modify: `packages/adapters/src/index.ts`
 - Modify: `packages/application/src/case-runner.ts`
 - Modify: `apps/worker/src/main.ts`
 
 **Interfaces:**
-- Produces: `ModelCatalogPort.list()`, `ModelCatalogSnapshotPort`, `ModelCatalogService.getCatalog()/refresh()/validateSelections()`, `ModelValidationTicket`, `PiSessionOptions.model`, stable `invocation_id`.
+- Produces: `ModelCatalogPort.list()`, `ModelCatalogSnapshotPort`, `ModelCatalogService.getCatalog()/refresh()/validateSelections()`, `ModelValidationTicket`, `PiSessionOptions.model`, `PiSessionEvidence.rebuild()`, stable `logical_session_id`.
 - Consumes: Pi `ModelRuntime.getProviders/getModels/getAvailable`, task Agent model selections.
 
-- [ ] **Step 1: Run the blocking Pi 0.82 Session sink-hook feasibility probe**
+- [ ] **Step 1: Re-run the Task 0 gate and write Provider compatibility tests**
 
-  Before catalog or binding implementation, instrument the real installed SDK and exercise message, Provider error, tool call/result, custom entry, branch summary, compaction and reopen paths against a sink spy. Prove production persistence can be routed through exactly one controllable serializer without plaintext thinking. This probe requires no Provider credential because entry fixtures are synthetic. If any SDK path bypasses the hook, stop Task 4 and G1 as technically blocked; do not build a partial wrapper.
+  Run `npm.cmd run test:feasibility:pi` before touching production code. Then add compatibility fixtures for ordered `TextContent`, `ThinkingContent`, `ToolCall` and `ToolResult` blocks. Assert `textSignature`, `thinkingSignature` and `thoughtSignature` remain attached only to their original block type and ordinal; plaintext hidden thinking is removed; no signature is moved, fabricated or logged. Unsupported content or a Provider that cannot safely continue without plaintext reasoning is marked `recoverable=false`, not silently downgraded.
 
 - [ ] **Step 2: Write tests proving the current global-model behavior is rejected**
 
-  Create two Agents with different Provider/Model selections; assert `createSession` receives each exact selection, resume receives the frozen original selection and selected-model fingerprint, unavailable or drifted models fail before Case creation/Session open, unrelated Provider changes do not block it, and no credential fields enter returned catalog DTO. `executeTurn` receives a persisted unique `invocation_id`; the same input hash under another invocation is not treated as the same call.
+  Create two Agents with different Provider/Model selections; assert `createSession` receives each exact selection, resume receives the frozen original selection and selected-model fingerprint, unavailable or drifted models fail before Case creation/Session open, unrelated Provider changes do not block it, and no credential fields enter returned catalog DTO. Session creation receives the persisted `logical_session_id`; resume reconstructs that exact logical Session from Forge evidence rather than opening Pi JSONL.
 
 - [ ] **Step 3: Run tests and observe failure**
 
-  Run: `npx vitest run packages/application/src/model-catalog-service.test.ts packages/adapters/src/pi-model-catalog.test.ts packages/adapters/src/pi-adapter.probe.test.ts`
+  Run: `npx.cmd vitest run packages/application/src/model-catalog-service.test.ts packages/adapters/src/pi-model-catalog.test.ts packages/adapters/src/pi-adapter.probe.test.ts`
   Expected: FAIL because `RealPiAdapter` still fixes Provider to `deepseek`.
 
 - [ ] **Step 4: Extend the Pi port**
@@ -447,14 +562,16 @@
     scenarioSkillsPath?: string;
     agentSkills?: string[];
     model: FrozenModelRef;
+    logical_session_id: string;
   }
-  interface PiInvocation {
-    invocation_id: string;
+  interface PiAgentRun {
+    agent_run_attempt_id: string;
+    logical_session_id: string;
     request_hash: string;
   }
   ```
 
-  Remove the global model fallback from session creation and resume. Missing model is a validation error, not a default.
+  Remove the global model fallback from session creation and resume. Missing model is a validation error, not a default. Remove the Adapter's `MAX_ATTEMPTS`/nudge retry loop: one `agent_run_attempt_id` may invoke the outer `AgentSession.prompt()` at most once.
 
 - [ ] **Step 5: Implement catalog snapshot semantics**
 
@@ -462,19 +579,19 @@
 
   Task start and every Worker create/resume path call live validation outside any database transaction and never substitute a model. A successful validation returns a short-lived `ModelValidationTicket` containing `snapshot_id`, selection hash, catalog hash, the selected provider/model-scoped fingerprint, issued/expiry time and no credential. The frozen Agent row references that exact snapshot and scoped fingerprint. Immediately before opening a Pi Session, the Worker compares only that Agent's fresh scoped fingerprint with its frozen value; changes to unrelated Providers do not block it. Drift yields `MODEL_CONFIGURATION_DRIFT + waiting_recovery` before any model call.
 
-- [ ] **Step 6: Implement and prove Pi Session storage is safe**
+- [ ] **Step 6: Implement and prove Forge-owned Session evidence**
 
-  Run thinking-capable synthetic responses, Provider errors, tool calls/results, custom entries, branch summaries and compaction through a persistent SessionManager and scan its JSONL. `SanitizedSessionManager` is the only session serialization sink: every SDK entry type passes Task 1's sanitizer and an explicit allowlist before append/replace/compaction, plaintext `thinking` is removed, only provider-required opaque signature metadata is retained, and unsupported entry types or sanitizer failure reject the write. No SDK path may write the production JSONL behind this adapter; prove this with a sink-spy test.
+  Always create Pi with `SessionManager.inMemory(cwd, { id: logical_session_id })` and an in-memory SettingsManager with auto-compaction disabled. Forge stores only ordered, sanitized public content blocks in `agent_message_evidence`. The schema keeps `TextContent.textSignature`, `ThinkingContent.thinkingSignature` and `ToolCall.thoughtSignature` only on their original block and ordinal. It never stores plaintext hidden thinking, credentials or arbitrary SDK session entries.
 
-  Reopen the same logical Session and prove tool/result continuation plus compaction recovery works. If Pi offers no hook that covers every persistence path, or the selected Provider requires plaintext reasoning for continuation, the integration is P0-incompatible and G1 remains blocked; do not persist the raw block.
+  Rebuild a fresh in-memory Session by replaying Forge evidence in order through public `appendMessage()`, reusing the persisted logical ID and frozen Provider/API/Model. Assert the rebuilt safe-context hash is stable. P0 does not persist or replay Pi compaction entries: `autoCompactionEnabled` must remain false, and an estimated context at or above the conservative model-specific limit yields `CONTEXT_LIMIT + waiting_recovery` before any Provider request. P1 may add a separate sanitized compaction protocol.
 
 - [ ] **Step 7: Run a real non-content probe**
 
-  With local Pi configuration available, list Provider/Model IDs and create then close one session without storing credentials. This probe may be skipped only when credentials are absent, and the later release gate remains blocked.
+  With local Pi configuration available, list Provider/Model IDs and run one minimal continuation for the selected Provider/API/Model, covering the actual signature-bearing block types it emits. Persist only the sanitized evidence, rebuild the logical Session and continue once. Without credentials, catalog work may proceed, but no model is marked P0 recoverable and the later release gate remains blocked.
 
 - [ ] **Step 8: Verify and commit**
 
-  Run: `npx vitest run packages/application/src/model-catalog-service.test.ts packages/adapters/src/pi-model-catalog.test.ts packages/adapters/src/sqlite-model-catalog-repository.test.ts packages/adapters/src/sanitized-session-manager.test.ts packages/adapters/src/pi-adapter.probe.test.ts && npm run check`
+  Run: `npm.cmd run test:feasibility:pi && npx.cmd vitest run packages/application/src/model-catalog-service.test.ts packages/adapters/src/pi-model-catalog.test.ts packages/adapters/src/sqlite-model-catalog-repository.test.ts packages/adapters/src/pi-session-evidence.test.ts packages/adapters/src/pi-adapter.probe.test.ts && npm.cmd run check`
   Expected: PASS.
   Commit: `feat(pi): bind exact model per Agent session`
 
@@ -485,25 +602,29 @@
 - Create: `packages/domain/src/artifact-version-selection.ts`
 - Create: `packages/application/src/task-command-service.ts`
 - Create: `packages/adapters/src/sqlite-command-repository.ts`
-- Create: `packages/adapters/src/sqlite-event-repository.ts`
+- Create: `packages/adapters/src/sqlite-ui-event-repository.ts`
+- Modify: `packages/application/src/case-service.ts`
+- Modify: `packages/contracts/src/ports.ts`
+- Modify: `packages/adapters/src/sqlite-repository.ts`
 - Test: `packages/application/src/task-command-service.test.ts`
+- Test: `packages/application/src/task-start-atomicity.test.ts`
 - Test: `packages/domain/src/artifact-version-selection.test.ts`
 - Test: `packages/adapters/src/sqlite-command-race.test.ts`
-- Test: `packages/adapters/src/sqlite-event-repository.test.ts`
+- Test: `packages/adapters/src/sqlite-ui-event-repository.test.ts`
 - Modify: `packages/application/src/tool-executor.ts`
 - Modify: package index files.
 
 **Interfaces:**
-- Produces: correct current-valid/latest/delivered write rules, `TaskCommandService`, command CAS/dispatch-claim methods, transactional `UiEvent`.
+- Produces: correct current-valid/latest/delivered write rules, `TaskCommandService`, command CAS/dispatch-claim methods, transactional `UiEvent` append plus same-transaction `high_watermark`.
 - Consumes: `TransactionScopePort`, task/template/model ports, short-lived `ModelValidationTicket` and existing CaseService.
 
 - [ ] **Step 1: Write failing invariant, transaction and race tests**
 
-  Cover candidate publication not moving the valid pointer, atomic approval/supersede, immutable delivery, duplicate start, same idempotency key/different payload, crash after command insert, two dispatch claimers racing, stale expected revision/status, duplicate human answer, repositories accidentally bound to different Unit-of-Work connections and `all` environment writes. Event tests prove every append and the selected environment's `high_watermark` advance in the same `TransactionScopePort` transaction; injected failure rolls both back.
+  Cover candidate publication not moving the valid pointer, atomic approval/supersede, immutable delivery, duplicate start, same idempotency key/different payload, crash after command insert, two dispatch claimers racing, stale expected revision/status, duplicate human answer, repositories accidentally bound to different Unit-of-Work connections and `all` environment writes. Inject failure after each of draft freeze, Agent-model freeze, Case insert, task-Case bind, command append and event append; every earlier aggregate must roll back. Event tests prove every append and the selected environment's `high_watermark` advance in the same `TransactionScopePort` transaction.
 
 - [ ] **Step 2: Run focused tests**
 
-  Run: `npx vitest run packages/domain/src/artifact-version-selection.test.ts packages/application/src/task-command-service.test.ts packages/adapters/src/sqlite-command-race.test.ts`
+  Run: `npx.cmd vitest run packages/domain/src/artifact-version-selection.test.ts packages/application/src/task-command-service.test.ts packages/application/src/task-start-atomicity.test.ts packages/adapters/src/sqlite-command-race.test.ts`
   Expected: FAIL.
 
 - [ ] **Step 3: Fix artifact write semantics before enabling new execution**
@@ -512,7 +633,9 @@
 
 - [ ] **Step 4: Implement two-phase atomic task start**
 
-  Outside any DB transaction, live-validate all Agent selections and receive a `ModelValidationTicket`. Inside one short `TransactionScopePort.run`: CAS the latest draft revision → verify the ticket is unexpired and its `snapshot_id`/catalog/selection/scoped fingerprints match the persisted successful snapshot → freeze task → bind each Agent to that snapshot/fingerprint → create Case with frozen template/model evidence → bind task/Case → append `run_case` command → append UI events. Snapshot/ticket drift returns `STATE_CONFLICT`; the caller may obtain a new ticket and retry with the same user intent. No network/file I/O occurs in the transaction.
+  Refactor `CaseService` into `createCaseInTransaction(tx: TransactionContext, input)` plus a compatibility wrapper that opens one outer `TransactionScopePort` only for legacy callers. The transaction-aware method never calls `runInTransaction`, never opens a connection and requires every participating Repository method to accept the same branded context.
+
+  Outside any DB transaction, live-validate all Agent selections and receive a `ModelValidationTicket`. Inside one short `TransactionScopePort.run`, call only transaction-aware methods on that same context: CAS the latest draft revision → verify the ticket is unexpired and its `snapshot_id`/catalog/selection/scoped fingerprints match the persisted successful snapshot → freeze task → bind each Agent to that snapshot/fingerprint → create Case with frozen template/model evidence → bind task/Case → append `run_case` command → append UI events. Snapshot/ticket drift returns `STATE_CONFLICT`; the caller may obtain a new ticket and retry with the same user intent. No nested transaction and no network/file I/O occurs.
 
 - [ ] **Step 5: Implement command result protocol**
 
@@ -522,47 +645,62 @@
 
 - [ ] **Step 6: Verify and commit**
 
-  Run: `npx vitest run packages/domain/src/artifact-version-selection.test.ts packages/application/src/task-command-service.test.ts packages/adapters/src/sqlite-command-race.test.ts packages/adapters/src/sqlite-event-repository.test.ts && npm run check`
+  Run: `npx.cmd vitest run packages/domain/src/artifact-version-selection.test.ts packages/application/src/task-command-service.test.ts packages/application/src/task-start-atomicity.test.ts packages/adapters/src/sqlite-command-race.test.ts packages/adapters/src/sqlite-ui-event-repository.test.ts && npm.cmd run check`
   Expected: PASS.
   Commit: `feat(application): enforce artifacts and persistent commands`
 
-### Task 6: Turn Journal、租约写栅栏、工具幂等与恢复判定
+### Task 6: Agent Run/Turn Journal、租约写栅栏、工具幂等与恢复判定
 
 **Files:**
+- Create: `packages/domain/src/agent-run-attempt-state.ts`
 - Create: `packages/domain/src/turn-journal-state.ts`
 - Create: `packages/application/src/turn-journal-service.ts`
 - Create: `packages/adapters/src/sqlite-turn-journal-repository.ts`
+- Modify: `packages/adapters/src/sqlite-agent-run-repository.ts`
+- Test: `packages/domain/src/agent-run-attempt-state.test.ts`
 - Test: `packages/domain/src/turn-journal-state.test.ts`
 - Test: `packages/application/src/turn-journal-service.test.ts`
 - Modify: `packages/application/src/turn-executor.ts`
 - Modify: `packages/application/src/recovery.ts`
 - Modify: `packages/application/src/tool-executor.ts`
+- Modify: `packages/application/src/index.ts`
 - Modify: `packages/contracts/src/case.ts`
+- Modify: `packages/contracts/src/ports.ts`
+- Modify: `packages/adapters/src/pi-adapter.ts`
+- Modify: `packages/adapters/src/index.ts`
 
 **Interfaces:**
-- Produces: journal phases `prepared | model_running | response_recorded | actions_applying | completed | failed | outcome_unknown`, journal head CAS, deterministic `RecoveryDecision`, mandatory lease fencing.
+- Produces: Turn phases `prepared | agent_running | completed | failed | outcome_unknown`; Agent Run outcomes `started | succeeded | known_failed | outcome_unknown`; Action states `prepared | completed`; journal head CAS, deterministic `RecoveryDecision`, mandatory lease fencing.
 - Consumes: Pi port, execution lease generation, command/outbox repositories.
 
 - [ ] **Step 1: Write failing phase and recovery tests**
 
-  Cover every allowed/forbidden transition and crash windows: before Pi, during Pi, after response, after one tool effect, after Turn completion. Assert no SQLite write transaction spans the Pi `await`; two writers cannot advance one journal head; `UNIQUE(case_id,sequence)` prevents duplicate Turn; stale `worker_instance_id/lease_generation` gets `LEASE_LOST`.
+  Cover every allowed/forbidden transition and crash window: before Agent Run, after `agent_run_attempt=started`, after Action transaction A, during Action transaction B, after prompt settled but before evidence commit, after a nonterminal Turn/outbox commit while the owning run command remains legitimately `running`, and after the atomic terminal commit but before UI consumption. A terminal Turn with a pending owning command is not a producible window. Assert no SQLite write transaction spans the Pi `await`; one attempt invokes the outer `AgentSession.prompt()` at most once; two writers cannot advance one journal head; `UNIQUE(case_id,sequence)` prevents duplicate Turn; stale `worker_instance_id/lease_generation` gets `LEASE_LOST`.
+
+  Add exact outcome tests: a valid public final answer with no fatal flag becomes `succeeded`; a classified Provider error becomes `known_failed`; `aborted`, missing/invalid transcript, fatal tool flag, context-limit refusal or unclassified state becomes `outcome_unknown + waiting_recovery`. `prompt()` resolving is never sufficient evidence of success.
 
 - [ ] **Step 2: Write secret leakage fixtures**
 
-  Reuse Task 1's sanitizer fixtures with Provider errors, tool arguments/results and diagnostic payloads. Assert every Journal/tool/DB write calls the shared sanitizer, DB/API-safe values contain explicit redaction markers and never the originals, and the isolated full data root including `sessions/`, backups and logs has no synthetic secret.
+  Reuse Task 1's sanitizer fixtures with Provider errors, ordered assistant content blocks, tool arguments/results and diagnostic payloads. Assert every Journal/tool/message-evidence/DB write calls the shared sanitizer, DB/API-safe values contain explicit redaction markers and never the originals, and the isolated full data root including legacy `sessions/`, backups and logs has no synthetic secret. Assert each opaque signature stays on its original block and plaintext hidden thinking never persists.
 
 - [ ] **Step 3: Run focused tests**
 
-  Run: `npx vitest run packages/domain/src/turn-journal-state.test.ts packages/application/src/turn-journal-service.test.ts packages/application/src/secret-sanitizer.test.ts`
+  Run: `npx.cmd vitest run packages/domain/src/agent-run-attempt-state.test.ts packages/domain/src/turn-journal-state.test.ts packages/application/src/turn-journal-service.test.ts packages/application/src/secret-sanitizer.test.ts`
   Expected: FAIL.
 
 - [ ] **Step 4: Replace the long transaction**
 
-  Commit each phase by CAS on `turn_journal_heads.revision` through `TransactionScopePort`. The first prepared transaction freezes `owning_run_command_id` only after verifying that command has the same environment/task/Case, type `run_case | resume`, status `running`, and exact Worker/lease generation; later head/event/lease writes must match it. Add relational uniqueness/foreign-key or trigger constraints for the same command scope so application validation is not the only defense. Persist unique `invocation_id`, response/tool call identities and argument hashes before applying tools. Every Case/Turn/message/tool/artifact/Issue/revision/gate/evaluation/command write verifies the one current execution lease owner, generation and expiry in the same transaction. Structured evaluation tools append immutable `evaluation_evidence` with enum result `passed | failed | needs_revision | inconclusive`; related Issue/evaluation/outbox writes commit atomically. `action_id` itself is unique; `idempotency_key` is a separately unique alias. The same action or idempotency key with another argument hash fails closed; an already completed action returns its stored result. Internal domain effect, action completion and outbox append commit atomically.
+  Commit Turn head changes by CAS on `turn_journal_heads.revision` through `TransactionScopePort`. The first prepared transaction freezes `owning_run_command_id` only after verifying that command has the same environment/task/Case, type `run_case | resume`, status `running`, and exact Worker/lease generation; later head/event/lease writes must match it. Add relational uniqueness/foreign-key or trigger constraints for the same command scope so application validation is not the only defense.
+
+  Immediately before Pi, commit one `agent_run_attempt` row with status `started`, a unique `agent_run_attempt_id`, request hash, logical Session ID and exact lease owner. Return from that short transaction before calling Pi. The Adapter then creates an attempt-local in-memory transcript buffer and synchronously captures this run's complete user, assistant and toolResult `message_end` evidence; listeners perform no asynchronous database writes. Every P0 mutation tool is declared `executionMode='sequential'`.
+
+  Each mutation tool first commits transaction A: stable `action_id`, Provider tool-call identity, idempotency key and canonical arguments hash with state `prepared`. It then runs transaction B, which atomically commits the internal domain effect, Action `completed` result and outbox under the same current lease. If transaction B rolls back, the `prepared` row remains while domain effect, completed marker and outbox are absent; the tool sets an in-memory fatal flag, calls `ctx.abort()`, throws, and prevents the Agent Run from succeeding. Replaying an already completed Action returns its stored result; the same identity/key with another argument hash fails closed. External non-transactional side-effect tools are not P0-capable.
+
+  After `prompt()` settles, validate and sanitize the complete attempt buffer rather than reading only the last item from `agentSession.messages`. One short fenced transaction appends all ordered Forge message evidence and writes `stop_reason + outcome`: valid public final answer and no fatal flag → `completed/succeeded`; classified Provider failure → `completed/known_failed`; aborted, fatal flag, missing/invalid evidence, persistence failure or unclassified state → `outcome_unknown + waiting_recovery`. If that transaction cannot commit, no success state is written. Provider lifecycle hooks may append best-effort telemetry but are never a recovery barrier because handler failure is not authoritative.
 
   When a run reaches a terminal/safe-checkpoint result (`completed`, `failed`, `paused`, `stopped`, `waiting_human`, or `waiting_recovery`), the final Journal head, Case state, execution-lease release, exact `owning_run_command_id` completion and one UI outbox event commit in the same fenced transaction. Therefore a new “terminal Journal / pending run command” state cannot be produced. Legacy/injected inconsistent rows are repaired only by a separate reconciliation CAS over exact `owning_run_command_id + terminal journal revision + lease generation`, requiring no valid execution lease; it changes that command/outbox only and never invents business evidence.
 
-  If Pi cannot confirm an in-flight invocation, append `outcome_unknown`, move the Case to `waiting_recovery`, and never call Pi again automatically.
+  A crash after `agent_run_attempt=started` but before a committed classified outcome always recovers as `outcome_unknown + waiting_recovery`; it never automatically calls Pi again. Before each attempt, estimate the reconstructable public context against the frozen model `contextWindow`; at the conservative hard limit, persist `CONTEXT_LIMIT + waiting_recovery` without sending a Provider request. Remove the Forge Adapter's outer empty-response/nudge retry; Pi SDK retries internal to one `prompt()` remain part of the same coarse attempt.
 
 - [ ] **Step 5: Implement paused Case semantics**
 
@@ -574,10 +712,12 @@
 
   An expired/ambiguous active Journal first converges to `waiting_recovery`; Supervisor never writes a business pause/stop result itself. Forced termination during a pause request converges to `waiting_recovery`, not `paused`. Tests cover simultaneous run/pause/stop, duplicate controls, a dead Worker followed by stop end-to-end, revision change during dispatch, Worker death before claim and Worker death after claim. Automatic recovery remains feature-disabled until Task 7's process ownership tests pass.
 
-- [ ] **Step 6: Verify and commit**
+- [ ] **Step 6: Run the production recovery gate and commit**
 
-  Run: `npx vitest run packages/domain/src/turn-journal-state.test.ts packages/application/src/turn-journal-service.test.ts packages/application/src/secret-sanitizer.test.ts packages/application/src/crash-recovery.test.ts && npm run check`
-  Expected: PASS.
+  Repeat Task 0's conceptual assertions against migration 003, the final repositories and the real `TurnExecutor`: Action-B rollback retains only `prepared`; Provider error/aborted resolve paths are classified; outer prompt count stays one; transcript/evidence failure cannot succeed; and no write transaction spans Pi. This is the first production-protocol proof, not Task 0's temporary harness.
+
+  Run: `npx.cmd vitest run packages/domain/src/agent-run-attempt-state.test.ts packages/domain/src/turn-journal-state.test.ts packages/application/src/turn-journal-service.test.ts packages/application/src/secret-sanitizer.test.ts packages/application/src/crash-recovery.test.ts && npm.cmd run check`
+  Expected: PASS with production schema/repository tests; Task 12 still must prove the same windows across real processes.
   Commit: `feat(recovery): add durable Turn journal`
 
 ### Task 7: Supervisor、独立 Case Worker、命令交接与安全关闭
@@ -591,21 +731,23 @@
 - Create: `packages/adapters/src/local-worker-ipc.ts`
 - Test: `packages/application/src/supervisor-service.test.ts`
 - Test: `apps/supervisor/src/main.integration.test.ts`
+- Modify: `packages/application/src/index.ts`
+- Modify: `packages/adapters/src/index.ts`
 - Modify: `apps/worker/src/main.ts`
 - Modify: root `package.json`
 - Modify: `package-lock.json`
 
 **Interfaces:**
-- Produces: `SupervisorService.tick()`, Worker handshake/heartbeat/exit protocol, command ownership reconciliation, `npm run supervisor`.
+- Produces: `SupervisorService.tick()`, Worker handshake/heartbeat/exit protocol, command ownership reconciliation, `npm.cmd run supervisor`.
 - Consumes: Tasks 5–6 persistent commands, artifact invariants, fenced leases and Turn Journal.
 
 - [ ] **Step 1: Write failing scheduling and ownership tests**
 
-  Verify default concurrency 1, fenced per-environment Supervisor heartbeat/takeover, control priority over new runs, FIFO within priority, dispatch-claim expiry, no second Worker under a valid Case lease, Supervisor restart while a live Worker continues only through DB heartbeat, Worker completing its command while Supervisor is down, legacy terminal-Journal reconciliation and no PID-only process termination. Add explicit process windows for spawn throw, child ready timeout, ready message lost, transfer committed/ack lost, delayed first heartbeat, Supervisor death during handoff and a late old Worker after generation changed.
+  Verify default concurrency 1, fenced per-environment Supervisor heartbeat generation and expiry-based reclaim, control priority over new runs, FIFO within priority, dispatch-claim expiry, no second Worker under a valid Case lease, Supervisor restart while a live Worker continues only through DB heartbeat, Worker completing its command while Supervisor is down, legacy terminal-Journal reconciliation and no PID-only process termination. Add explicit process windows for spawn throw, child ready timeout, ready message lost, transfer committed/ack lost, delayed first heartbeat, Supervisor death during handoff and a late old Worker after generation changed.
 
 - [ ] **Step 2: Run the tests**
 
-  Run: `npx vitest run packages/application/src/supervisor-service.test.ts apps/supervisor/src/main.integration.test.ts`
+  Run: `npx.cmd vitest run packages/application/src/supervisor-service.test.ts apps/supervisor/src/main.integration.test.ts`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement atomic command-to-Worker handoff**
@@ -630,7 +772,7 @@
 
 - [ ] **Step 7: Verify and commit**
 
-  Run: `npx vitest run packages/application/src/supervisor-service.test.ts apps/supervisor/src/main.integration.test.ts && npm run check`
+  Run: `npx.cmd vitest run packages/application/src/supervisor-service.test.ts apps/supervisor/src/main.integration.test.ts && npm.cmd run check`
   Expected: PASS.
   Commit: `feat(worker): add fenced persistent command supervisor`
 
@@ -638,31 +780,34 @@
 
 **Files:**
 - Create: `packages/application/src/task-query-service.ts`
+- Create: `packages/application/src/template-query-service.ts`
 - Create: `packages/application/src/agent-session-query-service.ts`
 - Create: `packages/application/src/artifact-query-service.ts`
 - Create: `packages/application/src/ui-event-service.ts`
 - Create: `packages/application/src/health-query-service.ts`
 - Create: `packages/adapters/src/sqlite-query-repository.ts`
-- Create: `packages/adapters/src/sqlite-ui-event-repository.ts`
+- Modify: `packages/adapters/src/sqlite-ui-event-repository.ts`
 - Create: `packages/adapters/src/sqlite-health-metrics.ts`
 - Test: `packages/application/src/task-query-service.test.ts`
+- Test: `packages/application/src/template-query-service.test.ts`
 - Test: `packages/application/src/agent-session-query-service.test.ts`
 - Test: `packages/application/src/ui-event-service.test.ts`
 - Test: `packages/application/src/health-query-service.test.ts`
 - Modify: `packages/application/src/index.ts`
+- Modify: `packages/adapters/src/index.ts`
 - Modify: `apps/supervisor/src/main.ts`
 
 **Interfaces:**
-- Produces: `TaskListQuery.execute`, `TaskWorkspaceQuery.execute`, `AgentSessionDetailQuery.execute`, `ArtifactQuery.execute`, `UiEventService.getWindow/replay/prune`, `HealthQueryService.execute`.
+- Produces: `TaskListQuery.execute`, `TemplateListQuery.execute`, `TemplateDetailQuery.execute`, `TaskWorkspaceQuery.execute`, `AgentSessionDetailQuery.execute`, `ArtifactQuery.execute`, `UiEventService.getWindow/replay/prune`, `HealthQueryService.execute`.
 - Consumes: consistent SQLite read snapshot and all authoritative records.
 
 - [ ] **Step 1: Write projection tests from authoritative fixtures**
 
-  Assert current valid/latest created/delivered are distinct; legal actions come from application rules; `TaskWorkspaceQuery` calls `ProgressProjector` with the frozen template presentation and persisted evidence; graph edges exist only for persisted message/route/artifact/Issue references; graph/session/history limits expose opaque cursors without splitting an edge from its referenced node; an unrelated Session/Turn/version/diff pair is rejected with `OBJECT_SCOPE_MISMATCH`.
+  Assert bounded task text/status/priority filters and opaque pagination; P0 template list/detail fields; current valid/latest created/delivered are distinct; legal actions come from application rules; `TaskWorkspaceQuery` calls `ProgressProjector` with the frozen template presentation and persisted evidence; graph edges exist only for persisted message/route/artifact/Issue references; graph/session/history limits expose opaque cursors without splitting an edge from its referenced node; an unrelated Session/Turn/version/diff pair is rejected with `OBJECT_SCOPE_MISMATCH`.
 
 - [ ] **Step 2: Add Agent session privacy tests**
 
-  Assert the work area contains summaries only; opening a Session returns bounded sanitized business input/output and ordered tool cards; public reasoning is `null` when Pi did not supply an explicit public summary; Context Snapshot and hidden reasoning are absent. Artifact tests cover explicit same-scope `from/to`, oversized inline bodies, truncation and download metadata.
+  Assert the work area contains summaries only; opening a Session returns bounded sanitized business input/output and ordered tool cards; public reasoning is `null` when Pi did not supply an explicit public summary; Context Snapshot and hidden reasoning are absent. Artifact tests cover explicit same-scope `from/to`, oversized version-write rejection and typed Diff truncation metadata.
 
   Event tests freeze one independently increasing `event_seq` per environment database; production and test cursors are different opaque domains and are never compared. `low_watermark` means the greatest pruned sequence in that environment (`0` when none); replay returns rows `> after`, `after < low_watermark` yields `resync_required`, and prune plus watermark update commit atomically. Every event append advances that environment's `high_watermark` in the same business transaction, so a crash cannot leave a committed event above the stored high watermark.
 
@@ -670,18 +815,18 @@
 
 - [ ] **Step 3: Run focused tests**
 
-  Run: `npx vitest run packages/application/src/task-query-service.test.ts packages/application/src/agent-session-query-service.test.ts packages/application/src/ui-event-service.test.ts packages/application/src/health-query-service.test.ts`
+  Run: `npx.cmd vitest run packages/application/src/task-query-service.test.ts packages/application/src/template-query-service.test.ts packages/application/src/agent-session-query-service.test.ts packages/application/src/ui-event-service.test.ts packages/application/src/health-query-service.test.ts`
   Expected: FAIL.
 
 - [ ] **Step 4: Implement consistent read projections**
 
   Use one read transaction/snapshot per projection. Return opaque `projection_revision` for conditional Query caching and the selected environment's latest visible `source_event_seq` for SSE startup; they are different types and never substituted. `TaskWorkspaceQuery` invokes `ProgressProjector`, builds lane order from frozen template Agents, node order from persisted sequence/time and edges only from authoritative references.
 
-  `UiEventService` owns replay, low/high-watermark and retention semantics through its port; `sqlite-ui-event-repository.ts` owns SQL and pruning. Task 8 wires the Supervisor's generic maintenance hook to `UiEventService.prune`: acquire the persisted per-environment maintenance lease, run once after startup recovery and every 10 minutes, retain events on failure, persist bounded attempt/success/failure state, and retry next interval. Retention deletes every event older than 7 days and then, if needed, the oldest excess rows so at most 100,000 remain; one transaction deletes rows and advances `low_watermark` to the greatest deleted sequence. `HealthQueryService` combines Adapter metrics into `HealthSnapshot`, includes the launcher's non-secret `instance_id` and `release_id`, and exposes no paths/raw errors.
+  `UiEventService` owns replay, low/high-watermark and retention semantics through its port; Task 8 extends Task 5's `sqlite-ui-event-repository.ts` from append/high-watermark into replay, pruning and low-watermark SQL. Task 8 wires the Supervisor's generic maintenance hook to `UiEventService.prune`: acquire the persisted per-environment maintenance lease, run once after startup recovery and every 10 minutes, retain events on failure, persist bounded attempt/success/failure state, and retry next interval. Retention deletes every event older than 7 days and then, if needed, the oldest excess rows so at most 100,000 remain; one transaction deletes rows and advances `low_watermark` to the greatest deleted sequence. `HealthQueryService` combines Adapter metrics into `HealthSnapshot`, includes the launcher's non-secret `instance_id` and `release_id`, and exposes no paths/raw errors.
 
 - [ ] **Step 5: Verify and commit**
 
-  Run: `npx vitest run packages/application/src/task-query-service.test.ts packages/application/src/agent-session-query-service.test.ts packages/application/src/ui-event-service.test.ts packages/application/src/health-query-service.test.ts packages/application/src/delivery-validator.test.ts && npm run check`
+  Run: `npx.cmd vitest run packages/application/src/task-query-service.test.ts packages/application/src/template-query-service.test.ts packages/application/src/agent-session-query-service.test.ts packages/application/src/ui-event-service.test.ts packages/application/src/health-query-service.test.ts packages/application/src/delivery-validator.test.ts && npm.cmd run check`
   Expected: PASS.
   Commit: `feat(query): project authoritative task workspace`
 
@@ -692,6 +837,7 @@
 - Create: `apps/web/lib/http.ts`
 - Create: `apps/web/app/api/v1/tasks/route.ts`
 - Create: `apps/web/app/api/v1/tasks/[taskId]/route.ts`
+- Create: `apps/web/app/api/v1/tasks/[taskId]/copy/route.ts`
 - Create: `apps/web/app/api/v1/tasks/[taskId]/draft/route.ts`
 - Create: `apps/web/app/api/v1/tasks/[taskId]/start/route.ts`
 - Create: `apps/web/app/api/v1/tasks/[taskId]/commands/route.ts`
@@ -699,9 +845,9 @@
 - Create: `apps/web/app/api/v1/tasks/[taskId]/workspace/route.ts`
 - Create: `apps/web/app/api/v1/tasks/[taskId]/sessions/[sessionId]/route.ts`
 - Create: `apps/web/app/api/v1/tasks/[taskId]/artifacts/[artifactId]/versions/[versionId]/route.ts`
-- Create: `apps/web/app/api/v1/tasks/[taskId]/artifacts/[artifactId]/versions/[versionId]/download/route.ts`
 - Create: `apps/web/app/api/v1/tasks/[taskId]/artifacts/[artifactId]/diff/route.ts`
 - Create: `apps/web/app/api/v1/templates/route.ts`
+- Create: `apps/web/app/api/v1/templates/[templateRevisionId]/route.ts`
 - Create: `apps/web/app/api/v1/models/route.ts`
 - Create: `apps/web/app/api/v1/models/refresh/route.ts`
 - Create: `apps/web/app/api/v1/events/route.ts`
@@ -717,9 +863,9 @@
 
 - [ ] **Step 1: Write BFF integration tests**
 
-  Validate request and response Contracts, status mapping (`200/201/202/304/400/404/409/413/422/503`), bounded artifact read/download/diff routes, no raw SQLite rows, no CLI spawn, duplicate idempotency behavior, object-scope rejection and `2 MiB` request-body rejection.
+  Validate request and response Contracts, status mapping (`200/201/202/304/400/404/409/413/422/503`), bounded artifact read/diff routes, no raw SQLite rows, no CLI spawn, duplicate idempotency behavior, object-scope rejection and `2 MiB` request-body rejection. `GET /tasks` has bounded `q`, status and priority filters with opaque pagination; `POST /tasks/:taskId/copy` creates only a new draft with `source_task_id` and no Case/evidence; template detail returns P0 purpose/input/artifact/Agent/current-revision/availability fields but no secret paths.
 
-  The launcher passes the exact authority `127.0.0.1:<chosenPort>` into the Web process. Every `/api/v1/**` request, including GET, download and EventSource, must match that exact `Host`; reject `localhost`, DNS names, hostile/missing/mismatched Host and DNS-rebinding hostnames. Every mutation additionally requires exact same-origin `Origin` and `Content-Type: application/json`; reject hostile/missing Origin, cross-origin requests and CORS preflight. Minimal health contains only the bounded `HealthSnapshot` and still uses exact Host. These are local authority checks, not an account/auth system.
+  The launcher passes the exact authority `127.0.0.1:<chosenPort>` into the Web process. Every `/api/v1/**` request, including GET and EventSource, must match that exact `Host`; reject `localhost`, DNS names, hostile/missing/mismatched Host and DNS-rebinding hostnames. Every mutation additionally requires exact same-origin `Origin` and `Content-Type: application/json`; reject hostile/missing Origin, cross-origin requests and CORS preflight. Minimal health contains only the bounded `HealthSnapshot` and still uses exact Host. These are local authority checks, not an account/auth system.
 
 - [ ] **Step 2: Write SSE replay tests**
 
@@ -727,12 +873,12 @@
 
 - [ ] **Step 3: Run focused tests**
 
-  Run: `npx vitest run apps/web/src/bff.integration.test.ts`
+  Run: `npx.cmd vitest run apps/web/src/bff.integration.test.ts`
   Expected: FAIL.
 
 - [ ] **Step 4: Implement the BFF adapter**
 
-  Routes validate with shared TypeBox schemas, call one application use case, map stable errors and attach `request_id`. Artifact Diff requires explicit `from_version_id` and `to_version_id`; download uses attachment-safe filename and streams only the already-scoped immutable text version. No route imports better-sqlite3, CLI commands or Worker process APIs.
+  Routes validate with shared TypeBox schemas, call one application use case, map stable errors and attach `request_id`. Artifact Diff requires explicit `from_version_id` and `to_version_id`. P0 exposes no file-download route; that remains P1. No route imports better-sqlite3, CLI commands or Worker process APIs.
 
 - [ ] **Step 5: Implement SSE**
 
@@ -749,7 +895,7 @@
 
 - [ ] **Step 7: Verify and commit**
 
-  Run: `npx vitest run apps/web/src/bff.integration.test.ts && npm run check && npm --workspace @forge-ai/web run build`
+  Run: `npx.cmd vitest run apps/web/src/bff.integration.test.ts && npm.cmd run check && npm.cmd --workspace @forge-ai/web run build`
   Expected: PASS.
   Commit: `feat(web): add typed Forge BFF and SSE`
 
@@ -765,7 +911,9 @@
 - Create: `apps/web/app/tasks/new/page.tsx`
 - Create: `apps/web/app/tasks/[taskId]/page.tsx`
 - Create: `apps/web/app/templates/page.tsx`
+- Create: `apps/web/app/templates/[templateRevisionId]/page.tsx`
 - Create: `apps/web/components/task-list.tsx`
+- Create: `apps/web/components/template-detail.tsx`
 - Create: `apps/web/components/task-create-wizard.tsx`
 - Create: `apps/web/components/task-workspace.tsx`
 - Create: `apps/web/components/config-drawer.tsx`
@@ -774,10 +922,14 @@
 - Create: `apps/web/components/agent-session-dialog.tsx`
 - Create: `apps/web/components/task-actions.tsx`
 - Test: `apps/web/src/url-state.test.ts`
+- Test: `apps/web/src/task-list.test.tsx`
+- Test: `apps/web/src/template-detail.test.tsx`
 - Test: `apps/web/src/task-workspace.test.tsx`
+- Test: `apps/web/src/artifact-chain.test.tsx`
 - Test: `apps/web/src/draft-recovery-store.test.ts`
 - Create: `vitest.web.config.ts`
 - Modify: `apps/web/package.json`
+- Modify: `package-lock.json`
 - Replace: `apps/web/app/page.tsx`, `apps/web/app/globals.css`
 
 **Interfaces:**
@@ -786,15 +938,15 @@
 
 - [ ] **Step 1: Install only the frozen UI dependencies**
 
-  Add TanStack Query, React Hook Form, Radix Dialog, Lucide and Testing Library. Implement drawers with the Radix Dialog primitive plus side-panel styling; Radix has no separate Drawer primitive. Do not add Redux/Zustand, React Flow, GraphQL, tRPC, Storybook or a second component framework. `vitest.web.config.ts` uses jsdom and includes `apps/web/src/**/*.test.ts(x)`.
+  Add exact package versions for TanStack Query, React Hook Form, Radix Dialog, Lucide and Testing Library and commit the resulting lockfile. Implement drawers with the Radix Dialog primitive plus side-panel styling; Radix has no separate Drawer primitive. Do not add Redux/Zustand, React Flow, GraphQL, tRPC, Storybook or a second component framework. `vitest.web.config.ts` uses jsdom and includes `apps/web/src/**/*.test.ts(x)`.
 
 - [ ] **Step 2: Write URL and component tests**
 
-  Test direct open/refresh/back-forward for `agent`, `session`, `turn`, `artifact`, `version`, `compare`; invalid IDs produce local empty states. Test default left drawer closed/right drawer open at 1440, both overlay at 1024, Dialog focus return and historical selection protection during SSE updates.
+  Test direct open/refresh/back-forward for `agent`, `session`, `turn`, `artifact`, `version`, `compare`; invalid IDs produce local empty states. Test default left drawer closed/right drawer open at 1440, both overlay at 1024, Dialog focus return and historical selection protection during SSE updates. Workbench tests cover bounded text search, status/priority filters, pagination and production environment marker. Template tests cover purpose/input/artifact/Agent/current revision/availability. Task-copy tests prove source relation is preserved while Case, artifact, Issue, command and gate evidence are absent.
 
 - [ ] **Step 3: Run tests and observe failure**
 
-  Run: `npx vitest run apps/web/src/url-state.test.ts apps/web/src/task-workspace.test.tsx`
+  Run: `npx.cmd vitest run --config vitest.web.config.ts apps/web/src/url-state.test.ts apps/web/src/task-workspace.test.tsx`
   Expected: FAIL.
 
 - [ ] **Step 4: Implement the create-and-run path**
@@ -805,9 +957,11 @@
 
   A `409` broadcasts `{task_id, conflict_revision, conflict_hash}` through `BroadcastChannel`; every tab marks that task conflicted and stops new writes until the user reloads server state or forks one selected local snapshot into a new draft. Cleanup after fork is writer-scoped and explicit. There is no force overwrite or field merge. Tests interleave two tabs, duplicate a tab, force a writer collision, reorder acknowledgements, recover/tombstone an old writer snapshot, crash between each adoption/ACK cleanup phase and broadcast simultaneous conflict. Start flushes save first and reuses one idempotency key per user intent.
 
+  The workbench provides P0 search/status/priority filters and “基于此任务创建” using the dedicated copy command. The template center opens an objective P0 detail view before selection. Creation shows Provider/Model catalog loading, empty, unavailable and drift states; every Agent displays template default, task override and actual frozen selection without revealing credentials. Production is always visibly labelled.
+
 - [ ] **Step 5: Implement the work area**
 
-  Use CSS Grid and SVG paths without a graph framework. Agent columns run left-to-right; time runs top-to-bottom. Render only query-provided nodes and edges. Clicking a Turn writes `session`/`turn` to URL and lazily fetches the Agent Session Dialog. Clicking an artifact reference selects the right drawer object.
+  Use CSS Grid and SVG paths without a graph framework. Agent columns run left-to-right; time runs top-to-bottom. Render only query-provided nodes and edges. Clicking a Turn writes `session`/`turn` to URL and lazily fetches the Agent Session Dialog. Clicking an artifact reference selects the right drawer object. The top summary renders status, stage, step, next action, blockers and application-provided legal actions. The right drawer distinguishes current-valid/latest-working/delivered versions and renders the bounded Issue → repair → repair version → `verified` → delivery-gate chain. Current-task Turn/artifact/Issue/repair/version selections highlight both the lane and artifact chain. Copy and bounded current-task Diff never change artifact state; search/chapter navigation/file download remain P1.
 
 - [ ] **Step 6: Implement state-driven actions**
 
@@ -815,7 +969,7 @@
 
 - [ ] **Step 7: Verify functional UI and commit**
 
-  Run: `npx vitest run --config vitest.web.config.ts apps/web/src/url-state.test.ts apps/web/src/task-workspace.test.tsx apps/web/src/draft-recovery-store.test.ts && npm --workspace @forge-ai/web run build`
+  Run: `npx.cmd vitest run --config vitest.web.config.ts apps/web/src/url-state.test.ts apps/web/src/task-list.test.tsx apps/web/src/template-detail.test.tsx apps/web/src/task-workspace.test.tsx apps/web/src/artifact-chain.test.tsx apps/web/src/draft-recovery-store.test.ts && npm.cmd --workspace @forge-ai/web run build`
   Expected: PASS.
   Commit: `feat(ui): implement Forge production workspace`
 
@@ -830,6 +984,7 @@
 - Create: `apps/test-driver/tsconfig.json`
 - Create: `apps/test-driver/src/main.ts`
 - Create: `scripts/package-local.cjs`
+- Create: `scripts/release-candidate.cjs`
 - Create: `tsconfig.build.json`
 - Create/Modify: each runtime workspace `tsconfig.build.json` and `package.json`
 - Create: `packages/adapters/src/instance-lock.ts`
@@ -851,7 +1006,7 @@
 
 - [ ] **Step 2: Run tests**
 
-  Run: `npx vitest run apps/launcher/src/main.integration.test.ts packages/adapters/src/instance-lock.test.ts`
+  Run: `npx.cmd vitest run apps/launcher/src/main.integration.test.ts packages/adapters/src/instance-lock.test.ts`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement startup order**
@@ -861,29 +1016,33 @@
   Add a real production pipeline:
 
   ```tex
-  npm run build:runtime   # tsc -b tsconfig.build.json
-  npm run build:web       # next build with output=standalone
-  npm run package:local   # scripts/package-local.cjs
-  npm run test:package
+  npm.cmd run build:runtime   # tsc -b tsconfig.build.json
+  npm.cmd run build:web       # next build with output=standalone
+  npm.cmd run package:local   # scripts/package-local.cjs
+  npm.cmd run test:package
   ```
 
   Every runtime workspace emits `dist/**/*.js`, declarations and source maps from a dedicated build config; its production `exports`, `main` and `bin` point to `dist`, never `src`. `package:local` resolves the complete dependency closure for Launcher, isolated test driver, Supervisor and Worker from the exact lockfile—not only Next's trace—and copies every pure-JS dependency, Pi dynamic Provider asset and platform native module into staging alongside compiled workspace output, Next standalone/static/public and migrations. The normal launcher exports no test-driver module. The test-driver binary requires a fresh capability file bound to its temporary root; only it may inject Fake Pi/checkpoint IPC. Tests clear `NODE_PATH`, prepend no repository `node_modules`, and fail any module resolved outside staging.
 
-  Build a canonical payload manifest containing the hash/mode/relative path of every payload file but excluding `release-manifest.json` itself. `release_id = sha256(canonical_payload_manifest)`. Then write `release-manifest.json` containing that payload plus `release_id`, atomically rename staging to `releases/<release_id>`, reopen it and recompute all payload hashes and the ID. The manifest never claims to hash itself; any extra/missing/changed file fails verification. Production start must not invoke `tsx`, resolve workspace source exports or read repository TypeScript/source paths.
+  `release-candidate.cjs` refuses staged/unstaged changes and non-ignored untracked files, then records exact `source_commit`, `source_tree_sha256` over the canonical full `git ls-tree` listing, and `package_lock_sha256`. Build a canonical payload manifest containing the hash/mode/relative path of every payload file but excluding `release-manifest.json` itself. Bind the release to `source_commit + source_tree_sha256 + package_lock_sha256 + process.platform + process.arch + Node major + process.versions.modules`; `release_id = sha256(canonical_payload_manifest + source_provenance + runtime_abi_descriptor)`. Then write `release-manifest.json` containing the provenance, payload, ABI descriptor and `release_id`, atomically rename staging to `releases/<release_id>`, reopen it and recompute all payload hashes and the ID. The launcher validates the ABI descriptor before loading `better-sqlite3` and rejects a mismatch with `RUNTIME_ABI_MISMATCH`. The manifest never claims to hash itself; any extra/missing/changed file, lockfile mismatch or module resolved outside the payload fails verification. Production start must not invoke `tsx`, resolve workspace source exports or read repository TypeScript/source paths. Future Electron packaging must rebuild native modules for Electron's ABI rather than reusing this Node-native payload.
 
 - [ ] **Step 4: Implement safe close**
 
   Browser close changes nothing. First Ctrl+C drains; a second explicit interrupt exits the launcher but reports that incomplete Cases will be recovered from leases/journal. Never mark business state from process exit alone.
 
-- [ ] **Step 5: Prove the packaged layout works without source**
+- [ ] **Step 5: Verify and commit the source candidate before packaging**
 
-  Copy the immutable release directory to a temporary path, make the repository source unavailable and verify the release manifest. First invoke the normal compiled launcher with the test capability and assert it rejects the capability/Fake/checkpoint controls before startup. Then invoke only the packaged `forge-test-driver` with a fresh temporary-root-bound capability, pass identity-bound health with `test_hooks_enabled=true`, create one Fake Pi task and shut down cleanly. Assert module resolution stays inside the release directory and native/Pi assets load from it. This is the Electron-compatible packaging boundary proof and produces the exact `release_dir + release_id` consumed by Tasks 12–13.
-
-- [ ] **Step 6: Verify and commit**
-
-  Run: `npm run build:runtime && npm run build:web && npm run package:local && npx vitest run apps/launcher/src/main.integration.test.ts apps/launcher/src/standalone-smoke.integration.test.ts packages/adapters/src/instance-lock.test.ts && npm run test:package && npm run check`
+  Run: `npm.cmd run build:runtime && npm.cmd run build:web && npx.cmd vitest run apps/launcher/src/main.integration.test.ts packages/adapters/src/instance-lock.test.ts && npm.cmd run check`
   Expected: PASS.
   Commit: `feat(cli): add unified local Forge UI launcher`
+  Then require `git status --porcelain` to be empty. Do not package an uncommitted source tree.
+
+- [ ] **Step 6: Build one explicit candidate and prove the packaged layout without source**
+
+  Run `npm.cmd run release:prepare -- --manifest-out <absolute-temporary-json>`; the script fails unless the worktree is clean and returns one absolute `release-manifest.json` path. Copy that immutable release directory to a temporary path, make repository source unavailable and verify the manifest. First invoke the normal compiled launcher with the test capability and assert it rejects capability/Fake/checkpoint controls before startup. Then invoke only the packaged `forge-test-driver` with a fresh temporary-root-bound capability, pass identity-bound health with `test_hooks_enabled=true`, create one Fake Pi task and shut down cleanly. Assert module resolution stays inside the release directory and native/Pi assets load from it.
+
+  Run: `npm.cmd run test:package -- --release-manifest <absolute-release-manifest>`
+  Expected: PASS, with the exact absolute manifest path, `release_id`, `source_commit`, `source_tree_sha256` and `package_lock_sha256` recorded for Tasks 12–14. Generated releases remain untracked evidence and are never selected by “latest”.
 
 ### Task 12: Fake Pi 浏览器 E2E 与七窗口进程故障矩阵
 
@@ -892,38 +1051,46 @@
 - Create: `tests/e2e/forge-ui-main-path.spec.ts`
 - Create: `tests/e2e/forge-ui-reconnect.spec.ts`
 - Create: `scripts/process-fault-matrix.cjs`
+- Create: `scripts/playwright-preflight.cjs`
 - Create: `tests/fixtures/p0-generic-scenario/**`
 - Modify: root `package.json`
+- Modify: `package-lock.json`
 
 **Interfaces:**
 - Produces: deterministic P0 browser proof and process-level recovery proof.
-- Consumes: Task 11's immutable release directory; the complete launcher/BFF/Supervisor/Worker chain runs from that directory with only Pi replaced by Fake.
+- Consumes: the immutable release rebuilt from Task 12's own final clean commit; the complete launcher/BFF/Supervisor/Worker chain runs from that directory with only Pi replaced by Fake.
 
 - [ ] **Step 1: Add a generic scenario fixture**
+
+  Pin `@playwright/test@1.55.0` exactly and commit its lockfile. Add `test:browser:preflight`, which runs the matching `playwright install chromium`, records browser revision and launches/closes one isolated page. On Windows invoke it as `npm.cmd run test:browser:preflight`; a missing or mismatched browser blocks E2E before application startup.
 
   Use neutral Agent/step/artifact names; include artifact publication, evaluation, repair, human request and delivery. No platform code may reference fixture names.
 
 - [ ] **Step 2: Write browser E2E**
 
-  Cover create draft, autosave, model selection, start, queue, SSE, Turn Dialog, current artifact, gate failure, human answer, pause/resume, stop, refresh and URL restoration. Do not intercept APIs or prewrite success rows.
+  Start only with `--release-manifest <absolute-release-manifest>` and reject a missing ID, mismatched manifest or stale release. Cover: workbench search/status/priority filters; template detail and creation; draft/autosave; source-task copy without evidence cloning; model catalog loading/unavailable/drift and exact selection; start/queue/SSE; Turn Dialog and lane↔artifact selection; current-valid/latest-working/delivered distinction; text copy and bounded current-task Diff; complete Issue → repair → repair version → `verified` → delivery-gate chain; gate failure; human answer; `outcome_unknown/waiting_recovery`; pause/resume/stop; production marker; empty/invalid-scope states; refresh and URL restoration. Do not intercept APIs or prewrite success rows.
 
 - [ ] **Step 3: Write the seven-window process driver**
 
   The release contains two isolated compiled entry capabilities: the normal `forge-ui` entry is statically wired to the real Pi Adapter and rejects every Fake/checkpoint option; a non-exported `forge-test-driver` harness can inject Fake Pi and open test-only checkpoint IPC only when it receives a fresh capability file created in the temporary E2E root. The capability file is not accepted by the normal entry, is never copied into user data, and is deleted after the run. Adapter identity and `test_hooks_enabled` are exposed only in release-gate evidence/health reason metadata, not as user configuration.
 
-  Start the copied immutable release through `forge-test-driver`, wait for explicit test-only IPC checkpoints, then terminate the actual Worker/Supervisor at every TD-022 window plus Task 7's spawn/handoff windows. Restart the same release with the same data root and assert Fake adapter identity, test hooks enabled only in the harness, original Case/Session/template/model snapshot/configuration fingerprint/invocation, legal state convergence, lease fencing and no duplicate Turn/message/artifact/Issue/revision/gate/evaluation/tool/event/command-completion.
+  Start the copied immutable release through `forge-test-driver`, wait for explicit test-only IPC checkpoints, then terminate the actual Worker/Supervisor at every TD-022 window plus Task 7's spawn/handoff windows. The seven normative windows are: command persisted before Supervisor claim; command claimed before Worker ready/handoff; Worker lease plus Turn `prepared` before Pi; `agent_run_attempt=started` before classified outcome; Action transaction A committed before/during rolled-back B; prompt settled before transcript/outcome commit; and atomic terminal commit completed before UI/SSE consumption. Restart the same release with the same data root and assert Fake adapter identity, test hooks enabled only in the harness, original Case/logical Session/template/model snapshot/configuration fingerprint/attempt, legal state convergence, lease fencing and no duplicate Turn/message/artifact/Issue/revision/gate/evaluation/tool/event/command-completion. A terminal-Journal/pending-command state is tested only through an explicitly injected legacy fixture and is not counted as a runtime crash window.
+
+  Re-run the Task 6 production assertions through the process driver. A killed started-but-unclassified attempt must become `outcome_unknown + waiting_recovery` and must not call Pi again. Transaction-B rollback must leave its Action `prepared` row but no domain effect, completed marker or outbox. An already completed Action may be read idempotently but never re-applied.
 
 - [ ] **Step 4: Run and fix until green**
 
-  Run: `npm run test:e2e:ui && npm run test:e2e:faults`
+  Run: `npm.cmd run test:browser:preflight && npm.cmd run test:e2e:ui -- --release-manifest <absolute-release-manifest> && npm.cmd run test:e2e:faults -- --release-manifest <absolute-release-manifest>`
   Expected: all P0 browser paths and all seven Fake Pi crash windows PASS.
 
-- [ ] **Step 5: Run the full deterministic gate and commit**
+- [ ] **Step 5: Commit the harness, rebuild from that clean commit and run the full deterministic gate**
 
-  Run: `npm ci && npm test && npm run check && npm run test:e2e:ui && npm run test:e2e:faults`
+  First run `npm.cmd test && npm.cmd run check`, commit all Task 12 harness, fixture, package and lockfile changes as `test(e2e): prove Forge UI and crash recovery`, and require a clean worktree. Then run `npm.cmd run release:prepare -- --manifest-out <absolute-temporary-json>` and use only the newly returned manifest:
+
+  `npm.cmd ci && npm.cmd run test:package -- --release-manifest <absolute-release-manifest> && npm.cmd run test:browser:preflight && npm.cmd run test:e2e:ui -- --release-manifest <absolute-release-manifest> && npm.cmd run test:e2e:faults -- --release-manifest <absolute-release-manifest>`
+
   Expected: PASS.
-  Scan the complete temporary data root (`db/`, WAL, `sessions/`, `templates/`, `logs/`, `backups/`, `runtime/`, `cache/`), captured HTTP/SSE, screenshots and IndexedDB fixtures for synthetic credentials and plaintext thinking. Assert health evidence includes command lag, lease churn, sanitizer hits and `outcome_unknown`.
-  Commit: `test(e2e): prove Forge UI and crash recovery`
+  Scan the complete temporary data root (`db/`, WAL, `sessions/`, `templates/`, `logs/`, `backups/`, `runtime/`, `cache/`), captured HTTP/SSE, screenshots and IndexedDB fixtures for synthetic credentials and plaintext thinking. Assert health evidence includes command lag, lease churn, sanitizer hits and `outcome_unknown`. Windows teardown must prove every Harness-registered child exited, SQLite handles closed and the temporary release/data root can be deleted; it never kills an unknown process. A failure requires a new source commit, a new release and a full rerun.
 
 ### Task 13: 真实 Pi 发布候选门禁
 
@@ -934,8 +1101,8 @@
 - Modify: root `package.json`
 
 **Interfaces:**
-- Produces: `npm run test:release:realpi` and a sanitized JSON/Markdown evidence report.
-- Consumes: one locally configured Pi Provider/Model and the exact immutable `release_dir + release_id` produced and Fake-tested by Task 11/12; running from repository source is forbidden.
+- Produces: `npm.cmd run test:release:realpi` and a sanitized JSON/Markdown evidence report.
+- Consumes: one locally configured Pi Provider/Model plus Task 11/12's release machinery and Fake gates. Task 13 first commits its own harness, builds a new exact immutable `release_dir + release_id` from that clean commit, and reruns package/Fake/fault/real gates on it; running from repository source or reusing the older Task 12 candidate is forbidden.
 
 - [ ] **Step 1: Define evidence assertions**
 
@@ -943,29 +1110,51 @@
 
 - [ ] **Step 2: Implement three mandatory real-process kills**
 
-  Kill Worker while Pi call is in flight; kill Worker after a nonterminal Turn transaction while the owning run command legitimately remains running; kill Supervisor while Worker continues, then restart Supervisor and prove the new Supervisor relies on DB lease heartbeat without IPC takeover. Separately inject a legacy terminal-Journal/pending-command row to test the exact reconciliation CAS—new runtime code must not be able to create that state. At every fault checkpoint assert the expected readiness/status/reason allowlist (temporary missing heartbeat may be unhealthy; a live Worker with restarted healthy Supervisor must recover), and after convergence require `ready=true`, `status=healthy` and no stale migration/prune/lease reason.
+  Persist `agent_run_attempt=started`, confirm no classified assistant completion has been committed, then kill the Worker; this gate proves a started-but-unsettled Agent Run, not that an HTTP request was observed at the exact network in-flight instant. Also kill Worker after a nonterminal Turn transaction while the owning run command legitimately remains running; kill Supervisor while Worker continues, then restart Supervisor and prove the new Supervisor relies on DB lease heartbeat without IPC takeover. Separately inject a legacy terminal-Journal/pending-command row to test the exact reconciliation CAS—new runtime code must not be able to create that state. At every fault checkpoint assert the expected readiness/status/reason allowlist (temporary missing heartbeat may be unhealthy; a live Worker with restarted healthy Supervisor must recover), and after convergence require `ready=true`, `status=healthy` and no stale migration/prune/lease reason.
 
 - [ ] **Step 3: Implement sanitized evidence output**
 
-  Record commit, Node version, exact Pi versions, Schema version, template revision, Provider/Model IDs, invocation IDs, checkpoint names and assertion results. Scan the entire data root including Pi JSONL and backups, logs, captured HTTP/SSE and browser storage for credentials, headers and plaintext thinking; any match fails the gate.
+  Record release `source_commit`, `source_tree_sha256`, `package_lock_sha256`, separate test-harness commit, `release_id`, Node version/native ABI, exact Pi versions, Schema version, template revision, Provider/API/Model IDs, logical Session IDs, Agent Run attempt IDs, checkpoint names and assertion results. The Provider/Model must be the same selection that passed Task 4; a different selection reopens Task 4 compatibility. Scan the entire data root including any legacy Pi JSONL, backups, logs, captured HTTP/SSE and browser storage for credentials, headers and plaintext thinking; any match fails the gate.
 
-- [ ] **Step 4: Run the release gate**
+- [ ] **Step 4: Commit the release harness, then run the explicit release gate**
 
-  Run: `npm run test:release:realpi`
-  Expected: PASS with one timestamped report under `docs/acceptance/`; if local credentials are absent or any scenario fails, P0 remains explicitly unaccepted.
+  Commit the scripts, package-script change and acceptance README first as `test(release): add real Pi recovery gate`; require a clean worktree and record this harness commit. Because it changes the source tree, any earlier candidate is stale.
 
-- [ ] **Step 5: Commit evidence tooling and the sanitized report**
+  From this exact clean commit run `npm.cmd run release:prepare -- --manifest-out <absolute-temporary-json>`. Without rebuilding, run package proof and both Task 12 Fake gates, then the real gate against that one returned manifest:
 
-  Commit: `test(release): add real Pi recovery gate`
+  `npm.cmd run test:package -- --release-manifest <absolute-release-manifest> && npm.cmd run test:e2e:ui -- --release-manifest <absolute-release-manifest> && npm.cmd run test:e2e:faults -- --release-manifest <absolute-release-manifest> && npm.cmd run test:release:realpi -- --release-manifest <absolute-release-manifest>`
+
+  Expected: PASS with one timestamped report under `docs/acceptance/`; if local credentials are absent or any scenario fails, P0 remains explicitly unaccepted. A runtime or harness fix creates a new commit/release and repeats this entire command.
+
+- [ ] **Step 5: Commit only the sanitized evidence report**
+
+  Commit: `docs(acceptance): record real Pi release evidence`
+  The report commit is not the release source commit. It must point back to the immutable manifest and both source/harness commits.
 
 ### Task 14: P0 视觉实现与最终验收
 
 **Files:**
 - Create: `apps/web/styles/tokens.css`
-- Create: `apps/web/components/*.module.css`
+- Create: `apps/web/components/task-list.module.css`
+- Create: `apps/web/components/task-create-wizard.module.css`
+- Create: `apps/web/components/task-workspace.module.css`
+- Create: `apps/web/components/config-drawer.module.css`
+- Create: `apps/web/components/agent-swimlanes.module.css`
+- Create: `apps/web/components/artifact-drawer.module.css`
+- Create: `apps/web/components/agent-session-dialog.module.css`
+- Create: `apps/web/components/task-actions.module.css`
 - Create: `tests/e2e/forge-ui-visual.spec.ts`
+- Create after exact-release sign-off: `docs/acceptance/forge-ui-p0-final.md`
+- Modify before candidate commit: `README.md`
 - Modify: `apps/web/app/globals.css`
-- Modify: workspace components from Task 10.
+- Modify: `apps/web/components/task-list.tsx`
+- Modify: `apps/web/components/task-create-wizard.tsx`
+- Modify: `apps/web/components/task-workspace.tsx`
+- Modify: `apps/web/components/config-drawer.tsx`
+- Modify: `apps/web/components/agent-swimlanes.tsx`
+- Modify: `apps/web/components/artifact-drawer.tsx`
+- Modify: `apps/web/components/agent-session-dialog.tsx`
+- Modify: `apps/web/components/task-actions.tsx`
 
 **Interfaces:**
 - Produces: approved warm editor visual direction at 1024/1280/1440/1920.
@@ -973,7 +1162,7 @@
 
 - [ ] **Step 1: Write stable visual and accessibility assertions**
 
-  Capture only stable shells/states. Assert keyboard navigation, visible focus, Dialog/Drawer focus behavior, semantic status text/icons and reduced-motion support.
+  Re-run the handoff reference preflight first. `none_use_frozen_direction` consumes no image. `repository_asset` accepts only the one allowlisted tracked regular file, rejects symlink/junction/reparse points, verifies `1 byte <= reference_image_bytes <= 20 MiB`, extension/magic-byte media type and exact recorded SHA-256, and fails on any drift; it never loads an external path or URL. Then capture only stable shells/states. Assert keyboard navigation, visible focus, Dialog/Drawer focus behavior, semantic status text/icons and reduced-motion support.
 
 - [ ] **Step 2: Implement semantic tokens**
 
@@ -983,28 +1172,36 @@
 
   At 1440/1920, app shell uses `width: calc(100vw - 32px)` with no narrow content max; right artifact panel uses its token width, central lanes consume remaining space, left config stays collapsed. At 1024–1279 both sides are overlay drawers.
 
-- [ ] **Step 4: Run visual and full release checks**
+- [ ] **Step 4: Verify the visual source and commit the candidate**
 
-  Run:
+  Before verification, update README with the actual local commands, the stable `docs/acceptance/forge-ui-p0-final.md` evidence link, the P0-only scope, and an explicit `not yet accepted` marker; do not claim Gate success that has not run. This is the last README/source edit before the candidate.
+
+  Run: `npx.cmd vitest run --config vitest.web.config.ts && npm.cmd --workspace @forge-ai/web run build && npm.cmd run check`
+  Expected: PASS.
+  Commit: `feat(ui): finish Forge UI P0 visual system`
+  Require `git status --porcelain` to be empty before building the candidate.
+
+- [ ] **Step 5: Build one new immutable candidate and run every automated Gate**
+
+  Run `npm.cmd run release:prepare -- --manifest-out <absolute-temporary-json>` once. Use only its returned absolute manifest in every following command:
 
   ```tex
-  npm tes
-  npm run check
-  npm run build:runtime
-  npm run build:web
-  npm run package:local
-  npm run test:package
-  npm run test:e2e:ui
-  npm run test:e2e:faults
-  npm run test:release:realpi
+  npm.cmd test
+  npm.cmd run check
+  npm.cmd run test:package -- --release-manifest <absolute-release-manifest>
+  npm.cmd run test:browser:preflight
+  npm.cmd run test:e2e:ui -- --release-manifest <absolute-release-manifest>
+  npm.cmd run test:e2e:faults -- --release-manifest <absolute-release-manifest>
+  npm.cmd run test:release:realpi -- --release-manifest <absolute-release-manifest>
   ```
 
-  Expected: all PASS against the one newly generated immutable `release_id`; visual screenshots cover 1024, 1280, 1440 and 1920 without unused side gutters or clipped Agent Dialog.
+  Expected: all PASS against the one newly generated immutable `release_id`; every report repeats its `source_commit + source_tree_sha256 + package_lock_sha256 + release_id`; visual screenshots cover 1024, 1280, 1440 and 1920 without unused side gutters or clipped Agent Dialog. Any source change invalidates this set and requires a new release plus the entire command block.
 
-- [ ] **Step 5: Final truthful status update and commit**
+- [ ] **Step 6: Produce the objective status, then request one visual sign-off**
 
-  Update README only with commands and verified evidence links. Do not write “P0 complete” unless every command above passed on the same release candidate.
-  Commit: `feat(ui): finish Forge UI P0 visual system`
+  After the automated command set passes, status is `G7_AUTOMATED_READY`, not yet `P0_ACCEPTED`. Present screenshots from that exact release for one user response: `接受当前视觉` or one bounded list of visible changes. A requested visual change creates a new source commit and release and repeats Steps 4–5. Only `接受当前视觉` for the exact still-current `release_id` changes status to `P0_ACCEPTED`.
+
+  After acceptance, create only `docs/acceptance/forge-ui-p0-final.md` and commit it as `docs(acceptance): record Forge UI P0 acceptance`. This is an evidence-only direct child commit: the file records the release source commit/tree hash/lock hash/release ID, Gate report paths and visual response, but explicitly is **not** the release source commit. It must not embed its own future commit SHA; the final delivery command reports the actual evidence commit with `git rev-parse HEAD`. No README, runtime, package, lockfile, test, fixture, config or other tracked file may change in this commit. Any tracked change outside that one allowlisted report—including README—invalidates the candidate and requires a new source commit, release and full G7 rerun. Do not write “P0 accepted” unless the automated Gate and exact-release visual sign-off both exist. Never describe this as Forge UI 1.0, the orchestrator, or the entire Forge project.
 
 ---
 
@@ -1012,13 +1209,38 @@
 
 | Gate | Required before continuing | Blocks |
 |---|---|---|
-| G0 | Tasks 1–3 pass; legacy migration verified on a copy | Model/task runtime work |
-| G1 | Task 4 proves exact per-Agent model binding and sanitized recoverable Pi Session storage | Task start and real recovery |
-| G2 | Tasks 5–7 pass: artifact invariants, fenced Journal, command ownership and no long Pi transaction | Query/BFF/UI |
-| G3 | Tasks 8–9 pass; Web has no direct SQLite/CLI writes | Functional UI |
-| G4 | Tasks 10–12 pass on full Fake Pi process chain | Real Pi release gate |
-| G5 | Task 13 passes with sanitized evidence | Visual polish and P0 completion claim |
-| G6 | Task 14 full command set passes on one commit | P0 handoff |
+| G0 | Task 0 proves Pi 0.82 public APIs and conceptual two-transaction recovery protocol are feasible | All production implementation |
+| G1 | Tasks 1–3 pass; strict-offline legacy migration is verified on a copy or a fresh root is selected | Model/task runtime work |
+| G2 | Task 4 proves exact per-Agent model binding, in-memory Pi Session replay and actual Provider compatibility before a model is marked recoverable | Task start and real recovery |
+| G3 | Tasks 5–7 pass: artifact invariants, production Agent Run/Action Journal, command ownership and no long Pi transaction | Query/BFF/UI |
+| G4 | Tasks 8–9 pass; Web has no direct SQLite/CLI writes | Functional UI |
+| G5 | Tasks 10–12 pass on the full Fake Pi process chain and production crash protocol | Real Pi release gate |
+| G6 | Task 13 passes with sanitized evidence | Visual polish and P0 completion claim |
+| G7 | Task 14 full command set passes on one clean-commit release (`G7_AUTOMATED_READY`) and the user accepts that exact release's visual result (`P0_ACCEPTED`) | P0 handoff |
+
+## P0 Requirement → Task → Evidence Traceability
+
+`planned` below means the mapping is frozen, not that implementation exists. A row may move to `tested` only when its named command passes; `accepted` additionally requires an evidence path containing the exact `release_id`. Every P0 row needs at least one Task and one automated test. P1/out-of-scope work never contributes to P0 completion.
+
+| P0 ID | Frozen product slice | Contract / UI boundary | Tasks | Required automated evidence | Initial state |
+|---|---|---|---|---|---|
+| P0-FR-001 | Workbench task list, real status, priority, basic search/filter, production marker | `GET /tasks`; `TaskListQuery`; `/tasks` | 1, 8–10, 12 | `task-query-service.test.ts`, `task-list.test.tsx`, main-path E2E search/filter | planned |
+| P0-FR-002 | Template list and P0 purpose/input/artifact/Agent/revision/availability detail | `GET /templates`, `GET /templates/:templateRevisionId`; `/templates/**` | 1, 3, 8–10, 12 | template registry/query/component tests and template-detail E2E | planned |
+| P0-FR-003 | Three-step text task creation, durable autosave and atomic create/start | task/draft/start DTOs; `/tasks/new` | 1, 3, 5, 9–12 | draft CAS/recovery tests, task-start atomicity and create/start E2E | planned |
+| P0-FR-004 | Create a new draft from an existing task without copying execution evidence | `POST /tasks/:taskId/copy`; `source_task_id` | 3, 5, 8–10, 12 | domain copy test, BFF integration and no-evidence-clone E2E | planned |
+| P0-FR-005 | Provider/Model catalog, availability, per-Agent override, exact freeze and recovery | model catalog/refresh DTOs and selectors | 0, 4, 9, 10, 12, 13 | model catalog/session evidence tests, drift E2E and real-Pi report | planned |
+| P0-FR-006 | Status/stage/step/todo/blocker/next action and application legal actions | `TaskWorkspace`, progress and commands | 3, 5, 8–10, 12 | progress/query/component tests and state-action E2E | planned |
+| P0-FR-007 | Left-to-right Agent lanes, top-to-bottom time, persisted edges and complete sanitized Session Dialog | workspace/session Queries; lane and Dialog components | 4, 6, 8–10, 12, 13 | evidence/query/RTL, browser Dialog/URL and real-Pi identity evidence | planned |
+| P0-FR-008 | Current-valid/latest-working/delivered distinction, read/copy and bounded current-task Diff | artifact read/diff routes; right drawer | 5, 8–10, 12 | artifact invariant/query/component tests and copy/diff E2E | planned |
+| P0-FR-009 | Issue → repair → repair version → verified → gate/delivery chain with lane↔artifact selection | bounded Workspace graph and artifact chain | 5, 6, 8–10, 12, 13 | Issue/revision/delivery unit tests plus complete-chain Fake/real E2E | planned |
+| P0-FR-010 | `waiting_human` reason, exact-action text answer and idempotent resume | answer route/command and workspace action | 5–7, 9, 10, 12 | duplicate-answer tests and browser human-answer E2E | planned |
+| P0-FR-011 | Pause/resume/stop and `outcome_unknown` fail-closed recovery | commands, recovery reasons and legal actions | 5–7, 9, 10, 12, 13 | recovery/supervisor tests, seven-window matrix and three real kills | planned |
+| P0-FR-012 | Explicit migration, data-root isolation, secret/integrity/backup/disk protection | bootstrap/migration/health/launcher | 1, 2, 8, 11–14 | fixture migration, integrity/FK, package and full data-root scans | planned |
+| P0-FR-013 | Persistent SSE cursor, reset/resync, polling fallback and history-position protection | event route, Workspace cursor and client lifecycle | 5, 8–10, 12 | event/BFF tests plus reconnect/resync E2E | planned |
+| P0-FR-014 | Clean-commit immutable package, Fake process chain and same-release real Pi proof | release manifest and explicit manifest argument | 11–13 | package gate, Fake UI/fault reports and real-Pi report sharing one ID | planned |
+| P0-FR-015 | Warm editor visuals, 1024/1280/1440/1920, keyboard/focus/accessibility | semantic tokens and stable visual states | 14 | RTL/accessibility/visual screenshots, then exact-release user sign-off | planned |
+
+Reverse-coverage rule: each Task delivery report lists the P0 IDs it advances and exact test/report paths. Any implementation output not mapped here is either enabling infrastructure or out of scope; it cannot silently expand P0. If a P0 row lacks evidence, G7 fails even when unrelated tests are green.
 
 ## Explicitly Out of Scope
 
@@ -1030,10 +1252,10 @@
 - Notifications, mobile information architecture, Word/PDF conversion and batch packaging.
 - P1 full historical cross-highlighting, advanced diagnostics, archive/recycle management and complete template version UX.
 
-## Self-Review Resul
+## Self-Review Result
 
-- Spec coverage: all P0 product slices map to Tasks 1–14; P1-only interaction depth remains explicitly out of scope.
-- Placeholder scan: no unresolved implementation placeholder remains; commands, routes, errors, schema, transitions and release gates are named.
-- Type consistency: `task_id`, `case_id`, `session_id`, `turn_id`, `invocation_id`, `artifact_id`, `version_id`, `command_id`, `event_seq`, `provider_id`, `model_id`, `worker_instance_id` and `lease_generation` remain stable across contracts, storage, BFF and UI.
+- Spec coverage: Task 0 gates SDK/API feasibility; all P0 product slices map to Tasks 1–14; P1 compaction persistence and interaction depth remain explicitly out of scope.
+- Placeholder scan: no unresolved design placeholder remains. Angle-bracket command arguments such as `<absolute-release-manifest>` are runtime-bound values returned by the named script, while checklist boxes and `planned` trace rows are intentional execution state, not missing design.
+- Type consistency: `task_id`, `case_id`, `session_id`, `logical_session_id`, `turn_id`, `agent_run_attempt_id`, `action_id`, `artifact_id`, `version_id`, `command_id`, `event_seq`, `provider_id`, `model_id`, `worker_instance_id` and `lease_generation` remain stable across contracts, storage, BFF and UI.
 - Architecture check: no planned Web direct DB/CLI path; all business rules stay in domain/application; Adapter code remains business-name agnostic.
-- Truthfulness check: P0 completion is blocked by the real Pi report and process-level crash matrix, not by documentation or Fake Pi results.
+- Truthfulness check: implementation may start only from a `READY` handoff record; automated readiness is blocked by the real Pi report and process-level crash matrix, and final `P0_ACCEPTED` additionally requires exact-release visual sign-off. Documentation or Fake Pi alone never proves completion.
