@@ -1,170 +1,52 @@
-# Plan: Forge UI 产品化与本地运行链路重建
-_Locked via grill — by Claude + user_
+# Plan: Forge UI P0
+_Locked via grill — by Codex + user_
 
 ## Goal
 
-在不破坏 Forge 现有领域规则、追加式证据和真实 Pi 能力的前提下，把当前“CLI/单 Worker + 只读回放页”重建为面向个人内容生产操作者的本地 Web 产品：用户通过 `forge ui` 启动一套可恢复的 BFF、Supervisor 和独立 Case Worker，能够创建与管理生产任务、选择并冻结每个 Agent 的真实 Provider/Model、观察 Agent 生产过程、查看产物演进、处理人工介入以及安全暂停、恢复和停止。P0 必须以真实持久化、真实 Pi、真实进程强杀和可运行证据验收；P1 在同一架构上补齐冻结产品需求中的工作台、模板、诊断和体验能力。Electron 仅保留未来封装边界，本计划不实现 Electron。
+把 Forge 从工程回放页面升级为内容生产操作者可在本机真实使用的 Web 产品：用户可以选择不可变模板修订与每个 Agent 的实际模型，创建并运行生产任务，在统一任务工作区观察纵向 Agent 泳道和产物演进，处理人工介入、安全暂停或崩溃恢复，并获得由系统门禁确认的交付结果。完成声明必须同时具有真实 Pi、真实持久化、真实 Supervisor/Worker 进程和进程级崩溃恢复证据。
 
 ## Approach
 
-1. **固定基线与建立可重复验收入口**
-   - 记录当前 Node、npm、Pi 包、SQLite Schema、production/test DB 解析规则和现有测试结果。
-   - 为后续迁移准备脱敏旧库 fixture；把仓库内每个已发布 Scenario Bundle 及外部 story-pipeline 的恢复/失效传播集成测试纳入迁移前后回归，不只抽测 songwriting/copywriting。
-   - 把 `npm run check`、Vitest、Fake Pi E2E、真实 Pi E2E 的命令与证据输出格式固定下来。
-   - 在任何 UI 美化前先建立“未完成能力清单”，禁止用 Fake Pi、静态页面或文字说明替代真实链路。
+1. 把运行时统一到 Node `>=22.19.0` 与精确锁定的 Pi `0.82.0`，冻结有界 TypeBox API Contract、稳定错误码、REST 路由和 SSE 事件协议。
+2. 保留 production/test 双库隔离，对每个环境用独立 SQLite 排他维护窗口和不可复用的数据库 generation 完成显式前向迁移：确认全部旧 Worker 已退出后，Backup/迁移/验证并原子切换该环境的 active pointer；后续跨表写由抽象事务端口和同连接 SQLite Unit of Work 实现，所有持久化 sink 复用同一脱敏器。
+3. 通过 Pi 公共目录发现 Provider/Model，把准确的 `provider_id + model_id + catalog_snapshot_id + 非敏感配置指纹` 逐 Agent 冻结；Worker 创建或恢复 Session 前再次实时核对，禁止静默替换。
+4. 在事务外生成短期模型验证票据，在事务内以目录快照、配置指纹和草稿 revision CAS 原子完成任务冻结、Case 创建、任务绑定、命令和事件追加。
+5. 先修复当前有效产物写入不变量，再用带 head CAS、invocation ID 和租约写栅栏的短事务 Turn Journal 替换跨 Pi 调用的长事务；工具副作用按稳定 ID/参数哈希幂等，未知结果 fail closed。
+6. 用常驻 Supervisor 做短暂 dispatch，子进程 ready 后才把唯一 execution lease 交给独立 Case Worker；控制命令由当前或恢复 Worker 在安全 Turn 边界领取。Supervisor 重启不接管旧父子 IPC，只依据数据库租约避免重复启动；Worker 可离线闭合 Journal、Case、命令和事件。
+7. 从权威事实按需生成有界任务、工作区、Agent 会话、产物、事件与健康投影；Next.js BFF 只映射 application Query/Command，SSE 从 Workspace 的 `source_event_seq` 起步，轮询单独使用 ETag。
+8. 浏览器通过精确本地 authority 的 REST + SSE 使用正式链路；任务详情默认进入三栏工作区，Agent 从左到右分列、时间从上到下，Turn 浮窗按需读取完整脱敏会话。
+9. 先生成不依赖源码的不可变发布目录，以该同一目录完成 Fake Pi 浏览器/进程故障门禁和真实 Pi 三项强杀门禁。
+10. 真实运行与恢复通过后，才按暖色编辑器方向完成 1024/1280/1440/1920 视觉与宽屏适配。
 
-2. **先验证三项高风险外部假设**
-   - 用当前 `@earendil-works/pi-*` 公开 API 验证 Provider/Model 目录枚举、可用性检查和认证状态的准确接口；不读取 Pi 私有配置。
-   - 验证 `createAgentSession`/`resumeSession` 能按 Agent 接收并恢复准确 `provider_id + model_id`，并确认 Session 持久化中可用于崩溃核对的公开身份；同时用重复相同工具/参数和崩溃后 suffix replay 探针，验证 Pi 是否公开跨 resume 稳定且唯一的 tool call identity 或 replay position。
-   - 验证 Windows 下 Worker 进程身份、心跳、受限 IPC 握手和 Supervisor 重启接管方式；PID 仅作诊断，不作为所有权。
-   - 若任一 Pi 假设不成立，先更新 Adapter Contract 和技术文档，不在实现中静默回退到硬编码 Provider、全局模型或私有目录扫描。
-
-3. **建立显式迁移系统，再修改业务 Schema**
-   - 在 adapters 层增加版本化 migration runner、`schema_migrations`、checksum 校验、OS 级迁移意图闸门与数据根目录读写锁、WAL checkpoint 和 SQLite Backup API。每一个受管 DB opener，无论 CLI、Worker、Supervisor/BFF、story-pipeline 调用入口还是只读 status/list，均须在打开连接前取得共享锁、再次确认没有迁移意图，并持有到最后一个读写连接关闭；未取得锁或发现意图时拒绝打开连接。
-   - 迁移采用两阶段协议：先原子发布带 owner PID、nonce 和时间的 migration intent，使所有入口停止新开连接并通知 Supervisor 停止领取、排空 Worker/现有连接；待共享锁持有者归零后再取得独占锁，重新确认 production/test 零连接、零有效租约，才允许 checkpoint、双库备份和 Schema 操作。独占锁持有到双库迁移、校验以及必要的回滚全部完成，最后清除 intent。
-   - 迁移进程崩溃时 OS 独占锁自动释放，但 intent 不由普通入口删除；下一次启动只有在证明原 owner 已死亡并重新取得独占锁后，才能按迁移日志和备份完成校验/回滚并清除 intent，避免半迁移状态被误当成可运行状态。
-   - 把当前 `SqliteRepository` 构造函数中的零散 `ALTER TABLE` 迁出；应用声明最低/最高支持 Schema。
-   - 先完成 production/test 两库的全部空间预检和已验证数据库备份，再开始任一迁移；两库必须共同到达目标版本，否则用备份恢复已成功的第一库并拒绝启动，绝不运行 split-version UI。
-   - 明确 migration backup 只覆盖 SQLite；迁移过程不得修改共享 CAS 与 Pi Session，因此数据库回滚复用原有 CAS/Session。整机丢失后的完整灾备导出不属于本计划。
-   - 测试空库、历史 fixture、重复运行、checksum 被改、中途失败、磁盘不足、并发连接和备份恢复。
-
-4. **扩充 Contract 与权威持久化模型**
-   - 在 `packages/contracts` 定义 TypeBox DTO、稳定错误码、action descriptor、幂等请求、修订/CAS、Query 游标和 UI 事件 Contract。
-   - 新增生产任务、任务来源、标签、不可变模板修订/资源清单、模型选择来源、持久化命令、命令租约、UI outbox 事件、配置修订和 Worker 实例身份。
-   - 扩充 Case 状态机以支持 `paused`，保存可恢复的暂停前状态/检查点；排队状态只从命令事实投影，不写入 Case。
-   - 修正 Artifact 当前有效指针：候选版本不替换有效版本，批准事务原子完成旧版 supersede、新版 approve、指针切换和事件追加。
-   - 重建关键 SQLite 表并启用 `PRAGMA foreign_keys=ON`：增加状态 `CHECK`、同 Artifact 版本号唯一索引、单 delivered 版本部分唯一索引，以及保证 `current_valid_version_id` 归属和状态合法的 guarded trigger；并发批准必须由数据库约束兜底。
-   - 为 Turn Journal 和工具行为增加稳定身份、阶段、请求/响应哈希、租约 generation、结果未知、幂等字段和 `execution_protocol_version`。
-   - 已完成 legacy Case 保持只读可查；legacy 未完成 Turn 不尝试由新执行器续跑，迁移后原子进入不可恢复的 `failed` 终态并记录稳定原因码 `legacy_execution_protocol_unsupported`，只允许查看证据或基于原任务创建新任务，不暴露恢复动作。
-   - 在开始 Schema/UI 实现前冻结 `/api/v1` HTTP Contract、错误码、action descriptor、分页和脱敏分类，具体基线见步骤 10。
-
-5. **实现应用数据目录、配置和模板 CAS**
-   - 增加平台路径 Adapter：production 默认 `%LOCALAPPDATA%\ForgeAI`，CLI 参数和 `FORGE_DATA_DIR` 按既定优先级覆盖；开发与自动化测试使用隔离目录。
-   - 建立 `db/`、`sessions/`、`templates/`、`logs/`、`backups/`、`runtime/`、`cache/` 结构和安全路径校验。
-   - 实现带 `schema_version`/revision 的非敏感 `config.json`，TypeBox 严格校验、原子替换、最近有效备份和热更新/重启边界。
-   - 实现模板 staging、Bundle 校验、文件 CAS、SHA-256 去重、原子移动和数据库元数据事务。
-   - Runtime 只按冻结模板清单加载并复核对象哈希；草稿、Case 或证据引用的修订不可删除。
-   - P0/P1 禁止自动删除任何 CAS 对象，包括孤立对象；只记录可回收诊断。真正 GC 必须以后另行设计跨 production/test 的全局锁、mark generation 和删除前二次引用检查。
-
-6. **建立 application Query/Command 边界**
-   - 新增 ProductionTask、TemplateRegistry、ModelCatalog、Settings、CommandQueue 和 UI Query 应用服务。
-   - 保存草稿使用完整快照、`expected_revision` 和幂等键。
-   - 启动任务先在事务外执行有界 Pi 实时校验与模板对象复核，捕获目录 snapshot generation、模板修订/hash 和草稿 revision；随后短事务以 CAS 重新验证这些 generation/revision 未变化，再完成配置冻结、Case 创建、任务绑定、运行命令与 UI 事件追加。
-   - production/test 写操作显式选库；`all` 只用只读 Repository 合并任务摘要并拒绝命令。
-   - Query 统一计算任务状态、当前有效/最新创建/交付产物、待办原因和合法动作，BFF/前端不重写状态规则。
-   - 所有诊断写入前经过 `SecretSanitizer`；Query、复制和下载再执行防御性脱敏，隐藏思维链永不采集。
-
-7. **用分阶段 Turn Journal 替换跨 `await` 长事务**
-   - 先用短事务提交 Turn intent、上下文引用和 `model_running`，再在事务外调用 Pi。
-   - 由于 Pi Agent Runtime 可能在模型调用期间内联执行工具，Adapter 必须在每次工具回调产生副作用前，为不可变 `turn_id` 预留并持久化单调 `logical_tool_call_index`；action identity 固定为 `turn_id + logical_tool_call_index`，工具名和规范化参数哈希用于一致性核对，attempt/lease generation 只作执行证据而不参与身份计算。随后在短事务中原子提交 Forge 内部副作用与工具完成记录。
-   - 数据库对 `(turn_id, logical_tool_call_index)` 建非空唯一约束。若步骤 2 证明 Pi 提供跨 resume 稳定且唯一的 tool call identity/replay position，则将其作为唯一 replay key 持久化映射到 action identity；崩溃后只有 replay key 命中且工具名/参数哈希一致时才复用原 action，合法的相同参数重复调用因 replay key 不同而获得新逻辑序号。
-   - 若 Pi 不提供经探针证明的稳定 replay key，未中断执行仍可依次创建逻辑调用；崩溃后只有在响应引用、全部工具 outcome 和哈希均已完整持久化、无需恢复 Pi 或接受回调时，恢复器才可仅按 Journal 补齐 Turn 最终提交。任何需要恢复 Session 或接受首个未证明回调的路径，都必须在产生新副作用前进入 `outcome_unknown`，不得用顺序、参数哈希或新序号猜测重放。Fake/Real Pi 测试覆盖完全相同的连续工具调用、callback replay、suffix resume、journal-only finalization 和 lease generation 变化。
-   - Pi 最终响应返回后持久化响应引用并完成 Turn/路由；已完成工具行为再次调用只返回原结果引用。
-   - 恢复器按 Journal 证据判断继续模型核对、未完成工具、Turn 收尾或进入 `outcome_unknown`；不得盲目重放。
-   - P0 只注册可与 Forge 事务一起提交，或具有幂等键与结果核对协议的工具。
-   - 用确定性故障点覆盖每个阶段，证明没有重复产物、Issue、返修、门禁或工具行为。
-
-8. **接通真实 Pi 模型目录与按 Agent 模型运行**
-   - `RealPiAdapter` 通过公开运行时 API实现目录扫描、TTL/手动刷新、最近成功非敏感快照和启动前实时校验。
-   - 模板默认模型、草稿覆盖来源和启动时实际 `provider_id + model_id` 全程可追溯。
-   - Worker 创建/恢复每个 Agent Session 时传入冻结模型；原模型不可用时 fail closed，不静默替换。执行命令持久化进入 `blocked_model_unavailable`，保存原冻结 `provider_id + model_id`、失败证据、`retry_count` 和 `next_attempt_at`，Worker 释放租约，Case 收敛到可恢复的 `waiting_recovery` 原因投影。
-   - 仅对 Provider 暂时不可用执行持久化的有界指数退避，默认最多 3 次；目录确认模型缺失或达到上限后停止自动领取。UI 只提供显式“使用原模型重试”，该命令再次实时校验并复用冻结模型、原 Session 和恢复证据；若仍不可用则保持阻塞，不允许改模后原地续跑。用户如需换模型，只能基于原任务创建新任务。
-   - 删除 `deepseek` 与全局 `PI_MODEL_ID` 作为业务默认的硬编码路径；环境变量只保留兼容诊断或显式启动覆盖，不替代任务事实。
-   - 用至少一个真实 Provider/Model 验证新建、返修、暂停后恢复和崩溃恢复仍使用原 Session/模型。
-
-9. **实现持久化命令队列、Supervisor 与独立 Worker**
-   - 增加常驻 Supervisor composition root；按默认全局并发 1、命令优先级、FIFO/防饥饿和 Provider 限制领取命令。
-   - 每个 Case 启动独立 Worker；Worker 持有 Case 租约、generation、心跳、`worker_instance_id`，并在内存中持有该实例的短期非导出签名私钥；数据库只持久化对应公钥、算法和实例绑定。
-   - raw bootstrap secret 与签名私钥不放入 argv、环境变量、持久化文件或日志。首次启动时 Supervisor 通过当前用户 SID 限制的继承 pipe/handle 交付一次性 bootstrap secret，Worker 生成密钥对并以 bootstrap challenge 将公钥原子绑定到 Case、instance ID 和 lease generation；bootstrap secret 随即销毁。
-   - Supervisor 崩溃时健康 Worker 继续；新 Supervisor 从 DB 读取公钥，通过 SID 限制的 IPC 发送一次性 nonce challenge，由 Worker 签名 Case ID、instance ID、lease generation 和 nonce 后完成接管。nonce 只使用一次并设短时限，不能仅凭 PID、旧签名或 token 哈希强杀、接管或重复启动。
-   - 暂停/停止是持久化命令。Worker 在完整 Pi Turn 后检查：暂停成功保存检查点并退出；停止原子进入终态。
-   - 暂停强杀进入 `waiting_recovery`；停止强杀经证据核对后收敛为 `stopped`，未知外部结果不自动重试。
-
-10. **实现类型化 REST BFF、持久化 SSE 与本地启动器**
-    - 重建 `apps/web` 服务端 composition root，只调用 application Query/Command；删除页面直读 SQLite和 API Route 拉 CLI。
-    - HTTP 固定使用 `/api/v1`。Query Route 家族为 tasks/task-overview/timeline/artifacts/templates/models/settings/commands/health；Command Route 家族为 draft-save/start/clone/archive/trash、pause/resume/stop/human-answer、template-import/model-default、catalog-refresh/settings-update。每个具体 Route 在 `contracts/http-v1.ts` 中静态列出，不提供通用 CRUD。
-    - REST 写请求只接受 JSON，携带幂等键和预期修订/状态；GET 无副作用；异步命令返回 `202 + command_id`。
-    - 启动器生成并向 BFF 传入唯一规范地址；BFF 对所有请求精确 allowlist `Host` 为本次监听的 `127.0.0.1:<active_port>`，拒绝其他 Host、转发 Host 和绝对形式目标。该检查只防 DNS rebinding，不引入账号、CSRF Token、Origin/Fetch-Metadata 策略或远程访问能力。
-    - 错误码基线及 HTTP 映射：`validation_failed(400)`、`not_found(404)`、`revision_conflict/state_conflict/idempotency_mismatch(409)`、`model_unavailable/template_invalid/storage_low/recovery_required/outcome_unknown(422)`、`supervisor_unavailable(503)`、`internal_error(500)`；响应只带用户消息和可选脱敏 diagnostic reference。
-    - 任务列表使用 opaque `(created_at, task_id)` 游标，默认 50、最大 100；本地单 Case timeline/versions 按需整组读取，若以后测得真实卡顿再新增游标，不预建复杂分页。
-    - 脱敏基线：已知 DTO/工具字段使用 allowlist；未知文本检测 credential/header/cookie/connection-string 模式；占位符统一为 `[REDACTED:<TYPE>]`；解析失败丢弃正文并记录 `redaction_failed`；历史数据 Query 时重脱敏但不原地覆盖。
-    - 每个环境在自己的 DB 中维护单调 `event_seq`，暴露独立 SSE；`all` 页面同时维护 production/test 两个 `{environment, sequence}` 游标，不伪造跨库全局序号。
-    - UI 事件至少保留 7 天且始终保留最近 10,000 条/环境；SSE 每 15 秒 heartbeat，单批最多 100 条，单连接待发送缓冲最多 1 MiB。超限或游标缺口时断开并要求 `resync_required`，客户端重新 Query。
-    - 实现 `forge ui`：解析数据目录、单实例锁、迁移、Supervisor、Next standalone、健康检查、自动打开浏览器和 draining。
-    - 本地服务只监听 `127.0.0.1`；不实现账号、角色、权限或额外本地认证体系。
-
-11. **先交付无视觉抛光的 P0 纵向闭环**
-    - 用最小页面跑通 `/tasks`、`/tasks/new`、`/tasks/[taskId]`、`/templates`、`/settings`。
-    - 接入 TanStack Query、React Hook Form、IndexedDB 草稿恢复和 SSE Query 失效；不使用 Server Actions、Redux 或第二套状态机。
-    - P0 覆盖：创建/自动保存、模板与 Agent 模型选择、启动/排队、Agent/Turn 过程、当前有效产物、人工输入、暂停/恢复/停止和错误恢复。
-    - 在这一阶段只验证功能、可访问语义和真实数据，不进行最终视觉细节打磨。
-
-12. **通过高风险运行门禁后完成 UI 产品化**
-    - 真实 Pi 新建/返修/交付、真实 Worker 强杀、Supervisor 强杀接管和七个 Fake 故障窗口全部通过后，才进入视觉抛光。
-    - 建立暖色 CSS 语义令牌、CSS Modules、Radix 无样式交互组件、Lucide 图标和系统中文字体栈。
-    - 实现任务工作台、生产概览、Agent 泳道/时间线、右侧产物演进链、Issue/返修证据、模型目录、模板修订和高级诊断。
-    - 1024–1279 px 使用产物抽屉，1280 px 以上固定侧栏；不建设移动端。
-    - 使用安全 Markdown、结构化工具卡片、当前产物浏览器内搜索、Markdown 章节导航和双版本统一 Diff。
-
-13. **完成 P1 冻结范围，不扩张到 P2**
-    - 补齐状态摘要、组合筛选/排序、标签、归档、草稿回收站、来源任务、模板版本差异与升级提示。
-    - 补齐完整 Provider/Model 目录状态、模板默认模型维护、任务模型差异标记和脱敏诊断复制。
-    - 补齐 UTF-8 `.txt`/`.md`/允许文本原始类型下载、安全文件名、稳定深链接和刷新恢复。
-    - 不加入人工正文编辑、通知、鉴权、批量任务、Word/PDF、深色模式、自由流程画布或 Electron。
-
-14. **建立分层自动化证据**
-    - Vitest 覆盖 domain、application、迁移、命令、CAS、Turn Journal、模型冻结和恢复不变量；所有已发布 Scenario Bundle 及 story-pipeline 恢复/失效传播测试是迁移前后强制回归门禁。
-    - React Testing Library 覆盖表单、冲突、错误、合法动作和交互组件。
-    - Playwright 启动真实 BFF/Supervisor/Worker/SQLite + Fake Pi，跑完整操作者路径和少量稳定视觉回归。
-    - 进程级测试真实终止子进程并使用原数据目录恢复，覆盖七个冻结故障窗口。
-    - 运行秘密泄漏扫描，检查数据库、日志、REST、SSE、复制、下载和验收报告。
-    - 结构化本地诊断使用 `environment → command_id → case_id → turn_id → worker_instance_id → lease_generation` 关联链，记录 queue age、heartbeat age、SQLite lock wait、Pi latency、SSE lag 和 sanitizer failure；健康页对卡住/过期/不一致给出明确状态，但不建设远程告警平台。
-
-15. **执行真实发布候选验收并如实收口**
-    - 使用运行时发现的真实 Provider/Model 运行完整 P0 Case，并执行真实 Pi 的三项最小强杀矩阵。
-    - 验证原 Case、Session、模板、模型继续使用，已提交证据哈希不变且无重复副作用。
-    - 生成脱敏报告，包含 commit、Schema、模板修订、Pi 版本、Provider/Model ID、故障点和断言结果。
-    - 只有 `npm run check`、完整测试、Fake 故障矩阵、Playwright 与真实 Pi 门禁全部有可运行证据时，才能声明 P0 完成；随后按同样标准验收 P1。
+施工级任务、文件、接口、SQL、测试命令和提交边界以
+`docs/superpowers/plans/2026-07-29-forge-ui-p0-implementation.md`
+为规范性执行清单；本文件与该清单必须一起评审。
 
 ## Key decisions & tradeoffs
 
-- **Next.js BFF 而非独立 API 服务**：当前本地个人工具减少一个部署单元，但 application Contract 保持可拆分。
-- **本地 Web 先于 Electron**：先证明产品和运行链路，Electron 只复用 standalone、HTTP/SSE 和生命周期协议。
-- **生产任务与 Case 分离**：产品草稿/归档/标签不污染执行事实，代价是新增聚合与绑定迁移。
-- **production/test 物理分库，all 只读聚合**：沿用现有隔离，接受 application 层合并两个小型本地结果集。
-- **文件 CAS + SQLite 元数据**：恢复使用冻结资源且数据库不被大文件膨胀，代价是需要跨文件/数据库的 staging 与孤立对象清理。
-- **持久化命令 + 每 Case 独立 Worker**：增加进程编排复杂度，换取隔离、排队、恢复和未来 Electron 托管能力。
-- **分阶段 Turn Journal 而非跨 await 长事务**：避免 SQLite 长写锁，代价是必须处理结果未知与每个工具的幂等核对。
-- **Supervisor 不是正确性单点**：存活 Worker 可继续并被重接管，代价是需要实例身份、租约 generation 和 IPC 握手。
-- **SSE + Query 失效而非 WebSocket/前端状态机**：足够支持单向本地更新，同时保持权威状态在 application/DB。
-- **loopback 但无用户鉴权/CSRF 子系统**：这是用户明确接受的个人本地工具边界；仍保持精确 loopback `Host` allowlist、同源、无 CORS、JSON 写请求和无副作用 GET，但不扩张为账号、Token 或通用来源认证项目。
-- **个人本地规模优先**：不预建虚拟列表、全文索引、复杂 Diff 服务、权限体系或分布式基础设施。
-- **真实 Pi 与强杀门禁前不抛光 UI**：避免再次出现“Fake 演示 + UI 完成但真实运行未完成”的失败模式。
+- 生产任务与 Case 分离：草稿/标签/归档属于任务，运行事实仍属于 Case；避免 UI 状态污染状态机。
+- Next.js 是同源 BFF，不再直接查询 SQLite 或拉起 CLI；当前个人本地规模不新增独立 API 服务。
+- 使用持久化命令 + Supervisor + 独立 Case Worker，接受实现复杂度以换取进程隔离、可恢复性和真实幂等。
+- 保留独立 Supervisor 是已冻结的故障隔离边界；计划必须用脱离源码、带完整文件哈希的不可变发布目录证明四层生命周期可交付，Fake 与真实 Pi 门禁必须消费同一目录。
+- P0 默认单 Case 并发，暂不为团队级规模、远程部署或多租户增加基础设施。
+- Turn 只在完整 Pi Turn 边界暂停；不虚假承诺模型请求内即时取消或 Provider 费用 exactly-once。
+- Agent 泳道边只来自持久化引用，不按显示顺序猜测信息流；缺少证据时宁可不画箭头。
+- Agent 浮窗展示完整脱敏业务输入/输出、工具与系统结果；公开推理摘要仅在 Runtime 明确提供时显示，隐藏思维链永不采集。
+- UI 功能链在 Fake Pi 下成立后，还不能宣布完成；真实 Pi 与进程故障门禁是硬条件。
+- Electron、鉴权、流程编排、人工改产物等明确延后，避免个人本地项目失控扩张。
 
 ## Risks / open questions
 
-- 当前 Pi 0.82 公开目录 API、模型选择参数和 Session 核对能力的准确形态需要在步骤 2 用可运行探针证明；若能力缺失，必须先调整 Contract，不能读取 Pi 私有文件兜底。
-- Pi Agent Runtime 可能在一次模型调用中内联多次工具执行，Turn Journal 必须通过工具回调生命周期记录 intent/effect，而不能依赖“完整响应先于全部工具”的理想顺序。
-- Windows 上 Supervisor 崩溃后对存活 Worker 的公钥 challenge 重握手需要证明不会误认 PID、接受重放签名、泄露私钥，也不会因终端关闭意外杀死整个进程树。
-- 所有现有和新增 DB opener 都必须共同遵守 migration intent + 数据根目录共享锁协议；任何绕过该协议直接打开读库或写库的 legacy 路径都会破坏迁移互斥，必须由集成测试枚举并封死。
-- 从现有跨 await Turn 事务迁移到 Journal 时，历史 Case 和新 Case 的恢复路径必须有明确 Schema/版本边界；不支持混用两种执行器继续同一未完成 Turn。
-- 模板 CAS 与数据库元数据无法依靠单个 SQLite 事务覆盖文件系统，需要用 staging、原子 rename 和提交顺序保证“数据库不引用缺失对象”；P0/P1 保留孤立对象而不冒险回收。
-- 真实 Provider 调用在缺少上游幂等协议时无法保证费用 exactly-once；Forge 只承诺业务副作用不重复，并对未知调用结果 fail closed。
-- 精确 loopback `Host` allowlist 只关闭 DNS rebinding 主路径，不能替代浏览器来源认证；用户已明确拒绝额外 CSRF/来源认证复杂度，本计划接受剩余的同机威胁且不允许绑定 LAN。
-- migration backup 是数据库回滚机制，不是 CAS/Session/配置的整机灾备；完整灾备导出属于未来独立需求。
-- 这些项目是需要用 spike 和测试关闭的实施风险，不是授权扩大产品范围的开放需求。
+- Pi Runtime 是否能对“模型已处理但响应未持久化”的窗口提供稳定响应核对能力，必须在 Task 6/13 实测；不能核对时固定收敛为 `outcome_unknown + waiting_recovery`。
+- Pi SessionManager 有消息、工具、自定义 entry 和 compaction 等多个持久化入口；Task 4 必须证明全部入口都经过唯一白名单 sink，JSONL 不含明文 thinking 且仍可恢复，否则对应 Provider/Model 不得进入 P0。
+- 当前 SQLite 旧库没有迁移表；首次迁移必须在 Windows 真实进程测试中证明全部旧 Forge Worker 已退出，再在每环境独立屏障内完成 Backup API、迁移和验证；无法证明时拒绝采用旧 data root。
+- Supervisor 重启后只依据数据库 execution-lease heartbeat 观察存活 Worker，绝不接管旧父子 IPC；Windows 进程测试必须证明不会重复启动，PID 只能用于诊断。
+- 真实 Provider 凭据不进入仓库；如果本机没有可用凭据，实施可以推进到 Fake Pi 门禁，但 P0 不得标记完成。
 
 ## Out of scope
 
-- Electron 主进程、preload、安装器、签名和自动更新。
-- 预定义多 Case 流程 UI、自由拖拽流程设计器和新编排器实现。
-- 人工修改产物、人工修订版本和多人批注。
-- 账号、鉴权、角色、权限、多用户、远程或局域网部署。
-- 自定义 CSRF Token、Origin/Fetch-Metadata 来源认证框架；精确 loopback `Host` allowlist 除外。
-- Provider 凭据管理；凭据继续由 Pi 管理。
-- 通知、邮件、系统托盘提醒。
-- Word/PDF 转换、二进制原始文件、批量下载或批量任务。
-- 深色模式、完整移动端、手机操作体验。
-- 项目/工作空间层级、标签管理后台和生产证据永久清理。
-- 分布式队列、远程数据库、全文搜索集群、大规模性能设施。
-- CAS 垃圾回收和包含 DB/CAS/Session 的完整灾备导出。
+- Electron、安装器、签名、更新和桌面原生能力。
+- 预定义流程编排 UI 与自由拖拽流程设计器。
+- 人工修改产物、鉴权、多用户、通知、手机端、Provider 凭据管理。
+- 团队级并发、大规模搜索、物化 UI 投影和复杂性能基础设施。
+- P1 的完整历史传播高亮、高级诊断、归档回收站和模板版本体验。
