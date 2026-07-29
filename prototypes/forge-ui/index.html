@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="Forge AI 内容生产操作台离线交互原型，用于演示任务、执行轨迹与产物演进。"
+    >
+    <title>Forge AI · 内容生产操作台原型</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script src="./mock-data.js" defer></script>
+    <script src="./state.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+
+    <svg class="svg-sprite" aria-hidden="true">
+      <symbol id="icon-forge" viewBox="0 0 24 24">
+        <path d="M12 2.75 20 7.3v9.4l-8 4.55-8-4.55V7.3L12 2.75Z"></path>
+        <path d="m8.3 12 2.35 2.35 5.05-5.05"></path>
+      </symbol>
+      <symbol id="icon-workbench" viewBox="0 0 24 24">
+        <rect x="3.5" y="4" width="17" height="16" rx="2.5"></rect>
+        <path d="M3.5 9h17M9 9v11"></path>
+      </symbol>
+      <symbol id="icon-templates" viewBox="0 0 24 24">
+        <rect x="4" y="3.5" width="12.5" height="16" rx="2"></rect>
+        <path d="M8 7.5h4.5M8 11.5h5.5M8 15.5h3.5M16.5 7H20v13H8"></path>
+      </symbol>
+      <symbol id="icon-search" viewBox="0 0 24 24">
+        <circle cx="10.75" cy="10.75" r="6.25"></circle>
+        <path d="m15.5 15.5 4 4"></path>
+      </symbol>
+      <symbol id="icon-plus" viewBox="0 0 24 24">
+        <path d="M12 5v14M5 12h14"></path>
+      </symbol>
+      <symbol id="icon-chevron" viewBox="0 0 24 24">
+        <path d="m9 6 6 6-6 6"></path>
+      </symbol>
+      <symbol id="icon-arrow-left" viewBox="0 0 24 24">
+        <path d="m15 18-6-6 6-6M9 12h11"></path>
+      </symbol>
+      <symbol id="icon-check" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5"></circle>
+        <path d="m8.2 12.2 2.45 2.45 5.15-5.15"></path>
+      </symbol>
+      <symbol id="icon-clock" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5"></circle>
+        <path d="M12 7.5V12l3 2"></path>
+      </symbol>
+      <symbol id="icon-alert" viewBox="0 0 24 24">
+        <path d="M12 3.5 21 19H3L12 3.5Z"></path>
+        <path d="M12 9v4.5M12 16.7v.1"></path>
+      </symbol>
+      <symbol id="icon-edit" viewBox="0 0 24 24">
+        <path d="m14.5 5.5 4 4M6 18l2.5-.5L19 7a1.4 1.4 0 0 0 0-2l0 0a1.4 1.4 0 0 0-2 0L6.5 15.5 6 18Z"></path>
+        <path d="M4 20h16"></path>
+      </symbol>
+      <symbol id="icon-stop" viewBox="0 0 24 24">
+        <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+      </symbol>
+      <symbol id="icon-pause" viewBox="0 0 24 24">
+        <path d="M9 6v12M15 6v12"></path>
+      </symbol>
+      <symbol id="icon-retry" viewBox="0 0 24 24">
+        <path d="M19 8V4l-2 2a8 8 0 1 0 2.2 8"></path>
+        <path d="M19 4h-4"></path>
+      </symbol>
+      <symbol id="icon-agent" viewBox="0 0 24 24">
+        <circle cx="12" cy="8.5" r="3.5"></circle>
+        <path d="M5.5 20a6.5 6.5 0 0 1 13 0"></path>
+      </symbol>
+      <symbol id="icon-trace" viewBox="0 0 24 24">
+        <circle cx="6" cy="6" r="2"></circle>
+        <circle cx="18" cy="12" r="2"></circle>
+        <circle cx="7" cy="18" r="2"></circle>
+        <path d="M8 6h3a3 3 0 0 1 3 3v0a3 3 0 0 0 3 3h-1M9 18h2a3 3 0 0 0 3-3v0a3 3 0 0 1 3-3"></path>
+      </symbol>
+      <symbol id="icon-artifact" viewBox="0 0 24 24">
+        <path d="M6 3.5h8l4 4V20H6V3.5Z"></path>
+        <path d="M14 3.5V8h4M9 12h6M9 16h6"></path>
+      </symbol>
+      <symbol id="icon-diff" viewBox="0 0 24 24">
+        <path d="M8 5v8a4 4 0 0 0 4 4h4M13 7l3-3 3 3M13 17l3-3 3 3"></path>
+      </symbol>
+      <symbol id="icon-model" viewBox="0 0 24 24">
+        <path d="m12 3 8 4.5-8 4.5-8-4.5L12 3Z"></path>
+        <path d="m4 12 8 4.5 8-4.5M4 16.5l8 4.5 8-4.5"></path>
+      </symbol>
+      <symbol id="icon-info" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5"></circle>
+        <path d="M12 10.5V17M12 7.2v.1"></path>
+      </symbol>
+      <symbol id="icon-close" viewBox="0 0 24 24">
+        <path d="m6.5 6.5 11 11M17.5 6.5l-11 11"></path>
+      </symbol>
+      <symbol id="icon-link" viewBox="0 0 24 24">
+        <path d="m9.5 14.5 5-5"></path>
+        <path d="M7.5 16.5 6 18a3 3 0 0 1-4.25-4.25l3-3A3 3 0 0 1 9 10M16.5 7.5 18 6a3 3 0 1 1 4.25 4.25l-3 3A3 3 0 0 1 15 14"></path>
+      </symbol>
+    </svg>
+
+    <div class="page-canvas">
+      <section class="app-shell" aria-label="Forge AI 操作台">
+        <header class="topbar">
+          <div class="brand" aria-label="Forge AI">
+            <span class="brand-mark" aria-hidden="true">
+              <svg class="icon icon-lg"><use href="#icon-forge"></use></svg>
+            </span>
+            <span class="brand-copy">
+              <strong>Forge AI</strong>
+              <small>内容生产操作台</small>
+            </span>
+          </div>
+
+          <div class="topbar-actions">
+            <label class="global-search" for="global-search-input">
+              <svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg>
+              <span class="sr-only">搜索任务</span>
+              <input
+                id="global-search-input"
+                type="search"
+                autocomplete="off"
+                placeholder="搜索任务、模板或阶段"
+                data-action="search"
+              >
+              <kbd aria-hidden="true">/</kbd>
+            </label>
+
+            <label class="environment-control" for="environment-select">
+              <span>环境</span>
+              <select id="environment-select" data-action="environment">
+                <option value="production">生产</option>
+                <option value="test">测试</option>
+              </select>
+            </label>
+
+            <button class="button button-primary" type="button" data-action="new-task">
+              <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>
+              <span>新建生产任务</span>
+            </button>
+          </div>
+        </header>
+
+        <div class="shell-body">
+          <aside class="sidebar" aria-label="主导航">
+            <nav class="primary-nav">
+              <button
+                class="nav-item"
+                type="button"
+                data-action="navigate"
+                data-view="workbench"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#icon-workbench"></use></svg>
+                <span>工作台</span>
+              </button>
+              <button
+                class="nav-item"
+                type="button"
+                data-action="navigate"
+                data-view="templates"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#icon-templates"></use></svg>
+                <span>模板中心</span>
+              </button>
+            </nav>
+
+            <div class="sidebar-note">
+              <span class="sidebar-note-icon" aria-hidden="true">
+                <svg class="icon"><use href="#icon-info"></use></svg>
+              </span>
+              <p>离线原型</p>
+              <small>数据与操作均为模拟，不会发起真实生产。</small>
+            </div>
+          </aside>
+
+          <main id="main-content" class="main-content">
+            <div class="desktop-banner" role="note">
+              <svg class="icon" aria-hidden="true"><use href="#icon-info"></use></svg>
+              <span>建议在桌面端查看完整执行轨迹；当前布局已压缩为单列。</span>
+            </div>
+            <div id="view-title" class="view-title"></div>
+            <div id="view-toolbar" class="view-toolbar"></div>
+            <div id="view-content" class="view-content"></div>
+          </main>
+        </div>
+      </section>
+    </div>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+    <dialog
+      id="prototype-dialog"
+      class="prototype-dialog"
+      aria-labelledby="prototype-dialog-title"
+      aria-describedby="prototype-dialog-body"
+    >
+      <div class="dialog-content">
+        <div class="dialog-heading">
+          <span class="dialog-icon" aria-hidden="true">
+            <svg class="icon"><use href="#icon-info"></use></svg>
+          </span>
+          <div>
+            <p class="eyebrow">原型说明</p>
+            <h2 id="prototype-dialog-title">模拟操作</h2>
+          </div>
+          <button
+            class="icon-button"
+            type="button"
+            aria-label="关闭对话框"
+            data-action="close-dialog"
+          >
+            <svg class="icon" aria-hidden="true"><use href="#icon-close"></use></svg>
+          </button>
+        </div>
+        <p id="prototype-dialog-body" class="dialog-body"></p>
+        <div class="dialog-footer">
+          <span><kbd>Esc</kbd> 也可关闭</span>
+          <button class="button button-primary" type="button" data-action="close-dialog">
+            知道了
+          </button>
+        </div>
+      </div>
+    </dialog>
+
+    <noscript>
+      <div class="noscript-message">
+        此静态交互原型需要 JavaScript 才能展示任务、执行轨迹和产物 Diff。
+      </div>
+    </noscript>
+  </body>
+</html>
